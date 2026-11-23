@@ -22,9 +22,9 @@ export interface RelayKeys {
   enc: Buffer;
 }
 
-const CHANNEL_PREFIX = 'plaitcode/channel/1:';
-const RELAY_PREFIX = 'plaitcode/relay/1:';
-const ENC_PREFIX = 'plaitcode/enc/1:';
+export const CHANNEL_PREFIX = 'plaitcode/channel/1:';
+export const RELAY_PREFIX = 'plaitcode/relay/1:';
+export const ENC_PREFIX = 'plaitcode/enc/1:';
 
 function hash(prefix: string, secret: string): Buffer {
   return createHash('sha256').update(prefix).update(secret, 'utf8').digest();

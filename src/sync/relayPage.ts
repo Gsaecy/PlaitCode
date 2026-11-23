@@ -1,0 +1,324 @@
+/**
+ * 手机端页面：直接用浏览器连**中继**（跨网络），端到端加密在浏览器里做。
+ *
+ * 与局域网那套（`mobileControl.ts`）的区别只在"怎么送达"：
+ *  - 局域网：手机连电脑的 47821；
+ *  - 跨网络：手机连 https://plaitcode.com，消息由中继转发，中继只见密文。
+ *
+ * 页面要拿到频道密钥才能用：密钥放在 URL 的 **fragment**（`#k=…`）里 ——
+ * fragment 不会发给服务器，也不会出现在 nginx 日志里。打开后立刻写进 localStorage
+ * 并把它从地址栏抹掉，避免截图/历史记录泄露。
+ */
+
+import { CHANNEL_PREFIX, ENC_PREFIX, RELAY_PREFIX } from './relayCrypto';
+
+export function renderRelayMobilePage(options: { relayHost: string }): string {
+  const host = options.relayHost.replace(/[<>&"]/g, '');
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:">
+<title>PlaitCode · 团队群</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a; --text:#e5e7eb; --muted:#9aa3b2;
+    --brand:#4c9aff; --warn:#f0b429; --ok:#34d399; --bad:#f87171; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font:16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  body { display:flex; flex-direction:column; }
+  header { padding:12px 14px; background:var(--panel); border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:8px; position:sticky; top:0; z-index:5; }
+  header .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+  header .dot.on { background:var(--ok); box-shadow:0 0 0 3px rgba(52,211,153,.15); }
+  header .title { font-weight:600; font-size:15px; }
+  header .meta { margin-left:auto; font-size:12px; color:var(--muted); }
+  main { flex:1; overflow-y:auto; padding:12px 12px 20px; -webkit-overflow-scrolling:touch; }
+  .banner { margin:0 0 12px; padding:10px 12px; border-radius:12px; font-size:14px;
+    background:rgba(240,180,41,.12); border:1px solid rgba(240,180,41,.45); color:#f7d68a; }
+  .banner b { display:block; margin-bottom:4px; color:var(--warn); }
+  .msg { display:flex; margin-bottom:12px; }
+  .msg.user { justify-content:flex-end; }
+  .bubble { max-width:86%; padding:9px 12px; border-radius:14px; background:var(--panel2);
+    border:1px solid var(--line); white-space:pre-wrap; word-break:break-word; font-size:15px; }
+  .msg.user .bubble { background:#1d3a5f; border-color:#2a4f7d; }
+  .meta-line { font-size:11px; color:var(--muted); margin-bottom:4px; display:flex; gap:6px; align-items:center; }
+  .msg.user .meta-line { justify-content:flex-end; }
+  .tag { padding:1px 6px; border-radius:6px; font-size:11px; border:1px solid var(--line); color:var(--muted); }
+  .tag.question { color:var(--warn); border-color:rgba(240,180,41,.5); }
+  .tag.result { color:var(--ok); border-color:rgba(52,211,153,.5); }
+  .tag.requirement { color:var(--brand); border-color:rgba(76,154,255,.5); }
+  footer { padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel);
+    border-top:1px solid var(--line); display:flex; gap:8px; align-items:flex-end; }
+  textarea { flex:1; resize:none; min-height:42px; max-height:120px; padding:10px 12px; border-radius:12px;
+    background:var(--panel2); color:var(--text); border:1px solid var(--line); font:inherit; font-size:15px; }
+  button { padding:10px 12px; border-radius:10px; font-size:15px; border:1px solid var(--line);
+    background:var(--panel2); color:var(--text); font-weight:600; }
+  button.primary { background:var(--brand); border-color:var(--brand); color:#06121f; }
+  footer button { flex:0 0 68px; }
+  footer button:disabled { opacity:.5; }
+  .empty { color:var(--muted); text-align:center; font-size:14px; padding:40px 20px; }
+  .join { padding:28px 18px; }
+  .join h1 { font-size:18px; margin:0 0 6px; }
+  .join p { color:var(--muted); font-size:14px; margin:0 0 18px; }
+  .join input { width:100%; padding:13px; border-radius:12px; background:var(--panel2); color:var(--text);
+    border:1px solid var(--line); font-size:15px; }
+  .join button { width:100%; margin-top:12px; padding:13px; }
+  .err { color:var(--bad); font-size:13px; min-height:20px; margin-top:10px; text-align:center; }
+  .hint { color:var(--muted); font-size:12px; margin-top:14px; line-height:1.6; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <span class="title">PlaitCode · 团队群</span>
+  <span class="meta" id="meta">${host}</span>
+</header>
+<main id="main"><div class="empty">正在读取频道…</div></main>
+<footer id="footer" style="display:none">
+  <textarea id="input" rows="1" placeholder="以甲方身份说一句话（Enter 发送）"></textarea>
+  <button class="primary" id="send">发送</button>
+</footer>
+<script>
+(function () {
+  var KEY_STORE = 'plaitcode.relay.key';
+  var PHASES = { requirement:'需求', analysis:'解析', question:'追问', answer:'回复', confirm:'确认', progress:'进度', result:'结果' };
+  var main = document.getElementById('main');
+  var footer = document.getElementById('footer');
+  var input = document.getElementById('input');
+  var sendBtn = document.getElementById('send');
+  var dot = document.getElementById('dot');
+  var meta = document.getElementById('meta');
+
+  var secret = null, keys = null, deviceId = null, since = 0, busy = false, signature = '';
+
+  function el(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }
+  function say(text) { main.innerHTML = ''; var box = el('div', 'empty', text); main.appendChild(box); }
+
+  function b64(bytes) { var s = ''; var view = new Uint8Array(bytes); for (var i = 0; i < view.length; i += 1) s += String.fromCharCode(view[i]); return btoa(s); }
+  function unb64(text) { var s = atob(text); var out = new Uint8Array(s.length); for (var i = 0; i < s.length; i += 1) out[i] = s.charCodeAt(i); return out; }
+  function b64url(bytes) { return b64(bytes).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, ''); }
+  function hex(bytes) { var s = ''; var view = new Uint8Array(bytes); for (var i = 0; i < view.length; i += 1) s += ('0' + view[i].toString(16)).slice(-2); return s; }
+
+  var encoder = new TextEncoder();
+
+  function digest(prefix) {
+    return crypto.subtle.digest('SHA-256', encoder.encode(prefix + secret)).then(function (buf) { return buf; });
+  }
+
+  function deriveKeys() {
+    return Promise.all([digest('${CHANNEL_PREFIX}'), digest('${RELAY_PREFIX}'), digest('${ENC_PREFIX}')])
+      .then(function (parts) {
+        return crypto.subtle.importKey('raw', parts[2], 'AES-GCM', false, ['encrypt', 'decrypt'])
+          .then(function (key) {
+            return { channel: hex(parts[0]).slice(0, 32), relay: b64url(parts[1]), enc: key };
+          });
+      });
+  }
+
+  function seal(id, plaintext) {
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    return crypto.subtle.encrypt(
+      { name:'AES-GCM', iv: iv, additionalData: encoder.encode(keys.channel + ':' + id), tagLength:128 },
+      keys.enc, encoder.encode(plaintext)
+    ).then(function (ct) { return { iv: b64(iv), ct: b64(ct) }; });
+  }
+
+  function open(id, envelope) {
+    return crypto.subtle.decrypt(
+      { name:'AES-GCM', iv: unb64(envelope.iv), additionalData: encoder.encode(keys.channel + ':' + id), tagLength:128 },
+      keys.enc, unb64(envelope.ct)
+    ).then(function (buf) { return JSON.parse(new TextDecoder().decode(buf)); }).catch(function () { return null; });
+  }
+
+  function post(path, body) {
+    return fetch(path, {
+      method:'POST', credentials:'same-origin',
+      headers:{ 'content-type':'application/json', authorization:'Bearer ' + keys.relay },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json().catch(function () { return {}; }); });
+  }
+
+  function presence() {
+    return post('/v1/presence', {
+      channel: keys.channel,
+      device: { id: deviceId, name: '手机 · 浏览器', platform: 'android', project: 'mobile' }
+    }).then(function (result) {
+      if (Array.isArray(result.devices)) {
+        meta.textContent = (result.devices.length || 1) + ' 台设备在线';
+      }
+    }).catch(function () {});
+  }
+
+  function render(state) {
+    dot.className = 'dot' + (state.connected ? ' on' : '');
+    var next = JSON.stringify([state.messages, state.question]);
+    if (next === signature) return;
+    signature = next;
+    var atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 80;
+    main.innerHTML = '';
+    if (state.question) {
+      var banner = el('div', 'banner');
+      banner.appendChild(el('b', null, '乙方在等你回答'));
+      banner.appendChild(el('span', null, state.question));
+      main.appendChild(banner);
+    }
+    state.messages.forEach(function (message) {
+      var mine = message.author === 'user';
+      var wrap = el('div', 'msg' + (mine ? ' user' : ''));
+      var bubble = el('div', 'bubble');
+      var line = el('div', 'meta-line');
+      line.appendChild(el('span', 'tag ' + message.phase, PHASES[message.phase] || message.phase));
+      var who = mine ? '你' : ((message.from && message.from.name) || '乙方');
+      var time = new Date(message.at || Date.now());
+      line.appendChild(el('span', null, who + ' · ' + ('0' + time.getHours()).slice(-2) + ':' + ('0' + time.getMinutes()).slice(-2)));
+      bubble.appendChild(line);
+      bubble.appendChild(el('div', null, message.body));
+      wrap.appendChild(bubble);
+      main.appendChild(wrap);
+    });
+    if (!main.childNodes.length) main.appendChild(el('div', 'empty', '还没有发言。说一句需求，两台电脑上的乙方都会收到。'));
+    if (atBottom) main.scrollTop = main.scrollHeight;
+  }
+
+  var messages = [];
+  function questionFor(list) {
+    var answered = {};
+    for (var i = list.length - 1; i >= 0; i -= 1) {
+      var m = list[i];
+      if (m.author === 'user') answered[m.requirementId] = true;
+      else if (m.phase === 'question' && !answered[m.requirementId]) return m.body;
+    }
+    return '';
+  }
+
+  function poll() {
+    if (busy) return;
+    busy = true;
+    var url = '/v1/poll?channel=' + encodeURIComponent(keys.channel) + '&since=' + since + '&wait=20';
+    fetch(url, { credentials:'same-origin', headers:{ authorization:'Bearer ' + keys.relay } })
+      .then(function (r) {
+        if (r.status === 401 || r.status === 403) throw new Error('频道密钥不对');
+        return r.json();
+      })
+      .then(function (result) {
+        var incoming = Array.isArray(result.messages) ? result.messages : [];
+        if (typeof result.seq === 'number' && result.seq > since) since = result.seq;
+        var chain = Promise.resolve();
+        incoming.forEach(function (entry) {
+          if (!entry || typeof entry.id !== 'string') return;
+          if (entry.from === deviceId) return;
+          chain = chain.then(function () {
+            return open(entry.id, entry.envelope).then(function (message) {
+              if (!message || message.kind !== 'group') return;
+              if (messages.some(function (item) { return item.id === message.id; })) return;
+              messages.push(message);
+              if (messages.length > 200) messages = messages.slice(-200);
+            });
+          });
+        });
+        return chain;
+      })
+      .then(function () {
+        dot.className = 'dot on';
+        render({ connected:true, messages: messages, question: questionFor(messages) });
+      })
+      .catch(function () { dot.className = 'dot'; })
+      .finally(function () { busy = false; });
+  }
+
+  function submit() {
+    var text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    sendBtn.disabled = true;
+    var id = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    var message = {
+      kind: 'group', id: id, author: 'user', phase: 'requirement', body: text, requirementId: id, at: Date.now(),
+      from: { id: deviceId, name: '手机 · 浏览器', platform: 'android', project: 'mobile', version: 'web' }
+    };
+    seal(id, JSON.stringify(message))
+      .then(function (envelope) { return post('/v1/publish', { channel: keys.channel, id: id, from: deviceId, envelope: envelope }); })
+      .then(function (result) {
+        if (!result.ok) { input.value = text; alert(result.error || '没发出去'); return; }
+        messages.push(message);
+        signature = '';
+        render({ connected:true, messages: messages, question: questionFor(messages) });
+      })
+      .catch(function () { input.value = text; alert('网络没连上'); })
+      .finally(function () { sendBtn.disabled = false; input.focus(); });
+  }
+
+  sendBtn.addEventListener('click', submit);
+  input.addEventListener('keydown', function (event) {
+    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit(); }
+  });
+
+  function joinForm(errorText) {
+    footer.style.display = 'none';
+    main.innerHTML = '';
+    var form = document.createElement('form');
+    form.className = 'join';
+    form.appendChild(el('h1', null, '加入团队群'));
+    form.appendChild(el('p', null, '把电脑上「PlaitCode: 手机加入频道」显示的二维码扫一下，或粘贴那一整条配对信息。'));
+    var field = document.createElement('input');
+    field.placeholder = 'plaitcode://join?u=https://…&s=…';
+    field.autocomplete = 'off';
+    form.appendChild(field);
+    var submitBtn = el('button', 'primary', '进入');
+    submitBtn.type = 'submit';
+    form.appendChild(submitBtn);
+    var err = el('div', 'err', errorText || '');
+    form.appendChild(err);
+    main.appendChild(form);
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      var value = field.value.trim();
+      var match = /[?&]s=([^&\\s]+)/.exec(value);
+      var key = match ? decodeURIComponent(match[1]) : value;
+      if (key.length < 16) { err.textContent = '这条配对信息看不懂，重新扫一次二维码。'; return; }
+      localStorage.setItem(KEY_STORE, key);
+      boot(key);
+    });
+  }
+
+  function boot(candidate) {
+    secret = candidate;
+    history.replaceState(null, '', location.pathname);
+    say('正在连接…');
+    deriveKeys().then(function (ready) {
+      keys = ready;
+      deviceId = localStorage.getItem('plaitcode.relay.device');
+      if (!deviceId) {
+        deviceId = 'web' + Math.random().toString(36).slice(2, 10);
+        localStorage.setItem('plaitcode.relay.device', deviceId);
+      }
+      footer.style.display = 'flex';
+      presence();
+      setInterval(presence, 30000);
+      poll();
+      setInterval(poll, 1500);
+      document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
+    }).catch(function () { say('浏览器不支持 WebCrypto，无法加密'); });
+  }
+
+  var fromHash = null;
+  var hash = location.hash || '';
+  var hashMatch = /[#&]k=([^&]+)/.exec(hash);
+  if (hashMatch) fromHash = decodeURIComponent(hashMatch[1]);
+  var stored = localStorage.getItem(KEY_STORE);
+  if (fromHash && fromHash.length >= 16) {
+    localStorage.setItem(KEY_STORE, fromHash);
+    boot(fromHash);
+  } else if (stored && stored.length >= 16) {
+    boot(stored);
+  } else {
+    joinForm('');
+  }
+})();
+</script>
+</body>
+</html>`;
+}

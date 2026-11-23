@@ -226,6 +226,11 @@
       {
         "command": "plaitcode.relay.leave",
         "title": "PlaitCode: 退出跨网频道"
+      },
+      {
+        "command": "plaitcode.relay.phone",
+        "title": "PlaitCode: 手机加入团队群（二维码）",
+        "icon": "$(device-mobile)"
       }
     ],
     "viewsContainers": {

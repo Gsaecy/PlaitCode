@@ -21,6 +21,7 @@ const TRANSCRIPT_FILE = 'docs/TEAM-CHAT.md';
 import { LanSyncService, defaultDeviceName, defaultPlatform, lanAddresses, peerIdFor, type LanSyncBridge } from './lanSync';
 import { GroupPanel } from '../views/groupPanel';
 import { MobilePanel } from '../views/mobilePanel';
+import { RelayPhonePanel } from '../views/relayPhonePanel';
 import { RelayClient } from './relayClient';
 import { buildPairingText, newPairingSecret, parsePairingText } from './relayCrypto';
 
@@ -75,6 +76,8 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   let deviceName = setting('lanSync.deviceName', '');
   /** 跨网中继客户端（没加入频道时是 undefined）。 */
   let relay: RelayClient | undefined;
+  /** 频道密钥：SecretStorage 是异步的，这里缓存一份，供同步拼手机链接用。 */
+  let relayKey = '';
   const relaySecretKey = 'plaitcode.relay.secret';
 
   const bridge: LanSyncBridge = {
@@ -214,8 +217,16 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    * 密钥存在 SecretStorage（不进 settings.json），中转只见到密文。
    */
   const relayUrl = (): string => setting('relay.url', '').trim();
+  /** 手机要打开的地址：密钥放在 fragment，不会进服务器日志。 */
+  const relayPhoneLink = (): string | undefined => {
+    const url = relayUrl();
+    if (!url || !relayKey) return undefined;
+    return `${url.replace(/\/+$/, '')}/m#k=${encodeURIComponent(relayKey)}`;
+  };
+  const relayPhonePanel = new RelayPhonePanel(context.extensionUri, { link: relayPhoneLink });
   const startRelay = (url: string, secret: string): void => {
     relay?.stop();
+    relayKey = secret;
     relay = new RelayClient({
       url,
       secret,
@@ -419,10 +430,16 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     vscode.commands.registerCommand('plaitcode.relay.leave', async () => {
       relay?.stop();
       relay = undefined;
+      relayKey = '';
       await context.secrets.delete(relaySecretKey);
       refreshStatus();
       void vscode.window.showInformationMessage('已退出跨网频道。');
     }),
+    /** 手机加入：显示二维码（密钥在 fragment 里，扫码即进）。 */
+    vscode.commands.registerCommand('plaitcode.relay.phone', async () => {
+      await relayPhonePanel.open();
+    }),
+    relayPhonePanel,
     { dispose: () => relay?.stop() },
     groupPanel,
     mobilePanel,
@@ -526,6 +543,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    */
   const storedRelaySecret = await context.secrets.get(relaySecretKey);
   if (storedRelaySecret && relayUrl()) startRelay(relayUrl(), storedRelaySecret);
+  relayKey = storedRelaySecret ?? '';
 
   return { service, disposables };
 }

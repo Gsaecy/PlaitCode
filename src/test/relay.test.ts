@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { makeRequirement, type SyncPeer } from '../sync/lanProtocol';
 import { RelayClient } from '../sync/relayClient';
-import { buildPairingText, deriveKeys, newPairingSecret, open, parsePairingText, seal } from '../sync/relayCrypto';
+import { CHANNEL_PREFIX, ENC_PREFIX, RELAY_PREFIX, buildPairingText, deriveKeys, newPairingSecret, open, parsePairingText, seal } from '../sync/relayCrypto';
 import { createRelayServer } from '../sync/relayServer';
+import { webcrypto } from 'node:crypto';
 
 /**
  * 跨网中继：真起服务、真发 HTTP、真加解密。
@@ -168,6 +169,79 @@ test('限流按真实客户端 IP 计（不是 nginx 的 127.0.0.1），健康�
   } finally {
     await relay.close();
   }
+});
+
+test('中继：/m 返回手机页面（不占限流额度）', async () => {
+  const relay = await createRelayServer({ port: 0, rateLimit: 3 });
+  const base = `http://127.0.0.1:${relay.port}`;
+  try {
+    for (let index = 0; index < 8; index += 1) {
+      const page = await fetch(`${base}/m`, { headers: { host: 'plaitcode.com' } });
+      assert.equal(page.status, 200, `第 ${index + 1} 次打开页面不该被限流`);
+      assert.match(page.headers.get('content-type') ?? '', /text\/html/);
+      const html = await page.text();
+      assert.match(html, /PlaitCode · 团队群/);
+      assert.ok(html.includes(CHANNEL_PREFIX), '页面里必须带与 Node 端一致的派生前缀');
+      assert.match(html, /plaitcode\.relay\.key/);
+    }
+  } finally {
+    await relay.close();
+  }
+});
+
+test('手机页面：relayHost 被清洗，注入不进去', async () => {
+  const relay = await createRelayServer({ port: 0 });
+  try {
+    const page = await fetch(`http://127.0.0.1:${relay.port}/m`, {
+      headers: { host: '"><script>alert(1)</script>' },
+    });
+    const html = await page.text();
+    assert.equal(html.includes('<script>alert(1)</script>'), false);
+  } finally {
+    await relay.close();
+  }
+});
+
+test('浏览器端（WebCrypto）与 Node 端密钥派生一致、密文可互解', async () => {
+  // 手机页面用 WebCrypto，桌面用 node:crypto。两边的派生和 AES-GCM 格式必须完全一致，
+  // 否则「手机发的消息电脑解不开」会在真机上才暴露 —— 这条测试就是把那个风险钉死。
+  const secret = newPairingSecret();
+  const nodeKeys = deriveKeys(secret);
+
+  const encoder = new TextEncoder();
+  const hash = async (prefix: string): Promise<Uint8Array> => new Uint8Array(
+    await webcrypto.subtle.digest('SHA-256', encoder.encode(prefix + secret)),
+  );
+  const channel = Buffer.from(await hash(CHANNEL_PREFIX)).toString('hex').slice(0, 32);
+  const relayKey = Buffer.from(await hash(RELAY_PREFIX)).toString('base64url');
+  const rawEnc = await hash(ENC_PREFIX);
+
+  assert.equal(channel, nodeKeys.channel);
+  assert.equal(relayKey, nodeKeys.relay);
+  assert.deepEqual(Buffer.from(rawEnc), nodeKeys.enc);
+
+  const key = await webcrypto.subtle.importKey('raw', rawEnc, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  const iv = webcrypto.getRandomValues(new Uint8Array(12));
+  const plaintext = JSON.stringify({ kind: 'group', body: '手机发的需求' });
+  const cipher = await webcrypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: encoder.encode(`${channel}:msg-web`), tagLength: 128 },
+    key,
+    encoder.encode(plaintext),
+  );
+  const envelope = {
+    iv: Buffer.from(iv).toString('base64'),
+    ct: Buffer.from(new Uint8Array(cipher)).toString('base64'),
+  };
+  // 浏览器加密 → Node 解密
+  assert.equal(open(nodeKeys, 'msg-web', envelope), plaintext);
+  // 反过来：Node 加密 → 浏览器解密（AAD 一致才解得开）
+  const sealedByNode = seal(nodeKeys, 'msg-node', plaintext);
+  const decrypted = await webcrypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: Buffer.from(sealedByNode.iv, 'base64'), additionalData: encoder.encode(`${channel}:msg-node`), tagLength: 128 },
+    key,
+    Buffer.from(sealedByNode.ct, 'base64'),
+  );
+  assert.equal(new TextDecoder().decode(decrypted), plaintext);
 });
 
 test('中继：密钥不匹配的设备发不进去也读不到', async () => {

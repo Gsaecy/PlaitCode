@@ -10,6 +10,7 @@
 
 import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { renderRelayMobilePage } from './relayPage';
 
 export interface RelayOptions {
   port?: number;
@@ -152,14 +153,29 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       const route = rawUrl.split('?')[0] ?? '/';
       const query = new URLSearchParams(rawUrl.slice(rawUrl.indexOf('?') + 1));
 
-      // 健康检查不限流：监控、探活、负载均衡都会打它，不该占用户额度。
+      // 健康检查与手机页面不限流：探活和首次打开都不该占用户额度。
       const isHealth = route === '/health' || route === '/';
-      if (!isHealth) {
+      const isStatic = isHealth || route === '/m';
+      if (!isStatic) {
         const ip = clientIp(request);
         if (!allowed(ip)) {
           json(response, 429, { ok: false, error: 'too many requests' });
           return;
         }
+      }
+
+      if (request.method === 'GET' && route === '/m') {
+        const html = renderRelayMobilePage({ relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com' });
+        response.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'content-length': Buffer.byteLength(html),
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+          'x-frame-options': 'DENY',
+          'referrer-policy': 'no-referrer',
+        });
+        response.end(html);
+        return;
       }
 
       if (request.method === 'GET' && isHealth) {
