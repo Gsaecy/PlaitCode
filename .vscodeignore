@@ -24,3 +24,5 @@ docs/**
 # 本地临时工作目录：tmp-* 只在 .gitignore 里，vsce 不认，必须在这里再排一次
 # （0.4.19 第一次打包时把 tmp-app-guidelines/ 的 9428 个文件一起打了进去）
 tmp-*/**
+deploy/**
+.plaitcode-*
