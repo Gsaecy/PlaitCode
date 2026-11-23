@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.1（2026-11-24）
+
+### 补齐跨网中继的命令入口
+
+0.5.0 打包时，`relay.*` 五个命令只在代码里 `registerCommand`，**没有写进 `package.json` 的
+`contributes.commands`**，所以命令面板里搜不到（虽然能靠快捷键/内部调用执行）。
+0.5.1 把它们补上：
+
+| 命令 | 用途 |
+|---|---|
+| `PlaitCode: 新建跨网频道` | 填中继地址（如 `https://plaitcode.com`），生成频道并复制配对信息 |
+| `PlaitCode: 加入跨网频道` | 粘贴另一台设备的配对信息 |
+| `PlaitCode: 复制配对信息` | 把当前频道的钥匙再复制一次 |
+| `PlaitCode: 查看跨网中继状态` | 连接状态、在线设备数、收发计数 |
+| `PlaitCode: 退出跨网频道` | 清除本地配对密钥 |
+
+### 中继部署包
+
+新增 `deploy/relay/`：一键安装脚本（Node 锁版本到 `/opt`、systemd 专用用户、
+nginx 反代、Let's Encrypt 自动续期、journald 上限）、零依赖 `server.cjs`、部署说明。
+
 ## 0.5.0（2026-11-24）
 
 ### 品牌迁移：HWChat → PlaitCode
