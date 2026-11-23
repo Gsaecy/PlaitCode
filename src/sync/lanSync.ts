@@ -113,6 +113,13 @@ export interface LanSyncBridge {
    * 只在「本机产生」时调用，收到别人的消息不会再触发，避免回声。
    */
   onOutgoing?(message: SyncMessage): void;
+  /**
+   * 中继上收到「甲方在群里发的需求」：本机要真的开跑。
+   *
+   * 与 `onMobileMessage` 的区别：那条会**再广播一次**（局域网里由本机转发），
+   * 这条不会 —— 中继已经把消息发给所有设备了，再广播就是环。
+   */
+  onRelayUserMessage?(text: string): Promise<void> | void;
 }
 
 export type LanSyncRole = 'off' | 'hub' | 'peer';
@@ -319,7 +326,25 @@ export class LanSyncService implements Disposable {
    * 用 `relay: false`：中继已经把它发给所有设备了，这里再转发就是回路。
    */
   async ingestRelayMessage(message: SyncMessage): Promise<void> {
+    /*
+     * 手机（或另一台设备）以**甲方**身份在群里发的需求，本机也要真的开跑。
+     *
+     * 群消息本身不触发执行（那是防「两个 agent 互相接龙」的设计），但甲方发的话
+     * 是唯一的例外：他说要做，就得做。上层用 `origin: 'sync'` 交出去，本机**不会**
+     * 再广播一次 —— 手机已经通过中继广播过了，再发就是环。
+     *
+     * 去重按 id：同一条消息被重复投递（断线重连）时只开跑一次。
+     */
+    const fresh = message.kind === 'group' && !this.group.some((item) => item.id === message.id);
     await this.applyMessage(message, { relay: false });
+    if (fresh && message.kind === 'group' && message.author === 'user'
+      && message.phase === 'requirement' && message.from.id !== this.bridge.peer().id) {
+      try {
+        await this.bridge.onRelayUserMessage?.(message.body);
+      } catch (error) {
+        this.bridge.log(`[relay] 处理甲方需求失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+      }
+    }
   }
 
   /** 本机产生的消息交给中继（没接中继时是空操作）。 */

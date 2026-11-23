@@ -93,6 +93,21 @@ function bearer(request: IncomingMessage): string {
   return match?.[1]?.trim() ?? '';
 }
 
+/**
+ * 真实客户端 IP。
+ *
+ * 中继只监听 127.0.0.1，前面一定有 nginx —— 这时候 `socket.remoteAddress` 永远
+ * 是 127.0.0.1，如果拿它做限流，**所有用户会共用一个桶**：一个扫描器就能把
+ * 所有人的额度打光。所以优先读 nginx 写的 `X-Real-IP`。
+ */
+function clientIp(request: IncomingMessage): string {
+  const real = request.headers['x-real-ip'];
+  if (typeof real === 'string' && real.trim()) return real.trim();
+  const forwarded = request.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) return forwarded.split(',')[0]!.trim();
+  return (request.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
+}
+
 export async function createRelayServer(options: RelayOptions = {}): Promise<RelayHandle> {
   const maxMessages = Math.max(20, options.maxMessages ?? 500);
   const maxWaitMs = Math.max(1_000, Math.min(options.maxWaitMs ?? 22_000, 25_000));
@@ -133,16 +148,21 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
 
   const server: Server = createServer((request, response) => {
     void (async () => {
-      const ip = (request.socket.remoteAddress ?? '').replace(/^::ffff:/, '');
-      if (!allowed(ip)) {
-        json(response, 429, { ok: false, error: 'too many requests' });
-        return;
-      }
       const rawUrl = request.url ?? '/';
       const route = rawUrl.split('?')[0] ?? '/';
       const query = new URLSearchParams(rawUrl.slice(rawUrl.indexOf('?') + 1));
 
-      if (request.method === 'GET' && (route === '/health' || route === '/')) {
+      // 健康检查不限流：监控、探活、负载均衡都会打它，不该占用户额度。
+      const isHealth = route === '/health' || route === '/';
+      if (!isHealth) {
+        const ip = clientIp(request);
+        if (!allowed(ip)) {
+          json(response, 429, { ok: false, error: 'too many requests' });
+          return;
+        }
+      }
+
+      if (request.method === 'GET' && isHealth) {
         json(response, 200, {
           ok: true,
           service: 'plaitcode-relay',

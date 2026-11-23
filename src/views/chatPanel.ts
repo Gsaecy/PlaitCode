@@ -946,6 +946,16 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
   }
 
   /**
+   * 中继上收到「甲方在群里发的需求」：本机开跑，但**不再广播**。
+   *
+   * 手机已经把这条消息通过中继发给所有设备了，这里再广播就是环；
+   * 用 `origin: 'sync'` 正好跳过广播分支（也不会弹「只发给本机」的提示）。
+   */
+  async runRelayedUserRequirement(text: string): Promise<void> {
+    await this.send(text, undefined, undefined, undefined, undefined, undefined, { origin: 'sync' });
+  }
+
+  /**
    * 群里出现了新发言：追加到当前对话。
    *
    * @deprecated 群消息现在进独立的「团队群」窗口（`GroupPanel`），主对话不再插队，

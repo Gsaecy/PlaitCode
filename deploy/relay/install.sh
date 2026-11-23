@@ -110,8 +110,13 @@ UNIT
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null 2>&1
 systemctl restart "$SERVICE"
-sleep 1
-systemctl is-active "$SERVICE" >/dev/null || die "服务没起来，看日志：journalctl -u $SERVICE -n 50 --no-pager"
+# 重启后进程立刻算 active，但端口未必已经 listen —— 必须轮询到真的能响应为止，
+# 否则后面 nginx/certbot 的自检会撞上竞态，看到假的 502。
+for attempt in $(seq 1 20); do
+  if curl -fsS -m 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then break; fi
+  [ "$attempt" -eq 20 ] && die "服务 20 秒内没起来，看日志：journalctl -u $SERVICE -n 50 --no-pager"
+  sleep 0.5
+done
 ok "服务运行中（127.0.0.1:${PORT}）"
 curl -fsS "http://127.0.0.1:${PORT}/health" || die "本机自检失败：journalctl -u $SERVICE -n 50 --no-pager"
 echo

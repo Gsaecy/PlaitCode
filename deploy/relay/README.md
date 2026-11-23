@@ -49,11 +49,24 @@ certbot certificates                 # 证书与到期时间
 npm run build:relay
 git add deploy/relay/server.cjs && git commit -m "relay: rebuild" && git push
 
-# 服务器
+# 服务器（注意 sleep：systemctl restart 返回时进程刚起来，端口可能还没 listen）
 curl -fsSL https://raw.githubusercontent.com/Gsaecy/PlaitCode/main/deploy/relay/server.cjs \
   -o /opt/plaitcode-relay/server.cjs
 systemctl restart plaitcode-relay
+sleep 2
+curl -s https://plaitcode.com/health   # 应输出 {"ok":true,...}
 ```
+
+如果 `curl` 立刻返回 nginx 的 **502**，先别改配置，等两秒再试：
+
+```bash
+curl -s http://127.0.0.1:8787/health          # 直连服务
+systemctl status plaitcode-relay --no-pager  # 服务是否 active
+journalctl -u plaitcode-relay -n 30 --no-pager
+```
+
+`/health` 从本机也连不上 = 服务真的挂了（看日志）；
+本机能连、走域名 502 = nginx 或证书的问题（`nginx -t`）。
 
 ## 数据与隐私
 

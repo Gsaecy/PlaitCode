@@ -33,6 +33,8 @@ export interface LanSetupOptions {
     runSyncNote(note: import('./lanProtocol').SyncNote): Promise<boolean>;
     /** 群窗口里发一句话（需求或回答），由面板决定走哪条路径。 */
     sendGroupMessage(text: string): Promise<void>;
+    /** 中继上收到甲方需求：开跑但不再广播。 */
+    runRelayedUserRequirement(text: string): Promise<void>;
   };
   version: string;
 }
@@ -171,6 +173,11 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         if (!result.ok) output.warn(`[relay] ${result.message}`);
       });
     },
+    /**
+     * 手机在群里发的需求（经中继到达）：本机开跑。
+     * 不再广播 —— 中继已经发给所有设备了。
+     */
+    onRelayUserMessage: (text) => chat.runRelayedUserRequirement(text),
   };
 
   const service = new LanSyncService(join(context.globalStorageUri.fsPath, 'lan-sync.json'), bridge);

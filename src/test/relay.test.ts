@@ -143,6 +143,33 @@ test('中继：两台设备经真实中转互通，且中转只拿到密文', as
   }
 });
 
+test('限流按真实客户端 IP 计（不是 nginx 的 127.0.0.1），健康检查不占额度', async () => {
+  // 线上踩到的真问题：中继只监听 127.0.0.1，`socket.remoteAddress` 永远是 127.0.0.1，
+  // 于是所有用户共用一个限流桶，一个扫描器就能把所有人的额度打光。
+  const relay = await createRelayServer({ port: 0, rateLimit: 3 });
+  const base = `http://127.0.0.1:${relay.port}`;
+  try {
+    for (let index = 0; index < 6; index += 1) {
+      const health = await fetch(`${base}/health`);
+      assert.equal(health.status, 200, `第 ${index + 1} 次健康检查不该被限流`);
+    }
+
+    const call = (ip: string): Promise<Response> => fetch(`${base}/v1/poll?channel=abc&since=0&wait=0`, {
+      headers: { 'x-real-ip': ip },
+    });
+    // 服务端把限流下限卡在 10 次/分钟（防止有人配成 0 等于关掉防线），所以打 12 次
+    const statuses: number[] = [];
+    for (let index = 0; index < 12; index += 1) statuses.push((await call('203.0.113.7')).status);
+    assert.deepEqual(statuses.slice(0, 10), new Array(10).fill(403));
+    assert.deepEqual(statuses.slice(10), [429, 429]);
+
+    // 换一个客户端 IP 不受前一个人的额度影响
+    assert.equal((await call('203.0.113.8')).status, 403);
+  } finally {
+    await relay.close();
+  }
+});
+
 test('中继：密钥不匹配的设备发不进去也读不到', async () => {
   const relay = await createRelayServer({ port: 0, maxWaitMs: 1_000 });
   const base = `http://127.0.0.1:${relay.port}`;
