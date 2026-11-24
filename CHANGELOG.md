@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0（2026-11-24）
+
+### 飞书登录（SSO）
+
+阶段二最后一块代码：员工用飞书账号登录，管理员不用再手工发令牌。
+
+- `GET /v1/auth/feishu/start` → 飞书授权页（`state` 自带签名 + 10 分钟有效期，防 CSRF／重放）；
+- `GET /v1/auth/feishu/callback` → 换 `user_access_token` → 取姓名/邮箱 →
+  **邮箱白名单**校验 → 按邮箱找成员 → 找不到就在第一个组织**自动开户为 member** →
+  下发 `HttpOnly + Secure + SameSite=Lax` 会话 Cookie → 回到 `/m`；
+- `GET /v1/auth/me`、`POST /v1/auth/logout`；
+- 端点可用 `PLAITCODE_FEISHU_{AUTHORIZE,TOKEN,USERINFO}` 覆盖 —— 飞书改过几次授权域名，
+  真机联调不该为了一个 URL 重新打包；
+- 换 token 先试 v2（`client_id`/`client_secret`），失败回落 v1 参数形态。
+
+**为什么按 email 映射成员**：飞书的 `open_id` 只在单个应用内唯一，换应用就变；
+`union_id` 与 `email` 才稳定，而 email 还能直接对上企业邮箱目录。
+
+**离职即失效**：飞书停用账号 → SSO 登不进来；管理接口 `devices/revoke` 吊销设备 → 立即断开。
+两条路一起断，这是企业最在意的一条。
+
+新增 6 条单测：state 签名与过期、会话签名与篡改、授权地址、邮箱白名单、换 token（真 HTTP mock）、
+以及整条回调链路的端到端（跳转 → 回调 → 会话 → `/v1/auth/me` → 自动开户且不重复开户）。
+
 ## 0.6.1（2026-11-24）
 
 ### 审计外送：syslog / webhook / OTLP

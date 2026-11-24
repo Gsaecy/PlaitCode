@@ -120,6 +120,39 @@ PLAITCODE_AUDIT_SINK=otlp+http://collector:4318/v1/logs
 完整性由本地 JSONL 保证，外送只是为了集中检索。OTLP 的 payload 是标准
 `resourceLogs → scopeLogs → logRecords`，`timeUnixNano` 取自审计行的 `ts`。
 
+### 飞书登录（SSO）
+
+飞书不是标准 OIDC，走 OAuth 2.0 授权码。四个环境变量齐了就生效：
+
+```bash
+PLAITCODE_IDENTITY=/var/lib/plaitcode-relay/identity.json   # 必须有身份库（成员在这里）
+PLAITCODE_FEISHU_APP_ID=cli_xxxxxxxxxxxx
+PLAITCODE_FEISHU_APP_SECRET=xxxxxxxx                         # 只存在于服务器
+PLAITCODE_AUTH_SECRET=$(openssl rand -hex 32)                # 会话签名密钥
+PLAITCODE_AUTH_EMAIL_DOMAINS=yourcompany.com,acme.com        # 允许自动开户的域名
+```
+
+飞书后台对应配置：应用能力 → **网页应用**（打开方式选「在浏览器中打开」）、
+安全设置 → 重定向 URL = `https://<你的域名>/v1/auth/feishu/callback`、
+权限 = `contact:user.base:readonly` + `contact:user.email:readonly`。
+
+流程：
+
+```
+GET /v1/auth/feishu/start      → 302 到飞书授权页（state 自带签名与 10 分钟有效期）
+GET /v1/auth/feishu/callback   → 换 user_access_token → 取姓名/邮箱
+                               → 邮箱不在白名单 → 403
+                               → 按邮箱找成员；找不到就在第一个组织自动开户为 member
+                               → 下发 HttpOnly + Secure + SameSite=Lax 会话 Cookie → 302 /m
+GET /v1/auth/me                → 当前成员（未登录 401）
+POST /v1/auth/logout           → 清 Cookie
+```
+
+**离职即失效**：飞书停用账号后 SSO 登不进来；再用管理接口 `devices/revoke` 吊销设备，
+两条路一起断。设备令牌仍然由管理员发放（不做自助登记，避免"谁都能把自己加进来"）。
+
+飞书的用户标识里，**用 email 做成员映射**（`open_id` 只在单个应用内唯一，换应用就变）。
+
 ### 企业策略（`policy.json`）
 
 放在工作区 `.plaitcode/policy.json`，或用 MDM / 仓库模板统一下发：
@@ -150,7 +183,7 @@ PLAITCODE_AUDIT_SINK=otlp+http://collector:4318/v1/logs
 | 审计流水（JSONL） | ✅ 已完成 | 见上 |
 | 策略下发 | ✅ 已完成 | 见上 |
 | **组织 / 团队 / 成员 / 设备 / 角色** | ✅ 已完成 | 一人多设备、一设备多频道；设备令牌只存哈希；可吊销 |
-| **SSO（OIDC / SAML）** | ⬜ 未开始 | 需要客户提供 IdP（Azure AD / Okta / 飞书 / 企业微信） |
+| **SSO（OIDC / SAML）** | ✅ 飞书已支持 | 授权码流程 + 会话 Cookie；首次登录按邮箱自动开户 |
 | SCIM 自动开户销户 | ⬜ 未开始 | 依赖 SSO |
 | 审计导出到 SIEM | ✅ 已完成 | `PLAITCODE_AUDIT_SINK`：syslog(UDP/TCP) / webhook / OTLP |
 | 境内节点 + 备案 | ⬜ 待启动 | **流程 1–3 周，建议尽早开始**，不占开发资源 |

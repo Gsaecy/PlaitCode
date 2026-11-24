@@ -8,10 +8,11 @@
  * 对我们这种「人类说话」的频率（每秒几次都算多）足够。
  */
 
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { AuditLog, type AuditOptions } from './relayAudit';
 import { renderRelayMobilePage } from './relayPage';
+import { parseCookies } from './mobileControl';
 import {
   addDevice,
   addMember,
@@ -23,6 +24,16 @@ import {
   type Action,
   type IdentityState,
 } from './relayIdentity';
+import {
+  buildAuthorizeUrl,
+  emailAllowed,
+  exchangeCode,
+  signSession,
+  signState,
+  verifySession,
+  verifyState,
+  type FeishuConfig,
+} from './relayAuth';
 
 export interface RelayOptions {
   port?: number;
@@ -42,6 +53,14 @@ export interface RelayOptions {
   identity?: { state: IdentityState; path?: string };
   /** 管理接口令牌（请求头 `x-plaitcode-admin`）。不填就关闭管理接口。 */
   adminToken?: string;
+  /** 飞书登录（SSO）。需要身份库一起开启。 */
+  auth?: {
+    config: FeishuConfig;
+    secret: string;
+    /** 允许自动开户的邮箱域名；空数组表示不限制（内网自用）。 */
+    emailDomains?: string[];
+    sessionTtlMs?: number;
+  };
   log?: (line: string) => void;
 }
 
@@ -250,6 +269,110 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         response.end(html);
         return;
       }
+
+      /* ---------------- 飞书登录（SSO） ---------------- */
+
+      if (route === '/v1/auth/feishu/start' && request.method === 'GET') {
+        const auth = options.auth;
+        if (!auth || !identity) {
+          json(response, 404, { ok: false, error: 'sso disabled' });
+          return;
+        }
+        const state = signState(auth.secret, crypto.randomUUID());
+        response.writeHead(302, { location: buildAuthorizeUrl(auth.config, state), 'cache-control': 'no-store' });
+        response.end();
+        return;
+      }
+
+      if (route === '/v1/auth/feishu/callback' && request.method === 'GET') {
+        const auth = options.auth;
+        if (!auth || !identity) {
+          json(response, 404, { ok: false, error: 'sso disabled' });
+          return;
+        }
+        if (!verifyState(auth.secret, query.get('state') ?? undefined)) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: 'sso state invalid' });
+          json(response, 400, { ok: false, error: 'state 无效或已过期，请重新登录' });
+          return;
+        }
+        const code = query.get('code') ?? '';
+        if (!code) {
+          json(response, 400, { ok: false, error: '缺少 code' });
+          return;
+        }
+        const result = await exchangeCode(auth.config, code);
+        if (!result.ok) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: `sso exchange failed: ${result.error}` });
+          json(response, 502, { ok: false, error: `飞书登录失败：${result.error}` });
+          return;
+        }
+        if (!emailAllowed(result.identity.email, auth.emailDomains ?? [])) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: `sso email not allowed: ${result.identity.email ?? '(none)'}` });
+          json(response, 403, { ok: false, error: '这个邮箱不在允许的域名内' });
+          return;
+        }
+        // 先按邮箱找成员；找不到就在第一个组织里自动开户为 member
+        let member = identity.state.members.find((item) => result.identity.email
+          && item.name && item.id && (item as { email?: string }).email === result.identity.email);
+        if (!member && result.identity.email) {
+          const org = identity.state.orgs[0];
+          if (!org) {
+            json(response, 409, { ok: false, error: '服务端还没有组织，请管理员先建组织' });
+            return;
+          }
+          member = addMember(identity.state, { orgId: org.id, name: result.identity.name, role: 'member' });
+          if (member) {
+            (member as { email?: string }).email = result.identity.email;
+            await persistIdentity();
+            audit.record({ event: 'admin', ip: clientIp(request), detail: `auto-provision ${result.identity.email}` });
+          }
+        }
+        if (!member) {
+          json(response, 409, { ok: false, error: '无法建立成员身份，请联系管理员' });
+          return;
+        }
+        const ttl = auth.sessionTtlMs ?? 12 * 60 * 60_000;
+        const cookie = signSession(auth.secret, {
+          memberId: member.id,
+          name: member.name,
+          ...(result.identity.email ? { email: result.identity.email } : {}),
+          exp: Date.now() + ttl,
+        });
+        audit.record({ event: 'login', ip: clientIp(request), detail: member.name });
+        response.writeHead(302, {
+          location: '/m',
+          'set-cookie': `plaitcode_session=${cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`,
+          'cache-control': 'no-store',
+        });
+        response.end();
+        return;
+      }
+
+      if (route === '/v1/auth/me' && request.method === 'GET') {
+        const auth = options.auth;
+        if (!auth) {
+          json(response, 404, { ok: false, error: 'sso disabled' });
+          return;
+        }
+        const session = verifySession(auth.secret, parseCookies(request.headers.cookie).plaitcode_session);
+        if (!session) {
+          json(response, 401, { ok: false, error: '未登录' });
+          return;
+        }
+        json(response, 200, { ok: true, member: { id: session.memberId, name: session.name, email: session.email ?? null } });
+        return;
+      }
+
+      if (route === '/v1/auth/logout' && request.method === 'POST') {
+        response.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'set-cookie': 'plaitcode_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
+        });
+        response.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      /* ---------------- 管理接口 ---------------- */
 
       if (route.startsWith('/v1/admin/')) {
         if (!identity || !adminToken) {

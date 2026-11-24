@@ -109,7 +109,7 @@ export function addOrg(state: IdentityState, name: string): Org {
 }
 
 /** 加成员（角色默认 member）。 */
-export function addMember(state: IdentityState, input: { orgId: string; name: string; role?: Role }): Member | undefined {
+export function addMember(state: IdentityState, input: { orgId: string; name: string; role?: Role; email?: string }): Member | undefined {
   if (!state.orgs.some((org) => org.id === input.orgId)) return undefined;
   const role: Role = isRole(input.role) ? input.role : 'member';
   const member: Member = {

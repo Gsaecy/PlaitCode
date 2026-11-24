@@ -8,6 +8,7 @@
 import { createRelayServer } from './relayServer';
 import { emptyIdentity, loadIdentity } from './relayIdentity';
 import { createSink, parseSink } from './relayAuditSink';
+import type { FeishuConfig } from './relayAuth';
 import { hostname as osHostname } from 'node:os';
 
 async function main(): Promise<void> {
@@ -36,12 +37,38 @@ async function main(): Promise<void> {
   const externalSink = sinkSpec ? createSink(sinkSpec, { hostname: osHostname() }) : undefined;
   if (sinkSpec) console.log(`[relay] 审计外送：${sinkSpec.kind} → ${sinkSpec.url.host}`);
 
+  /* 飞书登录（SSO）：四个环境变量齐了才启用 */
+  const feishuAppId = process.env.PLAITCODE_FEISHU_APP_ID?.trim() ?? '';
+  const feishuSecret = process.env.PLAITCODE_FEISHU_APP_SECRET?.trim() ?? '';
+  const authSecret = process.env.PLAITCODE_AUTH_SECRET?.trim() ?? '';
+  const publicUrl = (process.env.PLAITCODE_PUBLIC_URL?.trim() || 'https://plaitcode.com').replace(/\/+$/, '');
+  const feishuConfig: FeishuConfig | undefined = feishuAppId && feishuSecret
+    ? {
+      appId: feishuAppId,
+      appSecret: feishuSecret,
+      redirectUri: `${publicUrl}/v1/auth/feishu/callback`,
+      ...(process.env.PLAITCODE_FEISHU_AUTHORIZE ? { endpoints: { authorize: process.env.PLAITCODE_FEISHU_AUTHORIZE } } : {}),
+      ...(process.env.PLAITCODE_FEISHU_TOKEN ? { endpoints: { token: process.env.PLAITCODE_FEISHU_TOKEN } } : {}),
+      ...(process.env.PLAITCODE_FEISHU_USERINFO ? { endpoints: { userinfo: process.env.PLAITCODE_FEISHU_USERINFO } } : {}),
+    }
+    : undefined;
+  const sso = feishuConfig && authSecret && identity
+    ? {
+      config: feishuConfig,
+      secret: authSecret,
+      emailDomains: (process.env.PLAITCODE_AUTH_EMAIL_DOMAINS ?? '').split(',').map((item) => item.trim()).filter(Boolean),
+    }
+    : undefined;
+  if (sso) console.log('[relay] 飞书登录已启用');
+  else if (feishuAppId) console.log('[relay] 警告：飞书登录需要 PLAITCODE_AUTH_SECRET 与身份库（PLAITCODE_IDENTITY）');
+
   const handle = await createRelayServer({
     port: Number.isFinite(port) && port > 0 ? port : 8787,
     host,
     log: (line) => console.log(line),
     ...(identity ? { identity } : {}),
     ...(adminToken ? { adminToken } : {}),
+    ...(sso ? { auth: sso } : {}),
     audit: {
       ...(auditPath && auditPath !== '-' ? { path: auditPath } : {}),
       sink: ((line: string) => {
