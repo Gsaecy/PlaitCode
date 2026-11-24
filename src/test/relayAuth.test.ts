@@ -156,3 +156,63 @@ test('端到端：登录跳转 → 回调换 token → 下发会话 → /v1/auth
     mock.close();
   }
 });
+
+test('端到端：飞书没返回邮箱时用 open_id 开户；配了白名单则明确拒绝并提示加权限', async () => {
+  let withEmail = false;
+  const mock = createServer((request, response) => {
+    if (request.url?.startsWith('/token')) {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ access_token: 'u-abc' }));
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ data: withEmail ? { name: '小李', email: 'li@acme.com', open_id: 'ou_123' } : { name: '小李', open_id: 'ou_123' } }));
+  });
+  await new Promise<void>((resolve) => mock.listen(0, '127.0.0.1', resolve));
+  const address = mock.address();
+  const mockPort = typeof address === 'object' && address ? address.port : 0;
+
+  const state = emptyIdentity();
+  addOrg(state, 'Acme');
+  const config: FeishuConfig = { ...baseConfig, endpoints: { token: `http://127.0.0.1:${mockPort}/token`, userinfo: `http://127.0.0.1:${mockPort}/userinfo` } };
+  const login = async (relayPort: number): Promise<Response> => {
+    const base = `http://127.0.0.1:${relayPort}`;
+    const start = await fetch(`${base}/v1/auth/feishu/start`, { redirect: 'manual' });
+    const stateToken = new URL(start.headers.get('location') ?? '').searchParams.get('state') ?? '';
+    return fetch(`${base}/v1/auth/feishu/callback?code=abc&state=${encodeURIComponent(stateToken)}`, { redirect: 'manual' });
+  };
+
+  const openRelay = await createRelayServer({ port: 0, identity: { state }, auth: { config, secret: 'session-secret', emailDomains: [] } });
+  try {
+    // 白名单为空：没邮箱也能靠 open_id 开户
+    assert.equal((await login(openRelay.port)).status, 302);
+    assert.equal(state.members.length, 1);
+    assert.equal(state.members[0]?.openId, 'ou_123');
+    assert.equal(state.members[0]?.email, undefined);
+
+    // 再登一次：同一个 open_id 认回同一人，不重复开户
+    assert.equal((await login(openRelay.port)).status, 302);
+    assert.equal(state.members.length, 1, 'open_id 应能认回同一个人');
+  } finally {
+    openRelay.close();
+  }
+
+  // 白名单非空但飞书没给邮箱 → 拒绝，并明确告诉运维去开哪个权限
+  const strictRelay = await createRelayServer({ port: 0, identity: { state }, auth: { config, secret: 'session-secret', emailDomains: ['acme.com'] } });
+  try {
+    const denied = await login(strictRelay.port);
+    assert.equal(denied.status, 403);
+    const body = await denied.json() as { error: string };
+    assert.match(body.error, /contact:user\.email:readonly/);
+    assert.equal(state.members.length, 1, '被拒绝时不该开户');
+
+    // 一旦飞书给了邮箱，同一个人按邮箱认回（open_id 开户的那条记录）
+    withEmail = true;
+    assert.equal((await login(strictRelay.port)).status, 302);
+    assert.equal(state.members.length, 1, '邮箱命中优先，仍不重复开户');
+    assert.equal(state.members[0]?.email, 'li@acme.com');
+  } finally {
+    strictRelay.close();
+    mock.close();
+  }
+});

@@ -134,15 +134,18 @@ PLAITCODE_AUTH_EMAIL_DOMAINS=yourcompany.com,acme.com        # 允许自动开�
 
 飞书后台对应配置：应用能力 → **网页应用**（打开方式选「在浏览器中打开」）、
 安全设置 → 重定向 URL = `https://<你的域名>/v1/auth/feishu/callback`、
-权限 = `contact:user.base:readonly` + `contact:user.email:readonly`。
+权限 = `contact:user.base:readonly`（必需）+ `contact:user.email:readonly`（**推荐**，见下）。
+改权限后必须**创建新版本并发布**才生效，只点「开通」不会生效。
 
 流程：
 
 ```
 GET /v1/auth/feishu/start      → 302 到飞书授权页（state 自带签名与 10 分钟有效期）
-GET /v1/auth/feishu/callback   → 换 user_access_token → 取姓名/邮箱
+GET /v1/auth/feishu/callback   → 换 user_access_token → 取姓名/邮箱/open_id
+                               → 配了白名单却没拿到邮箱 → 403（提示去开邮箱权限）
                                → 邮箱不在白名单 → 403
-                               → 按邮箱找成员；找不到就在第一个组织自动开户为 member
+                               → 认人：邮箱 → open_id → union_id；都没有 → 409
+                               → 第一次来就在第一个组织自动开户为 member
                                → 下发 HttpOnly + Secure + SameSite=Lax 会话 Cookie → 302 /m
 GET /v1/auth/me                → 当前成员（未登录 401）
 POST /v1/auth/logout           → 清 Cookie
@@ -151,7 +154,23 @@ POST /v1/auth/logout           → 清 Cookie
 **离职即失效**：飞书停用账号后 SSO 登不进来；再用管理接口 `devices/revoke` 吊销设备，
 两条路一起断。设备令牌仍然由管理员发放（不做自助登记，避免"谁都能把自己加进来"）。
 
-飞书的用户标识里，**用 email 做成员映射**（`open_id` 只在单个应用内唯一，换应用就变）。
+**成员映射的优先级**（`findMemberByIdentity`）：
+
+| 顺序 | 标识 | 说明 |
+|---|---|---|
+| 1 | `email`（小写比对） | 最稳，能直接对上企业邮箱目录；审计里也最好读 |
+| 2 | `open_id` | 应用内唯一，**没有邮箱权限时靠它认人** |
+| 3 | `union_id` | 同开发者多应用之间唯一，作为兜底 |
+
+因此 `PLAITCODE_AUTH_EMAIL_DOMAINS` 的语义是"**配了就强制校验**"：
+
+- 白名单**非空** → 必须有邮箱，且域名在名单内；没邮箱直接 403 并提示去开
+  `contact:user.email:readonly`（安全优先，绝不因为拿不到邮箱就放过）；
+- 白名单**为空** → 不限制域名，靠 `open_id` 也能开户（内网自用 / 演示环境）。
+
+先用 open_id 开的户，等客户后来补开邮箱权限，下一次登录会**自动把邮箱补写**进成员记录，
+不需要重建账号。
+
 
 ### 企业策略（`policy.json`）
 

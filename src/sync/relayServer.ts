@@ -18,6 +18,7 @@ import {
   addMember,
   addOrg,
   authorize,
+  findMemberByIdentity,
   identitySnapshot,
   revokeDevice,
   saveIdentity,
@@ -306,30 +307,50 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 502, { ok: false, error: `飞书登录失败：${result.error}` });
           return;
         }
+        if (auth.emailDomains?.length && !result.identity.email) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: 'sso email missing while domain allowlist configured' });
+          json(response, 403, {
+            ok: false,
+            error: '飞书没有返回邮箱，无法校验域名白名单。请给应用开通 contact:user.email:readonly 权限并发布版本，或把 PLAITCODE_AUTH_EMAIL_DOMAINS 清空。',
+          });
+          return;
+        }
         if (!emailAllowed(result.identity.email, auth.emailDomains ?? [])) {
           audit.record({ event: 'denied', ip: clientIp(request), detail: `sso email not allowed: ${result.identity.email ?? '(none)'}` });
           json(response, 403, { ok: false, error: '这个邮箱不在允许的域名内' });
           return;
         }
-        // 先按邮箱找成员；找不到就在第一个组织里自动开户为 member
-        let member = identity.state.members.find((item) => result.identity.email
-          && item.name && item.id && (item as { email?: string }).email === result.identity.email);
-        if (!member && result.identity.email) {
+        // 认人顺序：邮箱 → open_id → union_id；三者都没有就无法开户
+        const who = result.identity;
+        let member = findMemberByIdentity(identity.state, who);
+        if (!member && (who.email || who.openId || who.unionId)) {
           const org = identity.state.orgs[0];
           if (!org) {
             json(response, 409, { ok: false, error: '服务端还没有组织，请管理员先建组织' });
             return;
           }
-          member = addMember(identity.state, { orgId: org.id, name: result.identity.name, role: 'member' });
+          member = addMember(identity.state, {
+            orgId: org.id,
+            name: who.name,
+            role: 'member',
+            email: who.email,
+            openId: who.openId,
+            unionId: who.unionId,
+          });
           if (member) {
-            (member as { email?: string }).email = result.identity.email;
             await persistIdentity();
-            audit.record({ event: 'admin', ip: clientIp(request), detail: `auto-provision ${result.identity.email}` });
+            audit.record({ event: 'admin', ip: clientIp(request), detail: `auto-provision ${who.email ?? who.openId ?? who.unionId}` });
           }
         }
         if (!member) {
-          json(response, 409, { ok: false, error: '无法建立成员身份，请联系管理员' });
+          audit.record({ event: 'denied', ip: clientIp(request), detail: 'sso identity has no stable key' });
+          json(response, 409, { ok: false, error: '无法建立成员身份：飞书没有返回可用于识别身份的标识，请联系管理员' });
           return;
+        }
+        // 之前靠 open_id 开的户，客户后来补开了邮箱权限：补写邮箱，后续审计和按邮箱认人都能用
+        if (who.email && !member.email) {
+          member.email = who.email;
+          await persistIdentity();
         }
         const ttl = auth.sessionTtlMs ?? 12 * 60 * 60_000;
         const cookie = signSession(auth.secret, {

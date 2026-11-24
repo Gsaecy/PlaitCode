@@ -34,6 +34,19 @@ export interface Member {
   name: string;
   role: Role;
   createdAt: number;
+  /** SSO 开户时记下的邮箱，用于按邮箱认人。 */
+  email?: string;
+  /** 飞书 open_id（本应用内唯一）：应用没拿到邮箱权限时靠它认人。 */
+  openId?: string;
+  /** 飞书 union_id（同开发者多应用间唯一）。 */
+  unionId?: string;
+}
+
+/** 登录时能从 SSO 拿到的身份标识，任意一个命中就算同一个人。 */
+export interface MemberIdentityKey {
+  email?: string;
+  openId?: string;
+  unionId?: string;
 }
 
 export interface DeviceGrant {
@@ -109,7 +122,10 @@ export function addOrg(state: IdentityState, name: string): Org {
 }
 
 /** 加成员（角色默认 member）。 */
-export function addMember(state: IdentityState, input: { orgId: string; name: string; role?: Role; email?: string }): Member | undefined {
+export function addMember(
+  state: IdentityState,
+  input: { orgId: string; name: string; role?: Role; email?: string; openId?: string; unionId?: string },
+): Member | undefined {
   if (!state.orgs.some((org) => org.id === input.orgId)) return undefined;
   const role: Role = isRole(input.role) ? input.role : 'member';
   const member: Member = {
@@ -119,8 +135,30 @@ export function addMember(state: IdentityState, input: { orgId: string; name: st
     role,
     createdAt: Date.now(),
   };
+  if (input.email?.trim()) member.email = input.email.trim();
+  if (input.openId?.trim()) member.openId = input.openId.trim();
+  if (input.unionId?.trim()) member.unionId = input.unionId.trim();
   state.members.push(member);
   return member;
+}
+
+/**
+ * 按 SSO 身份找成员：邮箱优先，其次 open_id，最后 union_id。
+ *
+ * 邮箱不是必需项——客户不给飞书应用开邮箱权限时，仍能靠 open_id 认人。
+ */
+export function findMemberByIdentity(state: IdentityState, key: MemberIdentityKey): Member | undefined {
+  const email = key.email?.trim().toLowerCase();
+  if (email) {
+    const byEmail = state.members.find((item) => item.id && item.email?.trim().toLowerCase() === email);
+    if (byEmail) return byEmail;
+  }
+  if (key.openId) {
+    const byOpenId = state.members.find((item) => item.id && item.openId === key.openId);
+    if (byOpenId) return byOpenId;
+  }
+  if (key.unionId) return state.members.find((item) => item.id && item.unionId === key.unionId);
+  return undefined;
 }
 
 /**

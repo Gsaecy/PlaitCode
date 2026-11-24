@@ -10,6 +10,7 @@ import {
   authorize,
   deviceByToken,
   emptyIdentity,
+  findMemberByIdentity,
   identitySnapshot,
   loadIdentity,
   newDeviceToken,
@@ -113,3 +114,21 @@ test('身份库：落盘后能读回，快照不含令牌哈希', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('按 SSO 身份认人：邮箱优先，没邮箱就退到 open_id，再退到 union_id', () => {
+  const state = emptyIdentity();
+  const org = addOrg(state, 'Acme');
+  const byEmail = addMember(state, { orgId: org.id, name: '有邮箱', email: 'A@Honor-World.com' })!;
+  const byOpenId = addMember(state, { orgId: org.id, name: '没邮箱', openId: 'ou_abc' })!;
+  const byUnionId = addMember(state, { orgId: org.id, name: '只有联合身份', unionId: 'on_xyz' })!;
+
+  assert.equal(byEmail.email, 'A@Honor-World.com');
+  assert.equal(findMemberByIdentity(state, { email: 'a@honor-world.com' })?.id, byEmail.id, '邮箱按小写比对');
+  assert.equal(findMemberByIdentity(state, { openId: 'ou_abc' })?.id, byOpenId.id);
+  assert.equal(findMemberByIdentity(state, { unionId: 'on_xyz' })?.id, byUnionId.id);
+  assert.equal(findMemberByIdentity(state, { email: 'a@honor-world.com', openId: 'ou_abc' })?.id, byEmail.id, '邮箱命中优先');
+  assert.equal(findMemberByIdentity(state, { openId: 'ou_other', unionId: 'on_xyz' })?.id, byUnionId.id, 'open_id 没命中再试 union_id');
+  assert.equal(findMemberByIdentity(state, { email: 'nobody@honor-world.com' }), undefined);
+  assert.equal(findMemberByIdentity(state, {}), undefined);
+});
+
