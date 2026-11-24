@@ -1222,6 +1222,17 @@ export class LanSyncService implements Disposable {
     }
     const response = answer.data ?? {};
     if (Array.isArray(response.peers)) this.absorbPeers(response.peers);
+    /*
+     * 加入了谁的群，就信任谁。
+     *
+     * 不加这一步，主机的 /deliver 会被自己 403 拒绝 ——
+     * 表现就是「我加入了，但主机说的话我一条也收不到」。
+     */
+    const hostPeerId = (response.hub as { peer?: { id?: unknown } } | undefined)?.peer?.id;
+    if (typeof hostPeerId === 'string' && hostPeerId) {
+      this.approved.add(hostPeerId);
+      await this.persist();
+    }
     this.role = 'peer';
     this.hubAddress = target;
     this.inviteCode = '';
@@ -1252,7 +1263,18 @@ export class LanSyncService implements Disposable {
   }
 
   /** 加入某台主机。地址留空时用 UDP 广播自动寻找。 */
-  async joinHub(address?: string, port = this.configuredPort): Promise<{ ok: boolean; message: string }> {
+  async joinHub(
+    address?: string,
+    port = this.configuredPort,
+    options: { allowWhileHosting?: boolean } = {},
+  ): Promise<{ ok: boolean; message: string }> {
+    /*
+     * 已经在当群主时不再"加入"别人（那会把自己的群关掉），
+     * 除非调用方明确要求让位（两台都开群时的收敛）。
+     */
+    if (this.role === 'hub' && this.inviteCode && !options.allowWhileHosting) {
+      return { ok: false, message: '这台正在开群，不需要加入别的群。' };
+    }
     this.usePort(port);
     this.stopListener();
     try {
@@ -1643,6 +1665,66 @@ export class LanSyncService implements Disposable {
     this.bridge.onState?.();
   }
 
+  /**
+   * 从一个请求体里取出「发送方设备 id」。
+   *
+   * 用来判断是不是已允许过的设备 —— 这类设备不该因为邀请码变了就被拒绝。
+   */
+  private senderIdOf(parsed: Record<string, unknown>): string {
+    const fromMessage = (): string => {
+      const message = parseSyncMessage(parsed.message);
+      return message?.from.id ?? '';
+    };
+    const candidates = [
+      (parsed.peer as { id?: unknown } | undefined)?.id,
+      (parsed.from as string | undefined),
+      fromMessage(),
+    ];
+    for (const value of candidates) {
+      if (typeof value === 'string' && value) return value;
+    }
+    return '';
+  }
+
+  /**
+   * 记住发来消息的设备地址。
+   *
+   * 两台各自重启后可能都是群主、都没有对方的地址，于是各自发的消息无处可去。
+   * 只要有一方先发过来（比如 Windows 还留着 mac 的地址），另一方就能在这里
+   * 学到对方的来源 IP，链路立刻双向打通 —— 不需要重新走一遍配对。
+   */
+  private async rememberSender(
+    peer: SyncPeer,
+    remoteAddress: string | undefined,
+    declaredPort: unknown,
+  ): Promise<void> {
+    const selfId = this.bridge.peer().id;
+    if (peer.id === selfId) return;
+    const ip = (remoteAddress ?? '').replace(/^::ffff:/, '');
+    if (!ip) return;
+    /*
+     * **必须用对方自报的端口**。
+     *
+     * 以前没有时回落成 `this.port`（本机端口）—— 于是把对方记成了
+     * `http://<对方IP>:<本机端口>`，消息全发回自己身上，谁也收不到。
+     * 拿不到端口就只更新身份信息，不动地址。
+     */
+    const hasPort = typeof declaredPort === 'number' && declaredPort > 0 && declaredPort < 65_536;
+    const existing = this.peers.get(peer.id);
+    const address = hasPort ? `http://${ip}:${declaredPort}` : (existing?.address ?? '');
+    const isNew = !existing;
+    this.peers.set(peer.id, { peer, address });
+    // 只学过地址就够放行了；第一次见面仍然要走 /pair 或用户点「允许」。
+    if (!this.approved.has(peer.id)) this.approved.add(peer.id);
+    await this.persist();
+    if (hasPort || isNew) {
+      this.bridge.log(
+        `[sync] ${isNew ? '自动记下对方地址' : '更新对方地址'}：${peer.name} → ${address || '（端口未知）'}`,
+      );
+    }
+    this.bridge.onState?.();
+  }
+
   private selfAddress(remoteAddress: string | undefined): string {
     const own = lanAddresses();
     // 尽量回给对方能连上的那个网段：取与请求来源同前缀的第一个地址。
@@ -1719,16 +1801,21 @@ export class LanSyncService implements Disposable {
        * 三种途径），所以不能在这里一刀切 —— 否则「傻瓜式」的弹窗永远走不到。
        */
       /*
-       * 通行证：**邀请码或旧配对码，任一正确即可**。
+       * 通行证：**邀请码 / 旧配对码 / 已允许过的设备**，任一成立即可。
        *
-       * 以前这里只认旧配对码，而「填邀请码进群」之后发消息带的是邀请码 ——
-       * 于是主机一律 403：加入看着成功，群消息和需求却一条都传不过去。
+       * 前两条是「第一次见面」的凭据。第三条是**关键**：
+       * 两台机器各自重启后可能各自都成了群主、各自生成了不同的邀请码，
+       * 于是互相 403 —— 表现就是「各看各的群、谁也收不到谁的消息」。
+       * 已经互相允许过的设备不该因为换了码就被挡在外面。
        */
       const suppliedCode = normalizeInviteCode(typeof parsed.code === 'string' ? parsed.code : '');
       const codeAccepted = this.inviteCode
         ? suppliedCode === normalizeInviteCode(this.inviteCode)
         : pairingMatches(parsed.code, this.code);
-      if (route !== '/hwchat-sync/v1/pair' && !codeAccepted) {
+      const senderId = this.senderIdOf(parsed);
+      const trusted = Boolean(senderId) && this.approved.has(senderId);
+      if (route !== '/hwchat-sync/v1/pair' && !codeAccepted && !trusted) {
+        this.bridge.log(`[sync] 拒绝 ${route}：通行证不对（来源 ${senderId || '未知'}）`, 'warn');
         json(403, { ok: false, error: 'group code mismatch' });
         return;
       }
@@ -1788,31 +1875,26 @@ export class LanSyncService implements Disposable {
         });
         return;
       }
-      if (route === '/hwchat-sync/v1/message') {
+      if (route === '/hwchat-sync/v1/message' || route === '/hwchat-sync/v1/deliver') {
         const message = parseSyncMessage(parsed.message);
         if (!message) {
           json(400, { ok: false, error: 'invalid message' });
           return;
         }
-        // 主机先落账，再转发给其它设备（不回给发送方，避免回声）。
-        await this.applyMessage(message, { relay: true, from: message.from.id });
-        json(200, { ok: true });
-        return;
-      }
-      /*
-       * 对端（非主机）的接收端口：主机把需求转发到这里。
-       *
-       * 只接受主机转发的消息，且同样校验配对码 —— 这样即使有人知道端口，
-       * 没有配对码也没法让别人的机器执行任务。
-       */
-      if (route === '/hwchat-sync/v1/deliver') {
-        const message = parseSyncMessage(parsed.message);
-        if (!message) {
-          json(400, { ok: false, error: 'invalid message' });
-          return;
+        /*
+         * 收到可信设备的消息时，把它的地址记下来。
+         *
+         * 两台各自重启后都可能成了群主，谁也没有对方的地址 ——
+         * 于是各自发的消息都"无处可去"，互相永远收不到。
+         * 只要有一方先发过来，另一方就记住了地址，链路立刻双向打通。
+         */
+        await this.rememberSender(message.from, request.socket.remoteAddress, parsed.port);
+        if (route === '/hwchat-sync/v1/message') {
+          // 主机先落账，再转发给其它设备（不回给发送方，避免回声）。
+          await this.applyMessage(message, { relay: true, from: message.from.id });
+        } else {
+          await this.applyMessage(message, { relay: false, from: message.from.id });
         }
-        if (message.kind === 'requirement') this.peers.set(message.from.id, { peer: message.from, address: '' });
-        await this.applyMessage(message, { relay: false });
         json(200, { ok: true });
         return;
       }
@@ -2101,7 +2183,7 @@ export class LanSyncService implements Disposable {
       }
     }
     if (options.relay && this.role === 'hub') {
-      const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message });
+      const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message });
       const targets = this.peerList().filter((entry) => entry.address && entry.peer.id !== options.from);
       await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     }
@@ -2157,7 +2239,7 @@ export class LanSyncService implements Disposable {
     const relayResult = await this.relayOut(requirement);
 
     if (this.role !== 'off') {
-      const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message: requirement });
+      const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: requirement });
       if (this.role === 'hub') {
         const targets = this.peerList().filter((entry) => entry.address);
         const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
@@ -2213,7 +2295,7 @@ export class LanSyncService implements Disposable {
       this.bridge.onState?.();
       return { ok: true, message: '本机已记录。局域网同步未启用，没有发出。' };
     }
-    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message: note });
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: note });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
       const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
@@ -2266,12 +2348,12 @@ export class LanSyncService implements Disposable {
     this.bridge.onState?.();
     if (this.role === 'off') return { ok: true, message: '已记入团队群（未启用局域网同步，没有发给队友）。', group };
 
-    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message: group });
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: group });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
       await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     } else {
-      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.credential(), message: group }).catch(() => undefined);
+      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.credential(), port: this.port, message: group }).catch(() => undefined);
     }
     return { ok: true, message: '已发到团队群。', group };
   }
@@ -2367,12 +2449,12 @@ export class LanSyncService implements Disposable {
     await this.refreshLedger();
     void this.relayOut(report);
     if (this.role === 'off') return;
-    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message: report });
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: report });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
       await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     } else {
-      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.credential(), message: report }).catch(() => undefined);
+      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.credential(), port: this.port, message: report }).catch(() => undefined);
     }
     this.bridge.onState?.();
   }

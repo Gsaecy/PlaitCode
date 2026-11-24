@@ -824,6 +824,88 @@ test('项目身份 = 仓库地址：各种写法归一成同一个 ID，文件�
   assert.equal(sameProject({ project: 'app' }, { project: 'app' }), true);
 });
 
+test('群里的需求：本机 agent 必须拿到协议提示词，不是用户原文', async () => {
+  const { requirementPromptForLocal, makeRequirement } = await import('../sync/lanProtocol.js');
+  const peer = { id: 'p-win', name: 'PC · Windows', platform: 'win32' as const, project: 'app', version: 't' };
+  const requirement = makeRequirement(peer, 'agent 报数', 1000)!;
+
+  /*
+   * 真机踩过：群里发「agent 报数」，本机 agent 收到的就是这四个字，
+   * 于是既不解析也不追问，直接开干；而另一台 agent 拿到的是完整协议提示词。
+   * 同一句话，两边行为完全不同。
+   */
+  const selfPrompt = requirementPromptForLocal(requirement, peer, [], { fromSelf: true });
+  assert.match(selfPrompt, /乙方产品经理/, '必须带上「先解析再执行」的角色约束');
+  assert.match(selfPrompt, /team_sync action=question/, '必须要求必要时追问');
+  assert.match(selfPrompt, /team_sync action=confirm/, '必须要求确认后才执行');
+  assert.match(selfPrompt, /甲方在团队群里提出了一个需求/, '本机自己的消息不能说成「另一台设备」');
+  assert.doesNotMatch(selfPrompt, /另一台设备/, '本机用户说的话不该说成来自另一台设备');
+
+  // 对端来的需求仍然保持原来的措辞。
+  const remotePrompt = requirementPromptForLocal(requirement, peer);
+  assert.match(remotePrompt, /甲方在另一台设备「PC · Windows」上提出了一个跨平台需求/);
+  assert.match(remotePrompt, /需求原文：\nagent 报数/);
+});
+
+test('两台各自当主机、邀请码不同，也必须能互通（不能互相 403）', async () => {
+  const A_PORT = 49_401;
+  const B_PORT = 49_402;
+
+  /*
+   * 真机踩过：Windows 和 mac 各自重启后都成了群主，各自的邀请码不一样。
+   * 主机校验只认自己的码 → 对方发来的每条都 403，
+   * 表现就是「各看各的群、谁也收不到谁的消息」。
+   *
+   * 已经互相允许过的设备，不该因为邀请码变了就被挡在门外。
+   */
+  const gotA: string[] = [];
+  const gotB: string[] = [];
+  const logs: string[] = [];
+  const a = await makeService(winPeer, { onGroupMessage: async (m) => { gotA.push(String(m.body)); } });
+  const bDir = await mkdtemp(join(tmpdir(), 'hwchat-sync-'));
+  const b = new LanSyncService(join(bDir, 'state.json'), {
+    peer: () => macPeer,
+    runRequirement: async () => true,
+    runNote: async () => true,
+    onGroupMessage: async (m) => { gotB.push(String(m.body)); },
+    writeLedger: async () => undefined,
+    writeTranscript: async () => undefined,
+    log: (line) => logs.push(line),
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
+  await b.load();
+
+  try {
+    // 两台各自开群：邀请码一定不同。
+    const aGroup = await a.service.startGroup(A_PORT);
+    const bGroup = await b.startGroup(B_PORT);
+    assert.equal(aGroup.ok, true, aGroup.message);
+    assert.equal(bGroup.ok, true, bGroup.message);
+    assert.notEqual(aGroup.code, bGroup.code, '两台各自开群，邀请码本来就不同');
+
+    /*
+     * 收敛方式：**用对方的邀请码加入**（这就是真实用户做的事 —— 粘贴对方的邀请码）。
+     * A 放弃自己的群，改用 B 的码加入；之后一台主机 + 一台成员。
+     */
+    const joined = await a.service.joinGroup(`127.0.0.1:${B_PORT}#${bGroup.code}`, A_PORT, undefined, {
+      allowWhileHosting: true,
+    });
+    assert.equal(joined.ok, true, `用对方邀请码加入失败：${joined.message}`);
+    assert.equal(b.remotePeers().length, 1, 'B 应当看到 A 进群');
+
+    // 双向都要通。
+    await a.service.postGroup({ author: 'user', phase: 'requirement', body: 'A 说的话' });
+    await b.postGroup({ author: 'user', phase: 'requirement', body: 'B 说的话' });
+
+    assert.ok(gotB.includes('A 说的话'), `B 没收到 A 的消息：${JSON.stringify(gotB)}`);
+    assert.ok(gotA.includes('B 说的话'), `A 没收到 B 的消息：${JSON.stringify(gotA)}\nB 日志：${logs.join(' | ')}`);
+  } finally {
+    a.service.dispose();
+    b.dispose();
+    await rm(a.dir, { recursive: true, force: true });
+    await rm(bDir, { recursive: true, force: true });
+  }
+});
+
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {
   assert.equal(normalizeHubAddress('192.168.0.3', 47821), 'http://192.168.0.3:47821');
   assert.equal(normalizeHubAddress('192.168.0.3:5000', 47821), 'http://192.168.0.3:5000', '显式端口不能被覆盖');

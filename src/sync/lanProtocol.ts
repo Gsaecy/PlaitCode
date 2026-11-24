@@ -673,9 +673,19 @@ export function requirementPromptForLocal(
   requirement: SyncRequirement,
   local: SyncPeer,
   groupLines: readonly string[] = [],
+  options: { fromSelf?: boolean } = {},
 ): string {
+  /*
+   * `fromSelf`：这条需求是本机用户刚在群窗口里说的。
+   *
+   * 不能说「另一台设备」，那会让 agent 以为需求来自队友，
+   * 甚至反过来去问"对方想做什么"。
+   */
+  const origin = options.fromSelf
+    ? `甲方在团队群里提出了一个需求（需求号 ${requirement.id}）。`
+    : `甲方在另一台设备「${requirement.from.name}」上提出了一个跨平台需求（需求号 ${requirement.id}）。`;
   return [
-    `甲方在另一台设备「${requirement.from.name}」上提出了一个跨平台需求（需求号 ${requirement.id}）。`,
+    origin,
     '',
     '需求原文：',
     requirement.detail,

@@ -1983,7 +1983,7 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     requestedReasoningEffort?: ReasoningEffort,
     options?: SendOptions,
   ): Promise<void> {
-    const content = text.trim();
+    let content = text.trim();
     const sendKey = this.activeConversationId ?? 'draft';
     if (!content && !this.pendingAttachments.length && !this.pendingContext) {
       return;
@@ -2038,6 +2038,14 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       }
       if (this.lanSync && !options?.resumedTodos && content) {
         if (options?.origin === 'group') {
+          /*
+           * 群里说的话，本机 agent 必须和对端 agent 拿到**同一套协议提示词**。
+           *
+           * 以前这里把用户原文直接塞进主对话：本机 agent 看到「agent 报数」四个字
+           * 就开干，既不解析也不追问；而对端 agent 拿到的是完整协议提示词 ——
+           * 同一句话，两边的行为完全不一样。
+           */
+          const { requirementPromptForLocal, renderGroupLine } = await import('../sync/lanProtocol.js');
           const openRequirement = this.lanSync.openQuestionRequirement();
           if (openRequirement) {
             void this.lanSync.postGroup({
@@ -2054,18 +2062,17 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
               body: content,
               ...(assignee ? { assignee } : {}),
             }).catch(() => undefined);
-            void this.lanSync.shareRequirement(content)
-              .then(async (result) => {
-                this.log(`[sync] 广播需求：${result.message}`);
-                /*
-                 * 没送到必须当场说。
-                 *
-                 * 用户遇到的正是这个：一边说已同步、一边什么都没有。
-                 * 群里发完只写日志的话，用户会以为两台都在做。
-                 */
-                if (!result.ok) await this.post({ type: 'toast', tone: 'warn', text: tt('sync.notDelivered') });
-              })
-              .catch(() => undefined);
+            const shared = await this.lanSync.shareRequirement(content).catch(() => undefined);
+            if (shared) {
+              this.log(`[sync] 广播需求：${shared.message}`);
+              /*
+               * 没送到必须当场说。
+               *
+               * 用户遇到的正是这个：一边说已同步、一边什么都没有。
+               * 群里发完只写日志的话，用户会以为两台都在做。
+               */
+              if (!shared.ok) await this.post({ type: 'toast', tone: 'warn', text: tt('sync.notDelivered') });
+            }
             /*
              * 指派给别的设备：本机**不跑**。
              *
@@ -2076,6 +2083,21 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
               const who = options?.assigneeName?.trim() || assignee;
               await this.post({ type: 'toast', tone: 'neutral', text: tt('sync.assignedElsewhere', { device: who }) });
               return;
+            }
+            /*
+             * 本机这一轮换成协议提示词，并把需求号带上 ——
+             * 这样 agent 的解析 / 追问 / 结果都会用 team_sync 回到**群里**，
+             * 而不是像以前那样只在右侧对话框自己说。
+             */
+            if (shared?.requirement) {
+              const groupLines = this.lanSync.recentGroup(10).map((message) => renderGroupLine(message));
+              content = requirementPromptForLocal(
+                shared.requirement,
+                this.lanSync.localPeer(),
+                groupLines,
+                { fromSelf: true },
+              );
+              options = { ...options, origin: 'sync', syncRequirementId: shared.requirement.id };
             }
           }
         } else if (options?.origin !== 'sync' && !this.localOnlyNoticeShown) {
