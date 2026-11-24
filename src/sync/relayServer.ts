@@ -657,12 +657,18 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         const who = result.identity;
         let member = findMemberByIdentity(identity.state, { githubId: who.githubId });
         if (!member) {
-          // 首个登录的人自动成为管理员；其余进同一个组织，等被授权频道
-          const org = identity.state.orgs[0] ?? addOrg(identity.state, who.login);
+          /*
+           * 每个 GitHub 账号一个独立空间。
+           *
+           * 不能把陌生人都塞进 `orgs[0]`：控制台按组织列设备和审计，
+           * 合在一起就等于让所有人看到彼此的机器名。个人空间是默认形态，
+           * 跨人协作以后用「邀请」单独做，而不是默认共享。
+           */
+          const org = addOrg(identity.state, who.login);
           member = addMember(identity.state, {
             orgId: org.id,
             name: who.name,
-            role: identity.state.members.length === 0 ? 'owner' : 'member',
+            role: 'owner',
             githubId: who.githubId,
             githubLogin: who.login,
             ...(who.email ? { email: who.email } : {}),

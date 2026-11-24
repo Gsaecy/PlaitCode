@@ -330,7 +330,15 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    * 与局域网是**两条独立通道**，可以同时开着：同一 WiFi 走直连更快，外网走中继。
    * 密钥存在 SecretStorage（不进 settings.json），中转只见到密文。
    */
-  const relayUrl = (): string => setting('relay.url', '').trim();
+  /**
+   * 默认中继地址。
+   *
+   * 普通用户不该知道也不需要填服务器地址 —— 他要的只是"能用"。
+   * 自托管的人把它改成自己的域名就行；想彻底关掉托管（企业内网）可以把设置里的
+   * `plaitcode.relay.url` 显式填成自己的地址，这里只作为缺省值。
+   */
+  const DEFAULT_RELAY_URL = 'https://plaitcode.com';
+  const relayUrl = (): string => (setting('relay.url', '') || DEFAULT_RELAY_URL).trim();
   /**
    * 写中继地址。失败不往命令层抛（会变成「命令导致错误」的红色弹窗），
    * 而是明确说清是哪一步坏了——0.7.2 就因为配置项没声明，用户只看到一句英文式报错。
@@ -435,9 +443,9 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         status.show();
         return;
       }
-      status.text = '$(broadcast) 连接另一台设备';
-      status.tooltip = '在同一 WiFi 的每台设备上各点一次，就能共享需求、一起执行（点了才启用）。';
-      status.command = 'plaitcode.lanSync.connect';
+      status.text = '$(rocket) 开始协作';
+      status.tooltip = '点一下 → 浏览器里用 GitHub 授权一次 → 手机和第二台电脑就能一起干活。不填地址、不要配对码。';
+      status.command = 'plaitcode.collab.start';
       status.show();
       return;
     }
@@ -733,30 +741,40 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     /**
      * 一键开始协作：GitHub 登录 → 建/继承频道 → 自动拿到密钥。
      *
-     * 这是给「我自己多台电脑」用的唯一入口。正常情况只要点一次、在浏览器里登录一次，
-     * 不需要配对码、二维码或任何字符串。
+     * 用户视角只有三步：点命令 → 浏览器登录 → 授权。
+     * 不问服务器地址（有缺省值）、不要配对码、不要二维码密钥串。
      */
     vscode.commands.registerCommand('plaitcode.collab.start', async () => {
-      let url = relayUrl();
-      if (!url) {
-        const input = await vscode.window.showInputBox({
-          title: '开始协作',
-          prompt: '中继地址只需要填一次，之后会自动记住',
-          placeHolder: 'https://plaitcode.com',
-          ignoreFocusOut: true,
-          validateInput: (value) => (/^https?:\/\/\S+$/i.test(value.trim()) ? undefined : '要以 http:// 或 https:// 开头'),
-        });
-        if (!input) return;
-        url = input.trim().replace(/\/+$/, '');
-        await saveRelayUrl(url);
-      }
-
+      const url = relayUrl();
+      const firstTime = !context.globalState.get<boolean>('plaitcode.collab.powerHintShown');
       const storedSecret = (await context.secrets.get(relaySecretKey)) ?? '';
       const storedToken = relayDeviceToken || (await context.secrets.get(relayDeviceTokenKey)) || '';
+
+      /*
+       * 第一次协作时先说清「需要 GitHub 账号」。
+       *
+       * 不假设人人都有：没有的人要能立刻知道去哪注册（免费、不用付费版），
+       * 有的人一键跳过。提示只出现一次，不反复打扰。
+       */
+      if (!storedToken && !context.globalState.get<boolean>('plaitcode.collab.accountHintShown')) {
+        const choice = await vscode.window.showInformationMessage(
+          '协作要用 GitHub 账号确认「这是你本人」，免费账号就行（不需要付费版）。',
+          '继续登录',
+          '去注册 GitHub',
+        );
+        await context.globalState.update('plaitcode.collab.accountHintShown', true);
+        if (choice === '去注册 GitHub') {
+          await vscode.env.openExternal(vscode.Uri.parse('https://github.com/signup'));
+          void vscode.window.showInformationMessage('注册好之后，再执行一次「PlaitCode: 开始协作」就行。');
+          return;
+        }
+        if (choice !== '继续登录') return;
+      }
+
       const result = await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'PlaitCode 开始协作', cancellable: false },
         async (progress) => quickStart({
-          relayUrl: url!,
+          relayUrl: url,
           deviceName: bridge.peer().name,
           platform: defaultPlatform(),
           ...(storedSecret ? { existingSecret: storedSecret } : {}),
@@ -801,6 +819,30 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         `已开始协作${result.memberName ? `（${result.memberName}）` : ''}。`
         + '手机端扫码即可一起看，另一台电脑执行同一个命令就会自动加入同一频道。',
       );
+
+      /*
+       * 只在第一次提醒电源设置。
+       *
+       * 电脑一睡，agent 就停了、手机也发不进来 —— 这是最常见的"用着用着不动了"。
+       * 但系统设置各版本不一样，直接替用户改太危险，给一条能复制的命令最稳。
+       */
+      if (firstTime) {
+        await context.globalState.update('plaitcode.collab.powerHintShown', true);
+        const pick = await vscode.window.showInformationMessage(
+          '还有一件事：这台电脑要一直开着才能接需求（显示器可以关，系统不能睡）。需要关闭睡眠吗？',
+          '复制卸载休眠的命令',
+          '我自己设置',
+        );
+        if (pick === '复制卸载休眠的命令') {
+          const command = defaultPlatform() === 'darwin'
+            ? 'sudo pmset -a sleep 0 disksleep 0 displaysleep 10'
+            : 'powercfg /change standby-timeout-ac 0';
+          await vscode.env.clipboard.writeText(command);
+          void vscode.window.showInformationMessage(
+            `已复制：${command}（在终端里执行一次即可；笔记本还要把"合盖时"设为不睡眠）`,
+          );
+        }
+      }
     }),
     relayPhonePanel,
     { dispose: () => relay?.stop() },

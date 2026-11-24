@@ -118,6 +118,9 @@ const BASE_CSS = `
   .card { border:1px solid var(--line); border-radius:var(--r-lg); background:var(--surface); padding:var(--s5); }
   .card h3 { display:flex; align-items:center; gap:var(--s2); font-size:var(--fs-h3); font-weight:600; }
   .card h3 .icon { color:var(--accent); }
+  a.card { display:block; color:var(--text); transition:border-color .16s ease-out; }
+  a.card:hover { border-color:var(--line-strong); text-decoration:none; }
+  a.card:hover h3 { color:var(--accent); }
   .card p { margin-top:var(--s2); color:var(--text-2); font-size:var(--fs-sm); }
 
   /* 表格：只靠 1px 下边线，不加斑马纹 */
@@ -171,10 +174,23 @@ function icon(name: string, cls = 'icon'): string {
   return `<svg class="${cls}" viewBox="0 0 20 20" aria-hidden="true">${ICONS[name] ?? ''}</svg>`;
 }
 
-/** 首页。所有入口在首屏即可见，且每个入口只有一个去处。 */
+/**
+ * 首页。
+ *
+ * **冰山原则**（用户 2026-11-24）：
+ *  露出水面的只有一句话 + 一个按钮；想深入的人自己往下走，有引导、有文档。
+ *
+ * 具体到这一页：
+ *  水面之上 —— 一句价值主张、两个按钮（装扩展 / 手机端）、一行「需要 GitHub 账号？」；
+ *  浅水区   —— 三步开始、为什么"先问清楚"（这是差异化，值得露出）；
+ *  深水区   —— 文档入口：多设备设置、企业能力、架构说明、和别的工具的区别。
+ *
+ * 所以这里**不再**放：功能清单、双设备表格、给程序员的段落、工具对比表 ——
+ * 那些都在 docs/ 里，首页只负责让人看懂"这是什么"和"从哪开始"。
+ */
 export function renderLandingPage(options: {
   relayHost: string;
-  /** 服务端是否配了飞书登录；没配时首页要给出确切原因，而不是给一个点了就报错的按钮。 */
+  /** 服务端是否配了登录；没配时给确切原因，而不是给一个点了就报错的按钮。 */
   consoleEnabled: boolean;
   installUrl: string;
   repoUrl: string;
@@ -184,30 +200,20 @@ export function renderLandingPage(options: {
   const repo = escapeHtml(options.repoUrl);
 
   const steps: Array<[string, string]> = [
-    ['用中文说要什么', '不用术语，不用先写文档。「会员到期要提醒续费」这样一句话就够。'],
-    ['它先问你，不猜', '含糊的地方给你二选一，你只要点一个；没答完它不会开工。'],
-    ['做完告诉你怎么验', '用大白话讲改了什么，以及你自己点两下就能确认的步骤。'],
+    ['装扩展', '在 VS Code 里装 PlaitCode，或用 VSIX 离线安装。'],
+    ['登录一次', '命令面板执行「开始协作」，浏览器里用 GitHub 授权。不填地址、不要配对码。'],
+    ['开始用', '第二台电脑执行同一个命令；手机扫一次码。都在同一条频道里。'],
   ];
   const threeC: Array<[string, string, string]> = [
-    ['message', '需求卡 Card', '你随口说的一句话，先被复述成「你将会看到什么」——不是变量名和文件名。'],
-    ['question', '澄清对话 Conversation', '含糊、有歧义、两边理解可能不一致的地方，停下来问，给的是选项而不是技术问题。'],
-    ['check', '验收标准 Confirmation', '事先说清「什么算做完了」，交付时给出你自己能复现的验证步骤。'],
+    ['message', '先说它听懂了什么', '把你要的效果复述一遍：哪个界面、看到什么、什么算做完。不出现文件名和变量名。'],
+    ['question', '含糊就问你', '拿不准的地方给二选一，你只要挑一个；没答完它不开始改。'],
+    ['check', '做完告诉你怎么验', '用大白话讲改了什么，以及你自己点两下就能确认的步骤。'],
   ];
-  const platformRows: Array<[string, string, string]> = [
-    ['会员到期提醒', '已完成', '已完成'],
-    ['深色模式', '已完成', '跳过 · 跟随系统外观'],
-    ['导出 PDF', '进行中', '待接'],
-  ];
-  const devCards: Array<[string, string, string]> = [
-    ['shield', '授权还在你手里', '跑命令、读敏感文件要你点。手机和电脑两端都能点，谁先点算谁。'],
-    ['activity', '上下文不会丢', '频道历史落盘只存密文。重启、换设备、换网络都能接上。'],
-    ['server', '可以自己部署', '零依赖单文件 + systemd + nginx，自己的域名五分钟上线。'],
-  ];
-  const compare: Array<[string, string, string]> = [
-    ['GitHub / GitLab PR', '评审已经写完的代码', '需求还没说清、还没人动手的那一段'],
-    ['Live Share / Code With Me', '两个人同时编辑同一份代码', '要求双方同时在线'],
-    ['Claude Code / Cursor', '在编辑器里把一件事从头做完', '单人单机；跨设备、甲方乙方这条线要自己接'],
-    ['Replit / CodePen', '浏览器里立刻看到结果', '不是你的真实仓库和环境'],
+  const deeper: Array<[string, string, string, string]> = [
+    ['terminal', '多设备与手机', '三步上手、电源设置、排查表、安全边界。', `${repo}/blob/main/docs/COLLAB-SETUP.md`],
+    ['users', '它和别的工具怎么分工', 'PR、Live Share、Cursor 各自擅长什么，这里补的是哪一段。', `${repo}/blob/main/docs/WEBSITE.md`],
+    ['shield', '企业能力', '组织与角色、审计、策略下发、私有化部署。', `${repo}/blob/main/docs/ENTERPRISE.md`],
+    ['server', '架构说明', '传输、身份、协作语义三层为什么分开。', `${repo}/blob/main/docs/ARCHITECTURE-REVIEW.md`],
   ];
 
   return `<!doctype html>
@@ -216,7 +222,7 @@ export function renderLandingPage(options: {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0f1115">
-<meta name="description" content="PlaitCode：不会写代码也能把想法做出来。用中文提需求，AI 当乙方——先复述、再追问、确认后才动手，交付时告诉你自己怎么验。">
+<meta name="description" content="PlaitCode：不会写代码也能把想法做出来。用中文提需求，AI 先复述、再追问、确认后才动手，交付时告诉你自己怎么验。">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: 'self'; connect-src 'self'; manifest-src 'self'">
 <title>PlaitCode · 你说要什么，它先问清楚再动手</title>
@@ -226,14 +232,10 @@ export function renderLandingPage(options: {
     background:radial-gradient(ellipse at 50% 0%, rgba(76,154,255,.16), transparent 68%); }
   .hero .wrap { position:relative; }
   .hero-grid { display:grid; gap:var(--s7); grid-template-columns:minmax(0,1fr) minmax(0,1.05fr); align-items:center; }
-  .badge { display:inline-flex; align-items:center; gap:var(--s2); height:24px; padding:0 var(--s2);
-    border-radius:var(--r-sm); border:1px solid var(--line); color:var(--text-2); font-size:var(--fs-xs); }
-  .hero h1 { margin:var(--s4) 0 0; font-size:var(--fs-hero); line-height:1.15; letter-spacing:-1px; font-weight:600; }
-  .hero .lede { margin-top:var(--s4); font-size:var(--fs-h3); line-height:1.6; color:var(--text-2); max-width:34em; }
+  .hero h1 { margin:0 0 var(--s4); font-size:var(--fs-hero); line-height:1.15; letter-spacing:-1px; font-weight:600; }
+  .hero .lede { font-size:var(--fs-h3); line-height:1.6; color:var(--text-2); max-width:32em; }
   .hero .actions { display:flex; gap:var(--s3); flex-wrap:wrap; margin-top:var(--s6); align-items:center; }
-  .hero .meta { display:flex; gap:var(--s4); flex-wrap:wrap; margin-top:var(--s5);
-    color:var(--text-3); font-size:var(--fs-xs); }
-  .hero .meta span { display:inline-flex; align-items:center; gap:var(--s1); }
+  .hero .fine { margin-top:var(--s3); color:var(--text-3); font-size:var(--fs-xs); }
   @media (max-width:960px) { .hero-grid { grid-template-columns:1fr; } .hero h1 { font-size:32px; } }
 
   /* 产品示意图：用真实结构画，不放会过时的截图 */
@@ -250,8 +252,6 @@ export function renderLandingPage(options: {
   .msg .bubble p + p { margin-top:var(--s2); }
   .msg.mine { align-self:flex-end; }
   .msg.mine .bubble { background:rgba(76,154,255,.14); border-color:rgba(76,154,255,.35); }
-  .thread-foot { display:flex; gap:var(--s2); align-items:center; padding-top:var(--s3);
-    border-top:1px dashed var(--line); color:var(--text-3); font-size:var(--fs-xs); flex-wrap:wrap; }
 
   .steps { display:grid; gap:var(--s4); grid-template-columns:repeat(3, minmax(0,1fr)); }
   .step { border-top:1px solid var(--line-strong); padding-top:var(--s4); }
@@ -264,25 +264,16 @@ export function renderLandingPage(options: {
     color:var(--text-2); font-size:var(--fs-sm); }
   .quote b { color:var(--text); }
   .quote cite { display:block; margin-top:var(--s2); color:var(--text-3); font-size:var(--fs-xs); font-style:normal; }
-  .rule { margin-top:var(--s5); padding:var(--s4); border:1px solid var(--line); border-radius:var(--r-md);
-    background:var(--surface-2); font-size:var(--fs-sm); color:var(--text-2); }
-  .rule b { color:var(--text); }
-
-  .code { border:1px solid var(--line); border-radius:var(--r-lg); background:#0b0d11; overflow:hidden; }
-  .code .head { display:flex; align-items:center; gap:var(--s2); padding:var(--s2) var(--s3);
-    border-bottom:1px solid var(--line); color:var(--text-3); font-size:var(--fs-xs); }
-  .code pre { margin:0; padding:var(--s4); overflow-x:auto; color:var(--text-2);
-    font:var(--fs-xs)/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  .code .k { color:#8fb6ff; }
-  .code .s { color:#9bd2a8; }
+  .note-line { display:flex; gap:var(--s2); align-items:center; margin-top:var(--s5); padding:var(--s3) var(--s4);
+    border:1px solid var(--line); border-radius:var(--r-md); background:var(--surface);
+    color:var(--text-2); font-size:var(--fs-sm); }
+  .note-line .icon { color:var(--accent); }
 
   .cta-band { border-top:1px solid var(--line); padding:var(--s8) 0; }
   .cta-band .inner { display:flex; align-items:center; gap:var(--s5); flex-wrap:wrap; }
   .cta-band h2 { font-size:var(--fs-h2); font-weight:600; }
   .cta-band p { color:var(--text-2); font-size:var(--fs-sm); margin-top:var(--s1); }
   .cta-band .actions { margin-left:auto; display:flex; gap:var(--s3); flex-wrap:wrap; }
-  td.ok { color:var(--ok); white-space:nowrap; }
-  td.gap { color:var(--text-3); white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -291,15 +282,13 @@ export function renderLandingPage(options: {
   <div class="inner">
     <a class="brand" href="/"><img src="/icon.svg" alt="">PlaitCode</a>
     <nav class="nav-links" aria-label="主导航">
-      <a href="#how">怎么协作</a>
-      <a href="#ask">先问清楚</a>
-      <a href="#platforms">两台设备</a>
-      <a href="#devs">给程序员</a>
-      <a href="#security">安全</a>
+      <a href="#start">怎么开始</a>
+      <a href="#ask">为什么这么用</a>
+      <a href="#deeper">文档</a>
     </nav>
     <div class="nav-actions">
-      <a class="btn btn-ghost" href="${repo}">GitHub</a>
-      <a class="btn btn-primary" href="/console">打开控制台</a>
+      <a class="btn btn-ghost" href="/console">控制台</a>
+      <a class="btn btn-primary" href="${install}">安装</a>
     </div>
   </div>
 </header>
@@ -309,44 +298,33 @@ export function renderLandingPage(options: {
     <div class="wrap">
       <div class="hero-grid">
         <div>
-          <span class="badge">${icon('activity', 'icon icon-sm')} 0.15 · VS Code 里的甲方与乙方</span>
           <h1>你说要什么，<br>它先问清楚，再动手。</h1>
-          <p class="lede">你不需要会写代码。用中文把想法说出来，频道里的 AI 先用大白话复述一遍、把含糊的地方问明白，等你点头才开始改；做完告诉你自己怎么验。</p>
+          <p class="lede">你不需要会写代码。用中文把想法说出来，它先复述一遍、把含糊的地方问明白，等你点头才开始改。</p>
           <div class="actions">
             <a class="btn btn-primary btn-lg" href="${install}">在 VS Code 安装</a>
-            <a class="btn btn-lg" href="/console">打开控制台</a>
-            <a class="btn btn-ghost btn-lg" href="/m">手机端 →</a>
+            <a class="btn btn-lg" href="/m">手机端 →</a>
           </div>
-          <div class="meta">
-            <span>${icon('message', 'icon icon-sm')} 先复述再动手</span>
-            <span>${icon('question', 'icon icon-sm')} 不懂就问，不猜</span>
-            <span>${icon('check', 'icon icon-sm')} 交付带验证步骤</span>
-          </div>
+          <p class="fine">需要一个 GitHub 账号？<a href="https://github.com/signup" target="_blank" rel="noopener">免费注册 →</a></p>
         </div>
 
-        <div class="window" role="img" aria-label="团队群对话示意：甲方用一句话提需求，AI 复述理解并追问两处含糊的地方，甲方回答后确认执行">
-          <div class="window-bar"><span class="dots"><i></i><i></i><i></i></span>团队群 · Windows 版 / macOS 版 各一个乙方</div>
+        <div class="window" role="img" aria-label="对话示意：用户提一句话需求，AI 复述理解并追问两处含糊的地方，用户回答后确认执行">
+          <div class="window-bar"><span class="dots"><i></i><i></i><i></i></span>团队群</div>
           <div class="window-body">
             <div class="msg mine">
-              <span class="who">你 · 甲方 · 手机</span>
+              <span class="who">你</span>
               <span class="bubble">会员快到期的时候要能提醒用户续费，不然他们就直接不用了。</span>
             </div>
             <div class="msg">
-              <span class="who">Windows 版 · 乙方 <span class="tag tag-warn"><span class="dot"></span>等你回复</span></span>
+              <span class="who">AI <span class="tag tag-warn"><span class="dot"></span>等你回复</span></span>
               <span class="bubble"><p>我理解成：到期前 7 天，在 App 里提示一次，并给一个续费按钮。</p><p>还有两处要你定：① 只在 App 里提示，还是也发短信？② 到期之后还能不能看以前的内容？</p></span>
             </div>
             <div class="msg mine">
-              <span class="who">你 · 甲方 · 手机</span>
+              <span class="who">你</span>
               <span class="bubble">只在 App 里提示。到期后还能看，但不能新增。</span>
             </div>
             <div class="msg">
-              <span class="who">Windows 版 + macOS 版 · 乙方 <span class="tag tag-ok"><span class="dot"></span>已确认</span></span>
-              <span class="bubble">按这个来，两边一起做：到期前 7 天提示 + 续费按钮，到期后只读。</span>
-            </div>
-            <div class="thread-foot">
-              <span>两边一起</span>
-              <span class="tag tag-ok"><span class="dot"></span>Windows 版 执行中</span>
-              <span class="tag tag-ok"><span class="dot"></span>macOS 版 执行中</span>
+              <span class="who">AI <span class="tag tag-ok"><span class="dot"></span>已确认</span></span>
+              <span class="bubble">按这个来：到期前 7 天提示 + 续费按钮，到期后只读。做完告诉你怎么验。</span>
             </div>
           </div>
         </div>
@@ -354,12 +332,11 @@ export function renderLandingPage(options: {
     </div>
   </div>
 
-  <section class="section" id="how">
+  <section class="section" id="start">
     <div class="wrap">
       <div class="section-head">
-        <div class="eyebrow">怎么协作</div>
-        <h2>三步，一句话开始</h2>
-        <p class="lede">不需要公网 IP，不需要端口映射，也不需要先在脑子里想清楚所有细节 —— 想清楚的活是它的。</p>
+        <div class="eyebrow">怎么开始</div>
+        <h2>三步，然后只说人话</h2>
       </div>
       <div class="steps">
         ${steps.map(([title, body], index) => `<div class="step"><div class="n">0${index + 1}</div><h3>${title}</h3><p>${body}</p></div>`).join('')}
@@ -369,125 +346,48 @@ export function renderLandingPage(options: {
 
   <section class="section" id="ask">
     <div class="wrap">
-      <div class="grid-2">
-        <div>
-          <div class="eyebrow">这不是我们发明的</div>
-          <h2>先把需求问清楚，是正规协作的拆法</h2>
-          <p class="lede" style="color:var(--text-2);margin-top:var(--s2)">行业里把一条需求拆成三段，PlaitCode 只是把这三段固定在流程里，让它不能被跳过。</p>
-          <div class="quote" style="margin-top:var(--s5)">
-            一条需求拆成三段：<b>需求卡（Card）</b> → <b>澄清对话（Conversation）</b> → <b>验收标准（Confirmation）</b>。
-            需求用<b>非技术语言</b>写，细节在双方<b>确认之后</b>才补。
-            <cite>Atlassian《User stories with examples and a template》</cite>
-          </div>
-          <div class="rule">返工的大头几乎都在「理解错了」这件事上。所以这里的规则是：<b>没听懂就问，问完要停，确认了才动手</b> —— 追问答完之前，它不会开始改代码。</div>
-        </div>
-        <div class="grid-3" style="grid-template-columns:1fr">
-          ${threeC.map(([name, title, body]) => `<div class="card"><h3>${icon(name)}${title}</h3><p>${body}</p></div>`).join('')}
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="section" id="platforms">
-    <div class="wrap">
-      <div class="grid-2">
-        <div>
-          <div class="eyebrow">两台设备</div>
-          <h2>同一个 app，两个平台，各有一个乙方</h2>
-          <p class="lede" style="color:var(--text-2);margin-top:var(--s2)">同一条需求发给两台电脑，各自一个产品经理。谁做到哪一步写在账本上 —— 一边做完、一边跳过，都写清原因，不会假装两边对齐了。</p>
-          <div style="display:grid;gap:var(--s4);margin-top:var(--s5)">
-            <div class="quote"><b>按设备记，不按平台猜。</b>两台 Windows 也不会互相覆盖进度。</div>
-            <div class="quote"><b>没答的追问会一直挂着。</b>一台问的问题不会因为另一台报了结果就被冲掉。</div>
-          </div>
-        </div>
-        <div class="panel" style="border:1px solid var(--line);border-radius:var(--r-lg);background:var(--surface);overflow:hidden">
-          <div style="display:flex;align-items:center;gap:var(--s2);padding:var(--s3) var(--s4);border-bottom:1px solid var(--line)">
-            ${icon('board', 'icon icon-sm')}<span style="font-size:var(--fs-h3);font-weight:600">对齐账本</span>
-            <span style="margin-left:auto;color:var(--text-3);font-size:var(--fs-xs)">需求 × 设备</span>
-          </div>
-          <table style="margin:0">
-            <thead><tr><th>需求</th><th>Windows 版</th><th>macOS 版</th></tr></thead>
-            <tbody>
-              ${platformRows.map(([name, win, mac]) => `<tr><td>${name}</td><td class="${win === '已完成' ? 'ok' : ''}">${win}</td><td class="${mac === '已完成' ? 'ok' : 'gap'}">${mac}</td></tr>`).join('')}
-            </tbody>
-          </table>
-          <div style="padding:var(--s3) var(--s4);border-top:1px solid var(--line);color:var(--text-3);font-size:var(--fs-xs)">状态取自真实流程：等你回复 / 未执行 / 进行中 / 待接 / 已完成</div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="section" id="devs">
-    <div class="wrap">
       <div class="section-head">
-        <div class="eyebrow">如果你就是写代码的那个</div>
-        <h2>它不替你做 code review</h2>
-        <p class="lede">PR 解决的是「评审已经写完的代码」。这里管的是它前面那一段：需求还没说清、还没人动手。</p>
+        <div class="eyebrow">为什么这么用</div>
+        <h2>先把需求问清楚，是正规协作的拆法</h2>
+        <p class="lede">行业里把一条需求拆成三段，这里只是把这三段固定在流程里，让它不能被跳过。</p>
       </div>
       <div class="grid-3">
-        ${devCards.map(([name, title, body]) => `<div class="card"><h3>${icon(name)}${title}</h3><p>${body}</p></div>`).join('')}
+        ${threeC.map(([name, title, body]) => `<div class="card"><h3>${icon(name)}${title}</h3><p>${body}</p></div>`).join('')}
+      </div>
+      <div class="quote" style="margin-top:var(--s6)">
+        需求卡 Card → 澄清对话 Conversation → 验收标准 Confirmation。需求用非技术语言写，细节在双方确认之后才补。
+        <cite>Atlassian《User stories with examples and a template》</cite>
       </div>
     </div>
   </section>
 
-  <section class="section" id="security">
-    <div class="wrap">
-      <div class="grid-2">
-        <div>
-          <div class="eyebrow">安全</div>
-          <h2>服务器看到的只有密文</h2>
-          <p class="lede" style="color:var(--text-2);margin-top:var(--s2)">频道密钥在设备之间协商，只放在浏览器 fragment 与本地安全存储里。中继负责排队和转发，解不开任何一条消息。</p>
-          <div style="display:grid;gap:var(--s4);margin-top:var(--s5)">
-            <div class="quote"><b>密钥不进服务器。</b>URL fragment 不会出现在请求行，也不会进 nginx 日志。</div>
-            <div class="quote"><b>令牌只存哈希。</b>设备令牌可以随时吊销，吊销立即生效。</div>
-            <div class="quote"><b>审计只有元数据。</b>谁、哪台设备、什么时间、多大密文 —— 没有正文。</div>
-          </div>
-        </div>
-        <div class="code">
-          <div class="head">${icon('server', 'icon icon-sm')} 中继能拿到的全部内容</div>
-          <pre>{
-  <span class="k">"seq"</span>: 42,
-  <span class="k">"id"</span>: <span class="s">"3f9c…"</span>,
-  <span class="k">"from"</span>: <span class="s">"dev_windows"</span>,
-  <span class="k">"envelope"</span>: {
-    <span class="k">"iv"</span>: <span class="s">"9Qm2…"</span>,
-    <span class="k">"ct"</span>: <span class="s">"Zk8v…"</span>
-  },
-  <span class="k">"at"</span>: 1763000000000
-}</pre>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="section" id="compare">
+  <section class="section" id="deeper">
     <div class="wrap">
       <div class="section-head">
-        <div class="eyebrow">定位</div>
-        <h2>和现有工具的分工</h2>
-        <p class="lede">它不替代下面任何一件，补的是它们都不做的那一段。</p>
+        <div class="eyebrow">想深入的时候</div>
+        <h2>这些不用读也能用</h2>
+        <p class="lede">下面每一条都是给想知道细节的人准备的。</p>
       </div>
-      <table>
-        <thead><tr><th>工具</th><th>擅长</th><th>差的那一段</th></tr></thead>
-        <tbody>
-          ${compare.map(([name, good, gap]) => `<tr><td>${name}</td><td>${good}</td><td style="color:var(--text-2)">${gap}</td></tr>`).join('')}
-          <tr><td style="font-weight:600">PlaitCode</td><td>不懂代码的人提需求，AI 先问清再执行；多台设备各有乙方并对齐</td><td style="color:var(--text-3)">—</td></tr>
-        </tbody>
-      </table>
-      ${options.consoleEnabled ? '' : `<div class="banner">${icon('shield', 'icon icon-sm')}<span>这台服务器还没配飞书登录（<code>PLAITCODE_AUTH_APP_ID</code> / <code>SECRET</code> / <code>REDIRECT_URI</code>），控制台暂时打不开；设备与通道仍可用管理接口查看。</span></div>`}
+      <div class="grid-3">
+        ${deeper.map(([name, title, body, href]) => `<a class="card" href="${escapeHtml(href)}"><h3>${icon(name)}${title}</h3><p>${body}</p></a>`).join('')}
+      </div>
+      <div class="note-line">
+        ${icon('key', 'icon icon-sm')}
+        <span>协作内容端到端加密：服务器只转发密文，解不开你的消息。服务端 ${host}</span>
+      </div>
+      ${options.consoleEnabled ? '' : `<div class="banner">${icon('shield', 'icon icon-sm')}<span>这台服务器还没开放登录，控制台暂时打不开。</span></div>`}
     </div>
   </section>
 
   <div class="cta-band">
     <div class="wrap inner">
       <div>
-        <h2>不用会写代码</h2>
-        <p>服务端 ${host} · 自托管单文件，五分钟部署</p>
+        <h2>现在就可以试</h2>
+        <p>装好、登录一次，就能开始。</p>
       </div>
       <div class="actions">
         <a class="btn btn-primary btn-lg" href="${install}">安装扩展</a>
-        <a class="btn btn-lg" href="/console">打开控制台</a>
-        <a class="btn btn-ghost btn-lg" href="/m">手机端</a>
+        <a class="btn btn-lg" href="/m">手机端</a>
       </div>
     </div>
   </div>
@@ -495,43 +395,10 @@ export function renderLandingPage(options: {
 
 <footer class="site">
   <div class="wrap">
-    <div class="foot-cols">
-      <div>
-        <h4>产品</h4>
-        <ul>
-          <li><a href="/">首页</a></li>
-          <li><a href="/console">控制台</a></li>
-          <li><a href="/m">手机端</a></li>
-        </ul>
-      </div>
-      <div>
-        <h4>资源</h4>
-        <ul>
-          <li><a href="${repo}">GitHub</a></li>
-          <li><a href="${repo}/tree/main/docs">文档</a></li>
-          <li><a href="/health">运行状态</a></li>
-        </ul>
-      </div>
-      <div>
-        <h4>流程依据</h4>
-        <ul>
-          <li><a href="https://www.atlassian.com/agile/project-management/user-stories">User stories 3C</a></li>
-          <li><a href="${repo}/blob/main/docs/ENTERPRISE.md">企业能力</a></li>
-          <li><a href="${repo}/blob/main/docs/WEBSITE.md">网站与控制台</a></li>
-        </ul>
-      </div>
-      <div>
-        <h4>入口</h4>
-        <ul>
-          <li><a href="${install}">Marketplace</a></li>
-          <li><a href="/console">登录</a></li>
-          <li><a href="/m">扫码进入</a></li>
-        </ul>
-      </div>
-    </div>
-    <div class="foot-bottom">
+    <div class="foot-bottom" style="margin-top:0;border-top:0;padding-top:0">
       <span>© 2026 PlaitCode</span>
-      <span>服务端 ${host}</span>
+      <span><a href="${repo}">GitHub</a></span>
+      <span><a href="${repo}/tree/main/docs">全部文档</a></span>
       <span style="margin-left:auto">只转发密文 · 不存代码</span>
     </div>
   </div>
@@ -539,7 +406,6 @@ export function renderLandingPage(options: {
 </body>
 </html>`;
 }
-
 /**
  * 登录结果页：浏览器里走完 GitHub 登录后给用户看的那一屏。
  *

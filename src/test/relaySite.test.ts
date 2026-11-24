@@ -26,25 +26,33 @@ function cookieFor(memberId: string, name: string): string {
   return `plaitcode_session=${value}`;
 }
 
-test('首页：三个入口分别是装扩展 / 控制台 / 手机端，且带上真实服务端地址', () => {
+test('首页（冰山）：只露一句价值 + 装扩展/手机端，GitHub 账号有注册引导', () => {
   const html = renderLandingPage({
     relayHost: 'relay.example.com',
     consoleEnabled: true,
     installUrl: 'https://marketplace.visualstudio.com/items?itemName=plaitcode.plaitcode',
     repoUrl: 'https://github.com/Gsaecy/PlaitCode',
   });
-  assert.match(html, /href="\/console"/);
+  // 水面之上：装扩展 + 手机端，两个按钮就够
   assert.match(html, /href="\/m"/);
   assert.match(html, /marketplace\.visualstudio\.com/);
+  // 控制台在导航里，不占首屏 CTA
+  assert.match(html, /href="\/console"/);
   assert.match(html, /relay\.example\.com/);
-  // 没配登录时要说明原因，而不是给一个点进去就报错的按钮
+  // 没有 GitHub 账号的人要知道去哪注册
+  assert.match(html, /github\.com\/signup/);
+  assert.match(html, /需要一个 GitHub 账号/);
+  // 想深入的人有文档入口（水下）
+  assert.match(html, /id="deeper"/);
+  assert.match(html, /docs\/COLLAB-SETUP\.md/);
+
   const noSso = renderLandingPage({
     relayHost: 'relay.example.com',
     consoleEnabled: false,
     installUrl: 'https://example.com/install',
     repoUrl: 'https://example.com/repo',
   });
-  assert.match(noSso, /还没配飞书登录/);
+  assert.match(noSso, /还没开放登录/);
 });
 
 test('首页：Host 头被转义，不能借服务端拼出脚本', () => {

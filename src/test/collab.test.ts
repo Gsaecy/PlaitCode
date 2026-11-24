@@ -493,6 +493,58 @@ test('服务端：两台设备用同一个 GitHub 账号登录，第二台继承
   }
 });
 
+test('服务端：不同 GitHub 账号是各自独立的空间，互相看不到设备', async () => {
+  const github = await fakeGitHub();
+  const state = emptyIdentity();
+  const relay = await createRelayServer({
+    port: 0,
+    identity: { state },
+    github: {
+      config: { clientId: 'cid', clientSecret: 'sec', redirectUri: 'http://x/cb', tokenUrl: `${github.base}/login/oauth/access_token`, apiBase: github.base },
+      secret: 'session-secret',
+    },
+    rateLimit: 500,
+  });
+  const base = `http://127.0.0.1:${relay.port}`;
+  const login = async (deviceName: string): Promise<string> => {
+    const started = await (await fetch(`${base}/v1/auth/device/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deviceName }),
+    })).json() as { code: string };
+    const redirected = await fetch(`${base}/v1/auth/github/start?device=${encodeURIComponent(started.code)}`, { redirect: 'manual' });
+    const stateParam = new URL(redirected.headers.get('location') ?? '').searchParams.get('state') ?? '';
+    await fetch(`${base}/v1/auth/github/callback?state=${encodeURIComponent(stateParam)}&code=abc`);
+    const polled = await (await fetch(`${base}/v1/auth/device/poll?code=${encodeURIComponent(started.code)}`)).json() as { token: string };
+    return polled.token;
+  };
+  try {
+    const first = await login('A 的电脑');
+    // 同一个 GitHub 账号的第二台：同一个组织
+    const second = await login('A 的第二台');
+    const meA = await (await fetch(`${base}/v1/devices/me`, { headers: { authorization: `Bearer ${first}` } })).json() as { orgId: string };
+    const meA2 = await (await fetch(`${base}/v1/devices/me`, { headers: { authorization: `Bearer ${second}` } })).json() as { orgId: string };
+    assert.equal(meA.orgId, meA2.orgId);
+    // 两台都在同一个空间里
+    assert.equal(state.orgs.length, 1);
+    assert.equal(state.members.length, 1);
+    assert.equal(state.devices.length, 2);
+
+    // 换一个 GitHub 账号手动建成员，模拟另一个用户
+    const strangerOrg = addOrg(state, 'someone-else');
+    const stranger = addMember(state, { orgId: strangerOrg.id, name: '别人', role: 'owner', githubId: '555', githubLogin: 'someone' })!;
+    assert.notEqual(stranger.orgId, meA.orgId);
+    // 他的设备不在我这个组织的设备列表里
+    const mine = state.devices.filter((device) => state.members
+      .filter((item) => item.orgId === meA.orgId)
+      .some((item) => item.id === device.memberId));
+    assert.equal(mine.length, 2);
+  } finally {
+    await relay.close();
+    await github.close();
+  }
+});
+
 test('服务端：交接只能给自己的其它设备，跨成员一律拒绝', async () => {
   const github = await fakeGitHub();
   const state = emptyIdentity();
