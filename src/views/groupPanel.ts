@@ -105,13 +105,20 @@ export class GroupPanel implements vscode.Disposable {
     private readonly service: LanSyncService,
     private readonly callbacks: {
       /** 在群里发一句话（需求或回答）—— 由面板决定走哪条路径。 */
-      send: (text: string) => Promise<void>;
+      send: (text: string, assignee?: { id: string; name: string }) => Promise<void>;
+      /** 远程控制：目前只用到「停止当前执行」。 */
+      control?: (action: 'stop') => Promise<{ ok: boolean; message: string }>;
       log: (line: string) => void;
       /**
        * 中继状态。跨网协作时局域网根本没连上（`role === 'off'`），
        * 但中继是通的 —— 只看局域网会把「已连 2 台」显示成「未连接」。
        */
-      relay?: () => { connected: boolean; peers: number; url: string } | undefined;
+      relay?: () => {
+        connected: boolean;
+        peers: number;
+        url: string;
+        devices?: Array<{ id: string; name: string; platform: string; project: string }>;
+      } | undefined;
     },
   ) {}
 
@@ -131,12 +138,26 @@ export class GroupPanel implements vscode.Disposable {
     this.panel = panel;
     panel.webview.html = this.html(panel.webview);
     this.disposables.push(panel.webview.onDidReceiveMessage(async (message: unknown) => {
-      const record = (message ?? {}) as { type?: unknown; text?: unknown; command?: unknown };
+      const record = (message ?? {}) as { type?: unknown; text?: unknown; command?: unknown; assignee?: unknown };
       if (record.type === 'ready') await this.refresh();
       if (record.type === 'send' && typeof record.text === 'string') {
         const text = record.text.trim();
         if (!text) return;
-        await this.callbacks.send(text);
+        // 指派：面板只传 id/名字，语义由 chatPanel 决定（指派给别人时本机不跑）
+        const assignee = typeof record.assignee === 'object' && record.assignee
+          ? (() => {
+            const value = record.assignee as { id?: unknown; name?: unknown };
+            return typeof value.id === 'string' && value.id
+              ? { id: value.id, name: typeof value.name === 'string' ? value.name : value.id }
+              : undefined;
+          })()
+          : undefined;
+        await this.callbacks.send(text, assignee);
+        await this.refresh();
+      }
+      if (record.type === 'control' && record.command === 'stop') {
+        const result = await this.callbacks.control?.('stop');
+        if (result) this.callbacks.log(`[group] 停止执行：${result.message}`);
         await this.refresh();
       }
       // 工具栏按钮：直接转发给命令，面板不重复实现打开账本 / 状态那套逻辑。
@@ -183,6 +204,20 @@ export class GroupPanel implements vscode.Disposable {
         return [...seen.values()];
       })(),
       openQuestion: state.openQuestion?.body ?? '',
+      /** 「由谁执行」候选：中继在线设备；没接中继时为空（只能本机做）。 */
+      devices: (() => {
+        const local = this.service.localPeer();
+        const list = this.callbacks.relay?.()?.devices ?? [];
+        return list.length
+          ? list.map((device) => ({
+            id: device.id,
+            name: device.name,
+            project: device.project,
+            isLocal: device.id === local.id,
+          }))
+          : [];
+      })(),
+      canStop: state.role !== 'off' || Boolean(this.callbacks.relay?.()?.connected),
       taskGroups: groupTasksByStatus(buildTaskBoard(state.messages)).map((group) => ({
         status: group.status,
         label: TASK_STATUS_LABEL[group.status],
@@ -199,6 +234,8 @@ export class GroupPanel implements vscode.Disposable {
       lines: state.messages.map((message) => ({
         ...compactGroupLine(message, now),
         requirementId: message.requirementId,
+        // 结果/未执行要保留换行：压成一行会把「改了哪些文件」挤成不可读的长句
+        full: message.body.slice(0, 2_000),
       })),
     });
   }
@@ -269,7 +306,13 @@ export class GroupPanel implements vscode.Disposable {
   .empty b { color: var(--vscode-foreground); }
 
   /* 输入区 */
-  footer { border-top: 1px solid var(--line); padding: 14px 20px 16px; }
+  footer { border-top: 1px solid var(--line); padding: 12px 20px 16px; }
+  .assign { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+  .assign .label { margin-right: 2px; }
+  .assign .chip { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line);
+    background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; font-family: inherit; }
+  .assign .chip.on { border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
+  .assign .stop { margin-left: auto; border-color: var(--vscode-errorForeground); color: var(--vscode-errorForeground); }
   .composer { display: flex; gap: 10px; align-items: flex-end; }
   textarea {
     flex: 1; min-height: 52px; max-height: 40vh; resize: none; padding: 11px 13px;
@@ -313,11 +356,12 @@ export class GroupPanel implements vscode.Disposable {
 </section>
 <main id="feed"></main>
 <footer>
+  <div class="assign" id="assign"></div>
   <div class="composer">
     <textarea id="text" rows="2" placeholder="说需求，或回答乙方的追问…"></textarea>
     <button class="send" id="send">发送</button>
   </div>
-  <div class="hint">Enter 发送 · Shift+Enter 换行 · 你的话会发到频道里所有设备</div>
+  <div class="hint">Enter 发送 · Shift+Enter 换行 · 选「所有人」= 频道内每台设备都做，选某台设备 = 只有它做</div>
 </footer>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
@@ -333,6 +377,8 @@ function avatar(who, side) {
 }
 
 let boardCollapsed = false;
+/** 当前选中的执行设备；null = 所有人（旧行为）。 */
+let assignee = null;
 function renderBoard(groups) {
   const board = el('board'), cols = el('boardCols'), hint = el('boardHint');
   const total = groups.reduce((sum, group) => sum + group.tasks.length, 0);
@@ -406,6 +452,7 @@ function render(state) {
   else banner.style.display = 'none';
 
   renderBoard(state.taskGroups || []);
+  renderAssign(state);
 
   feed.textContent = '';
   let lastRequirement = '';
@@ -433,7 +480,9 @@ function render(state) {
     time.textContent = line.time;
     meta.appendChild(tag); meta.appendChild(who); meta.appendChild(time);
     const body = document.createElement('div');
-    body.textContent = line.body;
+    body.textContent = (line.phaseKey === 'result' || line.phaseKey === 'blocked')
+      ? (line.full || line.body)
+      : line.body;
     bubble.appendChild(meta);
     bubble.appendChild(body);
     row.appendChild(bubble);
@@ -448,12 +497,43 @@ function render(state) {
   feed.scrollTop = feed.scrollHeight;
 }
 
+function renderAssign(state) {
+  const box = el('assign');
+  box.textContent = '';
+  const label = document.createElement('span');
+  label.className = 'label';
+  label.textContent = '由谁执行';
+  box.appendChild(label);
+
+  const chips = [{ id: null, name: '所有人' }, ...(state.devices || [])];
+  // 选中的设备掉线了就退回「所有人」，否则会发出一条谁都接不到的需求
+  if (assignee && !chips.some((item) => item.id === assignee.id)) assignee = null;
+  for (const item of chips) {
+    const chip = document.createElement('button');
+    chip.className = 'chip' + ((assignee ? assignee.id : null) === item.id ? ' on' : '');
+    chip.textContent = item.id === null ? item.name : (item.name + (item.isLocal ? '（本机）' : ''));
+    chip.addEventListener('click', () => {
+      assignee = item.id === null ? null : { id: item.id, name: item.name };
+      renderAssign(state);
+    });
+    box.appendChild(chip);
+  }
+
+  if (state.canStop) {
+    const stop = document.createElement('button');
+    stop.className = 'chip stop';
+    stop.textContent = '停止执行';
+    stop.addEventListener('click', () => vscode.postMessage({ type: 'control', command: 'stop' }));
+    box.appendChild(stop);
+  }
+}
+
 function send() {
   const value = text.value.trim();
   if (!value) return;
   text.value = '';
   autosize();
-  vscode.postMessage({ type: 'send', text: value });
+  vscode.postMessage({ type: 'send', text: value, assignee: assignee || undefined });
 }
 
 function autosize() {

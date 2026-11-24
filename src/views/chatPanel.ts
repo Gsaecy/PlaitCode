@@ -226,6 +226,14 @@ interface SendOptions {
    * 冲突时谁也说不清谁对。所以定死：**群 = 双方，主对话 = 本机**。
    */
   origin?: 'user' | 'sync' | 'group';
+  /**
+   * 指派给哪台设备执行（群窗口里选的）。
+   *
+   * 指派给别人时本机**不跑**：同一条需求两边各做一遍，改动会互相覆盖。
+   */
+  assignee?: string;
+  /** 指派目标的显示名，只用于提示文案。 */
+  assigneeName?: string;
   /** 来自同步需求时记下需求号，运行结束时据此回报进度。 */
   syncRequirementId?: string;
   /**
@@ -957,8 +965,11 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
    * 它已经负责判断「这是回答追问还是新需求」、广播、以及本机这一轮怎么跑；
    * 群窗口不重复实现那套逻辑，否则两处判断迟早会不一致。
    */
-  async sendGroupMessage(text: string): Promise<void> {
-    await this.send(text, undefined, undefined, undefined, undefined, undefined, { origin: 'group' });
+  async sendGroupMessage(text: string, assignee?: { id: string; name: string }): Promise<void> {
+    await this.send(text, undefined, undefined, undefined, undefined, undefined, {
+      origin: 'group',
+      ...(assignee ? { assignee: assignee.id, assigneeName: assignee.name } : {}),
+    });
   }
 
   /**
@@ -2027,11 +2038,27 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
               requirementId: openRequirement,
             }).catch(() => undefined);
           } else {
-            void this.lanSync.postGroup({ author: 'user', phase: 'requirement', body: content })
-              .catch(() => undefined);
+            const assignee = options?.assignee?.trim() ?? '';
+            void this.lanSync.postGroup({
+              author: 'user',
+              phase: 'requirement',
+              body: content,
+              ...(assignee ? { assignee } : {}),
+            }).catch(() => undefined);
             void this.lanSync.shareRequirement(content)
               .then((result) => this.log(`[sync] 广播需求：${result.message}`))
               .catch(() => undefined);
+            /*
+             * 指派给别的设备：本机**不跑**。
+             *
+             * 两边各跑一遍是同一份改动做两次，谁后写谁覆盖 —— 这比"没人做"更难查。
+             * 群窗口里那条需求已经广播出去了，被指派的那台会执行。
+             */
+            if (assignee && assignee !== this.lanSync.localPeer().id) {
+              const who = options?.assigneeName?.trim() || assignee;
+              await this.post({ type: 'toast', tone: 'neutral', text: tt('sync.assignedElsewhere', { device: who }) });
+              return;
+            }
           }
         } else if (options?.origin !== 'sync' && !this.localOnlyNoticeShown) {
           /*

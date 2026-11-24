@@ -34,7 +34,7 @@ export interface LanSetupOptions {
     runSyncRequirement(requirement: import('./lanProtocol').SyncRequirement): Promise<boolean>;
     runSyncNote(note: import('./lanProtocol').SyncNote): Promise<boolean>;
     /** 群窗口里发一句话（需求或回答），由面板决定走哪条路径。 */
-    sendGroupMessage(text: string): Promise<void>;
+    sendGroupMessage(text: string, assignee?: { id: string; name: string }): Promise<void>;
     /** 中继上收到甲方需求：开跑但不再广播；跑没跑起来都要回执。 */
     runRelayedUserRequirement(
       text: string,
@@ -293,11 +293,14 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    * 群窗口不重复实现那套判断。
    */
   const groupPanel = new GroupPanel(context.extensionUri, service, {
-    send: (text) => chat.sendGroupMessage(text),
+    send: (text, assignee) => chat.sendGroupMessage(text, assignee),
     log: (line) => output.info(line),
+    control: (action) => chat.applyRemoteControl({ action }),
     relay: () => {
       const state = relay?.status();
-      return state ? { connected: state.connected, peers: state.peers, url: state.url } : undefined;
+      return state
+        ? { connected: state.connected, peers: state.peers, url: state.url, devices: relay?.devices() ?? [] }
+        : undefined;
     },
   });
   /*

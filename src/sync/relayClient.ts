@@ -189,6 +189,8 @@ export class RelayClient implements Disposable {
   private received = 0;
   private sent = 0;
   private peers = 0;
+  /** 中继上最近一次 presence 返回的在线设备（团队群「由谁执行」用）。 */
+  private lastDevices: Array<{ id: string; name: string; platform: string; project: string }> = [];
   private lastError: string | undefined;
   private since = 0;
 
@@ -218,6 +220,11 @@ export class RelayClient implements Disposable {
       sent: this.sent,
       ...(this.lastError ? { lastError: this.lastError } : {}),
     };
+  }
+
+  /** 中继上当前在线的设备（含本机）。团队群据此生成「由谁执行」。 */
+  devices(): Array<{ id: string; name: string; platform: string; project: string }> {
+    return this.lastDevices.map((item) => ({ ...item }));
   }
 
   start(): void {
@@ -287,6 +294,19 @@ export class RelayClient implements Disposable {
       }, this.authHeaders());
       const devices = Array.isArray(response.body?.devices) ? response.body.devices : [];
       this.peers = Math.max(0, devices.length - 1);
+      /*
+       * 记下在线设备列表：团队群要按它生成「由谁执行」的候选。
+       * 只留能执行任务的字段（id / 名字 / 平台 / 项目），不收其它信息。
+       */
+      this.lastDevices = devices
+        .map((item) => item as { id?: unknown; name?: unknown; platform?: unknown; project?: unknown })
+        .filter((item) => typeof item.id === 'string' && item.id)
+        .map((item) => ({
+          id: String(item.id),
+          name: typeof item.name === 'string' ? item.name : String(item.id),
+          platform: typeof item.platform === 'string' ? item.platform : 'unknown',
+          project: typeof item.project === 'string' ? item.project : '',
+        }));
       if (response.status === 403) {
         this.lastError = '频道未授权（身份模式下需先登记设备令牌）';
       } else if (response.status === 200) {

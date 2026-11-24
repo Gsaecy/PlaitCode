@@ -649,6 +649,10 @@ const DICTIONARY: Record<string, Entry> = {
     zh: '这条只发给了本机 agent（主对话是「你和一个 agent」的频道）。需要频道里的其它设备一起做，请在「团队群」窗口里发。',
     en: 'This went to the local agent only — the main chat is a one-agent channel. To have other devices in the channel do it too, send it in the team group window.',
   },
+  'sync.assignedElsewhere': {
+    zh: '这条需求已指派给「{device}」，本机不执行（同一份改动做两遍会互相覆盖）。',
+    en: 'This request is assigned to “{device}”; this machine will not run it (doing it twice would overwrite each other).',
+  },
   'settings.nav.privacy': { zh: '权限与隐私', en: 'Permissions & privacy' },
   'settings.nav.storage': { zh: '存储', en: 'Storage' },
   'settings.nativeButton': { zh: 'VS Code 设置', en: 'VS Code settings' },

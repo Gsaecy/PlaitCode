@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { compactGroupLine, groupHeader } from '../views/groupPanel';
 import { makeGroupMessage, type SyncPeer } from '../sync/lanProtocol';
@@ -65,4 +66,49 @@ test('顶部状态：局域网没连但中继通着，必须是「已连接」�
   // 局域网连上时以局域网为准（更快的直连路径）
   assert.equal(groupHeader({ role: 'hub', relay: { connected: true, peers: 1, url: 'x' } }).status, '主机（等待队友）');
   assert.equal(groupHeader({ role: 'peer' }).status, '已连接');
+});
+
+/**
+ * 电脑端补齐（与手机能力一致）：指派、停止、看结果。
+ *
+ * 指派最容易写错的地方是「本机也跑了」——两台机器各做一遍，
+ * 谁后写谁覆盖，比没人做更难查。所以这里钉住那个提前返回。
+ */
+const PANEL = readFileSync('src/views/chatPanel.ts', 'utf8');
+const GROUP = readFileSync('src/views/groupPanel.ts', 'utf8');
+
+test('群窗口能把需求指派给某台设备，并一路传到 postGroup', () => {
+  const index = PANEL.indexOf('async sendGroupMessage(');
+  assert.ok(index > 0);
+  const body = PANEL.slice(index, index + 320);
+  assert.match(body, /assignee/, '群窗口发送要接受指派参数');
+  assert.match(body, /origin: 'group'/, '仍然走群频道');
+  assert.match(PANEL, /\(assignee \? \{ assignee \} : \{\}\)/, '指派要进 postGroup 的载荷');
+});
+
+test('指派给别的设备时本机不执行（否则同一改动做两遍）', () => {
+  const guard = PANEL.indexOf('assignee !== this.lanSync.localPeer().id');
+  assert.ok(guard > 0, '缺少「指派给别人就不跑」的判断');
+  const notice = PANEL.indexOf('sync.assignedElsewhere', guard);
+  assert.ok(notice > guard, '要告诉用户"这条已经交给别的设备了"');
+});
+
+test('群窗口有「由谁执行」和「停止执行」', () => {
+  assert.match(GROUP, /由谁执行/, '要能选执行设备');
+  assert.match(GROUP, /停止执行/, '要能中止电脑上的任务');
+  assert.match(GROUP, /type: 'control', command: 'stop'/, '停止走控制通道');
+});
+
+test('选中的设备掉线后退回「所有人」，不会发出没人接的需求', () => {
+  const index = GROUP.indexOf('function renderAssign(');
+  assert.ok(index > 0);
+  const body = GROUP.slice(index, index + 900);
+  assert.match(body, /chips\.some\(\(item\) => item\.id === assignee\.id\)/, '要校验选中项还在不在');
+});
+
+test('结果与未执行保留换行（压成一行会把文件清单挤成不可读长句）', () => {
+  const index = GROUP.indexOf('const body = document.createElement');
+  const body = GROUP.slice(index, index + 420);
+  assert.match(body, /result' \|\| line\.phaseKey === 'blocked'/, '结果类消息要用完整正文');
+  assert.match(GROUP, /full: message\.body\.slice\(0, 2_000\)/, '要额外传完整正文');
 });
