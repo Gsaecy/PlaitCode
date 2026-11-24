@@ -55,6 +55,7 @@ import {
   type SyncReport,
   type SyncRequirement,
 } from './lanProtocol';
+import { normalizeRepoUrl } from './projectRef';
 import {
   MOBILE_COOKIE,
   MOBILE_PATH,
@@ -98,6 +99,10 @@ export interface LanSyncBridge {
   onSuperseded?(info: { stopped: string; next: string; from: string }): void;
   /** 本机工作区里的项目名（供面板展示与选择）。 */
   localProjects?(): string[];
+  /** 本机每个项目的仓库地址（与 `localProjects()` 同序）。 */
+  localProjectRepos?(): string[];
+  /** 本机当前工作区的仓库地址。 */
+  localRepo?(): string;
   /**
    * 项目不一致：**先追问，别直接开跑**。
    *
@@ -393,10 +398,11 @@ export class LanSyncService implements Disposable {
   /**
    * 本机参与协作的项目名（工作区文件夹名）。
    *
-   * 每台设备各自选一个项目；两台选到**同名项目**才是一起做同一件事。
-   * 空串表示用默认（当前工作区文件夹名）。
+   * 只是**本地标签**：真正的项目身份是下面的 `collabRepo`（GitHub 仓库地址）。
    */
   private collabProject = '';
+  /** 本机参与协作的项目的仓库地址（项目唯一 ID）。 */
+  private collabRepo = '';
   /**
    * UDP 发现端口（固定，不随 HTTP 端口变化）。
    * 可注入只是为了让测试与真实运行中的实例隔离；生产永远用 `DISCOVERY_PORT`。
@@ -921,24 +927,40 @@ export class LanSyncService implements Disposable {
     return this.collabProject;
   }
 
-  /** 选定本机参与协作的项目；下一轮协作消息就会带上它。 */
-  async setCollabProject(name: string): Promise<void> {
+  /** 本机协作项目的仓库地址（项目唯一 ID）。 */
+  currentRepo(): string {
+    return this.collabRepo || (this.bridge.localRepo?.() ?? '');
+  }
+
+  /**
+   * 选定本机参与协作的项目。
+   *
+   * `repo` 是项目唯一 ID（仓库地址）；`name` 只是本地文件夹名，仅用于展示。
+   */
+  async setCollabProject(name: string, repo = ''): Promise<void> {
     this.collabProject = name.trim().slice(0, 80);
+    this.collabRepo = normalizeRepoUrl(repo);
     await this.persist();
-    this.bridge.log(`[sync] 协作项目设为「${this.collabProject || '（默认）'}」`);
+    this.bridge.log(
+      `[sync] 协作项目设为「${this.collabProject || '（默认）'}」${this.collabRepo ? `（仓库 ${this.collabRepo}）` : ''}`,
+    );
     this.bridge.onState?.();
   }
 
   /**
    * 本机有没有对方那个项目。
    *
-   * 用来判断「项目不一致」是不是真的不一致：同一个人另一台设备上
-   * 只是还没建/没拉这个项目，那就不是冲突，可以提示去拉取。
+   * **按仓库地址判断**：同一个仓库在别的机器上可能叫另一个文件夹名。
    */
-  hasProject(name: string): boolean {
-    if (!name) return false;
-    if (this.collabProject === name) return true;
-    return this.bridge.localProjects?.().includes(name) ?? false;
+  hasProject(repoOrName: string): boolean {
+    if (!repoOrName) return false;
+    const wanted = normalizeRepoUrl(repoOrName);
+    if (wanted) {
+      if (this.currentRepo() === wanted) return true;
+      const repos = this.bridge.localProjectRepos?.() ?? [];
+      if (repos.some((item) => normalizeRepoUrl(item) === wanted)) return true;
+    }
+    return this.localProjects().includes(repoOrName);
   }
 
   /** 本机工作区里的项目名（面板展示 / 选择用）。 */
@@ -1967,23 +1989,30 @@ export class LanSyncService implements Disposable {
         // 本机执行（除发起方自己）。
         if (message.from.id !== this.bridge.peer().id) {
           /*
-           * 项目门禁：**不是同一个项目就不能直接开跑**。
+           * 项目门禁：**按仓库地址判断**，文件夹名不算数。
            *
-           * 用户要求：多台设备的用户选中同一个项目才能协同；选的不一样时
-           * agent 先追问，确认后才调整。同账号只是本机还没这个项目 → 提示去拉取。
+           * 用户要求：项目唯一 ID 就是 GitHub 仓库地址。同一个仓库在不同设备上
+           * 可以叫不同文件夹名 —— 那是同一个项目，不该拦；
+           * 仓库不同才是真的不同，要先追问、确认后才调整。
            */
-          const required = message.project || message.from.project || '';
+          const theirRepo = normalizeRepoUrl(message.repo ?? message.from.repo ?? '');
+          const myRepo = this.currentRepo();
+          const sameRepo = Boolean(theirRepo) && Boolean(myRepo) && theirRepo === myRepo;
+          const required = theirRepo || message.project || message.from.project || '';
           const local = this.collabProject || this.bridge.peer().project;
-          if (required && local && required !== local && !this.hasProject(required)) {
+          const mismatch = theirRepo
+            ? !sameRepo && !this.hasProject(theirRepo)
+            : Boolean(required) && Boolean(local) && required !== local && !this.hasProject(required);
+          if (mismatch) {
             const mine = this.bridge.localLogin?.() ?? '';
             const theirs = message.from.login ?? '';
             this.bridge.log(
-              `[sync] 项目不一致（对方「${required}」/ 本机「${local}」），先追问，不执行需求 ${message.id}`,
+              `[sync] 项目不一致（对方仓库「${theirRepo || required}」/ 本机「${myRepo || local}」），先追问，不执行需求 ${message.id}`,
               'warn',
             );
             this.bridge.onProjectMismatch?.({
-              required,
-              local,
+              required: theirRepo || required,
+              local: myRepo || local,
               from: message.from.name,
               sameAccount: Boolean(mine) && mine === theirs,
               hasLocalCandidate: false,
@@ -2089,6 +2118,9 @@ export class LanSyncService implements Disposable {
       // 带上本机选中的项目：对方据此判断「是不是同一个项目」。
       const project = this.collabProject || this.bridge.peer().project;
       if (project) requirement.project = project;
+      // 项目唯一 ID：仓库地址（文件夹名不参与判断）。
+      const repo = this.currentRepo();
+      if (repo) requirement.repo = repo;
     const exists = this.requirements.some((item) => item.id === requirement.id);
     if (!exists) this.requirements = [...this.requirements, requirement].slice(-STATE_LIMIT);
     await this.persist();

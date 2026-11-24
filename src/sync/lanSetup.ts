@@ -11,14 +11,16 @@
  * 给需要固定码或跨网段的用户用。
  */
 
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import * as vscode from 'vscode';
 import { ALIGNMENT_FILE, type SyncPeer } from './lanProtocol';
 
 /** 团队群记录文件（与对齐账本并列，一个记状态、一个记过程）。 */
 const TRANSCRIPT_FILE = 'docs/TEAM-CHAT.md';
 import { LanSyncService, defaultDeviceName, defaultPlatform, lanAddresses, parseInviteText, peerIdFor, type LanSyncBridge } from './lanSync';
+import { normalizeRepoUrl } from './projectRef';
 import { GroupPanel } from '../views/groupPanel';
 import { MobilePanel } from '../views/mobilePanel';
 import { RelayPhonePanel } from '../views/relayPhonePanel';
@@ -136,15 +138,55 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     .map((folder) => basename(folder.uri.fsPath))
     .filter(Boolean);
 
+  /*
+   * 读项目的 GitHub 仓库地址 —— 这是**项目唯一 ID**。
+   *
+   * 直接解析 `.git/config`，不起子进程：子进程只能由命令执行器派生
+   * （审批与审计都在那里）。读不到就返回空串，调用方退回按文件夹名比较。
+   */
+  const repoOfFolder = (folderPath: string): string => {
+    try {
+      const dotGit = join(folderPath, '.git');
+      let gitDir = dotGit;
+      // worktree / 子模块里 `.git` 是一个文件，内容是 `gitdir: <路径>`。
+      if (existsSync(dotGit) && !statSync(dotGit).isDirectory()) {
+        const pointer = readFileSync(dotGit, 'utf8').trim();
+        const match = pointer.match(/^gitdir:\s*(.+)$/i);
+        if (!match?.[1]) return '';
+        gitDir = isAbsolute(match[1]) ? match[1] : join(folderPath, match[1]);
+      }
+      const config = readFileSync(join(gitDir, 'config'), 'utf8');
+      // 只取 [remote "origin"] 段里的 url。
+      const section = config.split(/^\[/m).find((chunk) => /^remote\s+"origin"\]/i.test(chunk));
+      if (!section) return '';
+      const url = section.match(/^\s*url\s*=\s*(.+)$/im)?.[1]?.trim() ?? '';
+      return normalizeRepoUrl(url);
+    } catch {
+      return '';
+    }
+  };
+  /** 本机每个项目的仓库地址（与 projects() 同序）。 */
+  const projectRepos = (): string[] => {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    return folders.map((folder) => repoOfFolder(folder.uri.fsPath));
+  };
+
   const bridge: LanSyncBridge = {
     peer: () => {
       const root = workspaceRoot();
+      const folders = vscode.workspace.workspaceFolders ?? [];
+      const folder = collabProjectName
+        ? folders.find((item) => basename(item.uri.fsPath) === collabProjectName)
+        : folders[0];
+      const repoNow = folder ? repoOfFolder(folder.uri.fsPath) : '';
       return localPeer({
         deviceName,
         version: options.version,
         project: collabProjectName || (root ? basename(root) : 'workspace'),
+        ...(repoNow ? { repo: repoNow } : {}),
         ...(githubLogin ? { login: githubLogin } : {}),
         ...(projects().length ? { projects: projects() } : {}),
+        ...(projectRepos().filter(Boolean).length ? { projectRepos: projectRepos().filter(Boolean) } : {}),
       });
     },
     runRequirement: (requirement) => chat.runSyncRequirement(requirement),
@@ -205,9 +247,15 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       }
     },
     /** 本机工作区里的项目名：面板用来展示和选择。 */
-    localProjects: () => (vscode.workspace.workspaceFolders ?? [])
-      .map((folder) => basename(folder.uri.fsPath))
-      .filter(Boolean),
+    localProjects: () => projects(),
+    localProjectRepos: () => projectRepos(),
+    localRepo: () => {
+      const folders = vscode.workspace.workspaceFolders ?? [];
+      const picked = collabProjectName
+        ? folders.find((folder) => basename(folder.uri.fsPath) === collabProjectName)
+        : folders[0];
+      return picked ? repoOfFolder(picked.uri.fsPath) : '';
+    },
     /** 本机 GitHub 登录名（拿不到就是空串，不阻塞协作）。 */
     localLogin: () => githubLogin,
     /**
@@ -721,6 +769,40 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     void vscode.window.showInformationMessage(`${message}\n${hint}`, '知道了');
   };
 
+  /**
+   * 项目还没有 GitHub 仓库时提醒。
+   *
+   * 项目唯一 ID 就是仓库地址；新项目还没建仓库，两台设备就没有共同身份可对齐。
+   * 所以先提醒用户去建仓库并推送，而不是让他靠文件夹名"碰运气"。
+   */
+  const remindRepoIfMissing = async (): Promise<boolean> => {
+    if (service.currentRepo()) return true;
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+    if (!folder) return true;
+    const choice = await vscode.window.showWarningMessage(
+      [
+        '这个项目还没有 GitHub 仓库，所以两台设备没法确认「是同一个项目」。',
+        '',
+        '项目靠仓库地址认身份（文件夹名不算数）。建议先建仓库并推送：',
+        '  git init && git add . && git commit -m init',
+        '  gh repo create <仓库名> --private --source=. --push',
+        '',
+        '（没有 gh 命令就到 GitHub 网页新建空仓库，再执行 git remote add origin <地址> && git push -u origin main）',
+      ].join('\n'),
+      { modal: true },
+      '复制命令',
+      '仍然继续',
+    );
+    if (choice === '复制命令') {
+      await vscode.env.clipboard.writeText(
+        'git init && git add . && git commit -m init\ngh repo create --private --source=. --push',
+      );
+      void vscode.window.showInformationMessage('命令已复制。执行完再点「启动群聊 / 加入群聊」。');
+      return false;
+    }
+    return choice === '仍然继续';
+  };
+
   const disposables: vscode.Disposable[] = [
     status,
     service,
@@ -733,6 +815,8 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 这是唯一的开群入口 —— 不自动找设备、不互相比谁让位，谁开群谁当主机。
      */
     vscode.commands.registerCommand('hwchat.lanSync.startGroup', async () => {
+      // 新项目还没仓库：先提醒建仓库，否则两台没有共同的项目身份。
+      if (!await remindRepoIfMissing()) return;
       const result = await service.startGroup(setting('lanSync.port', 47821));
       refreshStatus();
       if (!result.ok) {
@@ -768,6 +852,8 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 地址、端口、配对全部自动 —— 用户不需要知道对方的 IP。
      */
     vscode.commands.registerCommand('hwchat.lanSync.joinGroup', async () => {
+      // 本机项目没仓库时也提醒：否则对不齐项目。
+      await remindRepoIfMissing();
       const typed = await vscode.window.showInputBox({
         title: '加入群聊',
         prompt: '粘贴对方「复制邀请码」复制的那一整串（形如 192.168.0.3:47821#K7M2QX）——也可以只填 6 位邀请码',
@@ -930,18 +1016,26 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         return;
       }
       const current = service.currentProject() || folders[0];
+      const repos = projectRepos();
       const picked = await vscode.window.showQuickPick(
-        folders.map((name) => ({
-          label: name,
-          description: name === current ? '当前协作项目' : '',
-        })),
-        { title: '选择要参与协作的项目', placeHolder: '另一台设备选同一个项目，才能一起做同一件事' },
+        folders.map((name, index) => {
+          const repo = repos[index] ?? '';
+          return {
+            label: name,
+            description: repo || '未绑定 GitHub 仓库',
+            detail: repo
+              ? `项目 ID：${repo}${name === current ? '（当前）' : ''}`
+              : '两台设备靠仓库地址认项目。新项目建议先新建仓库并推送，否则只能按文件夹名对齐。',
+          };
+        }),
+        { title: '选择要参与协作的项目', placeHolder: '两台设备选同一个仓库，就一定协作的是同一个项目' },
       );
       if (!picked) return;
-      await service.setCollabProject(picked.label);
+      const index = folders.indexOf(picked.label);
+      await service.setCollabProject(picked.label, index >= 0 ? (repos[index] ?? '') : '');
       refreshStatus();
       void vscode.window.showInformationMessage(
-        `已把「${picked.label}」设为协作项目。请让对方也选同一个项目。`,
+        `已把「${picked.label}」设为协作项目。请让对方也选同一个仓库。`,
       );
     }),
     vscode.commands.registerCommand('hwchat.lanSync.openGroup', async () => {

@@ -787,6 +787,43 @@ test('只靠邀请码进群后，群消息必须真的能传过去（不能 403�
   }
 });
 
+test('项目身份 = 仓库地址：各种写法归一成同一个 ID，文件夹名不参与', async () => {
+  const { normalizeRepoUrl, repoSlug, sameProject } = await import('../sync/projectRef.js');
+
+  // 同一个仓库的四种常见写法必须归一成同一个 ID。
+  const forms = [
+    'https://github.com/Gsaecy/PlaitCode.git',
+    'https://github.com/gsaecy/plaitcode',
+    'git@github.com:Gsaecy/PlaitCode.git',
+    'ssh://git@github.com/Gsaecy/PlaitCode/',
+    'github.com/Gsaecy/PlaitCode',
+  ];
+  for (const form of forms) {
+    assert.equal(normalizeRepoUrl(form), 'github.com/gsaecy/plaitcode', `未能归一化：${form}`);
+  }
+  assert.equal(repoSlug('git@github.com:Gsaecy/PlaitCode.git'), 'gsaecy/plaitcode');
+
+  // 不是仓库地址（本地路径 / 空）→ 空串，调用方退回按文件夹名。
+  assert.equal(normalizeRepoUrl(''), '');
+  assert.equal(normalizeRepoUrl('D:\\projects\\app'), '');
+  assert.equal(normalizeRepoUrl('/Users/me/app'), '');
+
+  // 同一个仓库、不同文件夹名 → 同一个项目。
+  assert.equal(
+    sameProject({ repo: 'git@github.com:me/app.git', project: 'app-win' }, { repo: 'https://github.com/me/app', project: 'app-mac' }),
+    true,
+    '仓库相同就不该因为文件夹名不同被判成两个项目',
+  );
+  // 不同仓库、同名文件夹 → 不同项目。
+  assert.equal(
+    sameProject({ repo: 'https://github.com/me/app-a', project: 'app' }, { repo: 'https://github.com/me/app-b', project: 'app' }),
+    false,
+    '文件夹同名但是不同仓库，不是同一个项目',
+  );
+  // 都没有仓库 → 退回按文件夹名。
+  assert.equal(sameProject({ project: 'app' }, { project: 'app' }), true);
+});
+
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {
   assert.equal(normalizeHubAddress('192.168.0.3', 47821), 'http://192.168.0.3:47821');
   assert.equal(normalizeHubAddress('192.168.0.3:5000', 47821), 'http://192.168.0.3:5000', '显式端口不能被覆盖');
