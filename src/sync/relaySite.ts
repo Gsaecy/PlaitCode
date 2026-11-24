@@ -541,6 +541,43 @@ export function renderLandingPage(options: {
 }
 
 /**
+ * 登录结果页：浏览器里走完 GitHub 登录后给用户看的那一屏。
+ *
+ * 只用于「设备码」流程 —— 用户此刻的注意力在浏览器，要一眼看懂
+ * 「可以关掉了，回 VS Code 继续」。所以只有一句话 + 一个状态图标。
+ */
+export function renderAuthResultPage(options: { ok: boolean; title: string; body: string }): string {
+  const tone = options.ok ? 'var(--ok)' : 'var(--bad)';
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f1115">
+<title>${escapeHtml(options.title)} · PlaitCode</title>
+<style>${BASE_CSS}
+  .stage { min-height:100vh; display:grid; place-items:center; padding:var(--s5); }
+  .card { max-width:420px; width:100%; border:1px solid var(--line); border-radius:var(--r-lg);
+    background:var(--surface); padding:var(--s6); text-align:center; }
+  .mark { width:48px; height:48px; margin:0 auto var(--s4); border-radius:50%;
+    display:grid; place-items:center; border:1px solid ${tone}; color:${tone}; }
+  h1 { font-size:var(--fs-h2); font-weight:600; }
+  p { margin-top:var(--s2); color:var(--text-2); font-size:var(--fs-sm); line-height:1.7; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="card">
+    <div class="mark">${options.ok ? icon('check') : icon('question')}</div>
+    <h1>${escapeHtml(options.title)}</h1>
+    <p>${escapeHtml(options.body)}</p>
+  </div>
+</div>
+</body>
+</html>`;
+}
+
+/**
  * 控制台外壳。数据全部由 `/v1/console/*` 取，页面本身不含任何服务端数据。
  *
  * 结构沿用成熟后台的通行做法：左侧固定导航 + 右侧内容区，

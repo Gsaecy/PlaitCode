@@ -78,6 +78,13 @@ export interface StateCheck {
   valid: boolean;
   /** state 里带的「登录后回哪」，只返回调用方白名单里的值。 */
   next?: string;
+  /**
+   * 签名验证通过的原始 nonce。
+   *
+   * 调用方可以往里塞自己的附加信息（比如设备码 `uuid~dXXXX-XXXX`），
+   * 再从这里取出来用 —— 内容已经被签名保护，改不动。
+   */
+  nonce?: string;
 }
 
 /**
@@ -105,7 +112,11 @@ export function readState(secret: string, token: string | undefined, allowed: re
   const nonce = cut > 0 ? body.slice(0, cut) : '';
   const sep = nonce.indexOf('~');
   const next = sep > 0 ? nonce.slice(sep + 1) : '';
-  return next && allowed.includes(next) ? { valid: true, next } : { valid: true };
+  return {
+    valid: true,
+    nonce,
+    ...(next && allowed.includes(next) ? { next } : {}),
+  };
 }
 
 /** 会话 Cookie 的值：payload + 签名，客户端改不了内容。 */

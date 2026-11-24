@@ -70,6 +70,26 @@ async function main(): Promise<void> {
     : undefined;
   if (sso) console.log('[relay] 飞书登录已启用');
   else if (feishuAppId) console.log('[relay] 警告：飞书登录需要 PLAITCODE_AUTH_SECRET 与身份库（PLAITCODE_IDENTITY）');
+
+  /*
+   * GitHub 登录：和飞书共用同一个会话密钥，所以「同一个 GitHub 账号」在多台设备上
+   * 自动就是同一个成员 —— 新设备登录后会继承频道授权，密钥由老设备加密送达。
+   */
+  const githubClientId = process.env.PLAITCODE_GITHUB_CLIENT_ID?.trim() ?? '';
+  const githubClientSecret = process.env.PLAITCODE_GITHUB_CLIENT_SECRET?.trim() ?? '';
+  const github = githubClientId && githubClientSecret && authSecret && identity
+    ? {
+      config: {
+        clientId: githubClientId,
+        clientSecret: githubClientSecret,
+        redirectUri: `${publicUrl}/v1/auth/github/callback`,
+        ...(process.env.PLAITCODE_GITHUB_API?.trim() ? { apiBase: process.env.PLAITCODE_GITHUB_API.trim() } : {}),
+      },
+      secret: authSecret,
+    }
+    : undefined;
+  if (github) console.log('[relay] GitHub 登录已启用');
+  else if (githubClientId) console.log('[relay] 警告：GitHub 登录需要 PLAITCODE_GITHUB_CLIENT_SECRET、PLAITCODE_AUTH_SECRET 与身份库');
   if (process.env.PLAITCODE_FEISHU_WEBHOOK?.trim()) console.log('[relay] 飞书机器人通知已启用');
 
   const handle = await createRelayServer({
@@ -79,6 +99,7 @@ async function main(): Promise<void> {
     ...(identity ? { identity } : {}),
     ...(adminToken ? { adminToken } : {}),
     ...(sso ? { auth: sso } : {}),
+    ...(github ? { github } : {}),
     ...(historyDir ? { historyDir } : {}),
     ...(process.env.PLAITCODE_SELF_ENROLL === '0' ? { selfEnroll: false } : {}),
     ...(process.env.PLAITCODE_FEISHU_WEBHOOK?.trim() ? { notifyHook: process.env.PLAITCODE_FEISHU_WEBHOOK.trim() } : {}),

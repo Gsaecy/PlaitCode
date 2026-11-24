@@ -14,7 +14,10 @@ import { AuditLog, type AuditOptions } from './relayAudit';
 import { createChannelHistory } from './relayHistory';
 import { sendFeishuNotify, type NotifyPayload } from './relayNotify';
 import { renderRelayMobilePage } from './relayPage';
-import { renderConsolePage, renderLandingPage } from './relaySite';
+import { renderAuthResultPage, renderConsolePage, renderLandingPage } from './relaySite';
+import { DeviceFlow, type DeviceFlowResult } from './relayDeviceFlow';
+import { HandoffStore } from './relayHandoff';
+import { buildGitHubAuthorizeUrl, exchangeGitHubCode, type GitHubConfig } from './relayGitHub';
 import { APP_ICON_SVG, SERVICE_WORKER_JS, renderManifest } from './relayPwa';
 import { parseCookies } from './mobileControl';
 import {
@@ -26,12 +29,16 @@ import {
   findMemberByIdentity,
   identitySnapshot,
   deviceByToken,
+  claimChannel,
+  clearNeedsKey,
   revokeDevice,
   roleCan,
+  setDevicePubkey,
   saveIdentity,
   type Action,
   type IdentityState,
   type Member,
+  type Role,
 } from './relayIdentity';
 import {
   buildAuthorizeUrl,
@@ -68,6 +75,18 @@ export interface RelayOptions {
     secret: string;
     /** 允许自动开户的邮箱域名；空数组表示不限制（内网自用）。 */
     emailDomains?: string[];
+    sessionTtlMs?: number;
+  };
+  /**
+   * GitHub 登录。
+   *
+   * 和飞书二选一或同时开：两者共用同一个会话 Cookie 与同一份身份库，
+   * 所以「同一个 GitHub 账号登录的每台设备」自动是同一个成员。
+   */
+  github?: {
+    config: GitHubConfig;
+    secret: string;
+    /** 会话有效期，默认 12 小时。 */
     sessionTtlMs?: number;
   };
   log?: (line: string) => void;
@@ -248,6 +267,20 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
 
   const identity = options.identity;
   const adminToken = options.adminToken ?? '';
+  const deviceFlow = new DeviceFlow();
+  const handoff = new HandoffStore();
+
+  /**
+   * 会话 Cookie 的签名密钥。
+   *
+   * 飞书和 GitHub 共用同一把：同一个 cookie 在两条登录入口之间通用，
+   * 手机上用 GitHub 登录、电脑上用飞书登录也不会互相踢掉。
+   */
+  const sessionSecret = (): string => options.auth?.secret ?? options.github?.secret ?? '';
+  /** 会话有效期：谁配了就用谁的，缺省 12 小时。 */
+  const sessionTtl = (): number => options.auth?.sessionTtlMs ?? options.github?.sessionTtlMs ?? 12 * 60 * 60_000;
+  /** 有没有任何一种登录方式可用。 */
+  const ssoEnabled = (): boolean => Boolean((options.auth || options.github) && identity);
 
   /** 身份模式下的频道：鉴权已经由身份层做完，这里只负责取或建。 */
   const ensureChannel = (id: string): Channel | undefined => {
@@ -286,10 +319,10 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       if (!verdict.ok) return { ok: false, status: 403, reason: verdict.reason ?? '未授权' };
       return { ok: true, deviceId: verdict.device?.id, member: verdict.member?.name };
     }
-    const sso = options.auth;
-    if (!sso) return { ok: false, status: 403, reason: '设备令牌无效' };
-    const session = verifySession(sso.secret, parseCookies(request.headers.cookie).plaitcode_session);
-    if (!session) return { ok: false, status: 401, reason: '未登录：请先用飞书登录' };
+    const sessionKey = sessionSecret();
+    if (!sessionKey) return { ok: false, status: 403, reason: '设备令牌无效' };
+    const session = verifySession(sessionKey, parseCookies(request.headers.cookie).plaitcode_session);
+    if (!session) return { ok: false, status: 401, reason: '未登录：请先用 GitHub 或飞书登录' };
     const verdict = authorizeSession(identity.state, session.memberId, channelId, action);
     if (!verdict.ok) return { ok: false, status: 403, reason: verdict.reason ?? '未授权' };
     return { ok: true, member: verdict.member?.name };
@@ -424,7 +457,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       if (request.method === 'GET' && route === '/') {
         const page = renderLandingPage({
           relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com',
-          consoleEnabled: Boolean(options.auth && identity),
+          consoleEnabled: ssoEnabled(),
           installUrl: 'https://marketplace.visualstudio.com/items?itemName=plaitcode.plaitcode',
           repoUrl: 'https://github.com/Gsaecy/PlaitCode',
         });
@@ -443,7 +476,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       if (request.method === 'GET' && route === '/console') {
         const page = renderConsolePage({
           relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com',
-          sessionAuth: Boolean(options.auth && identity),
+          sessionAuth: ssoEnabled(),
         });
         response.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
@@ -460,7 +493,11 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       if (request.method === 'GET' && route === '/m') {        const html = renderRelayMobilePage({
           relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com',
           // 身份模式下手机不再出示频道密钥，改用登录后的会话 Cookie
-          sessionAuth: Boolean(identity),
+          sessionAuth: ssoEnabled(),
+          // 配了 GitHub 就优先用 GitHub：开发者的日常账号，扫码一次就能进
+          ...(options.github
+            ? { loginPath: '/v1/auth/github/start', loginLabel: 'GitHub' }
+            : { loginPath: '/v1/auth/feishu/start', loginLabel: '飞书' }),
         });
         response.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
@@ -510,6 +547,201 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           'x-content-type-options': 'nosniff',
         });
         response.end(APP_ICON_SVG);
+        return;
+      }
+
+      /* ---------------- GitHub 登录 + 设备码 ---------------- */
+
+      /*
+       * 设备码：VS Code 扩展拿不到浏览器回调，所以走「扩展拿码 → 浏览器登录 → 扩展轮询取令牌」。
+       * 这是 GitHub CLI 一类工具的通行做法，用户全程不需要复制任何字符串。
+       */
+      if (route === '/v1/auth/device/start' && request.method === 'POST') {
+        if (!identity || !options.github) {
+          json(response, 404, { ok: false, error: 'github login disabled' });
+          return;
+        }
+        const raw = await readBody(request);
+        if (raw === undefined) {
+          json(response, 413, { ok: false, error: 'body too large' });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        if (raw) {
+          try {
+            body = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            json(response, 400, { ok: false, error: 'invalid json' });
+            return;
+          }
+        }
+        const started = deviceFlow.start({
+          deviceName: typeof body.deviceName === 'string' ? body.deviceName : undefined,
+          platform: typeof body.platform === 'string' ? body.platform : undefined,
+        });
+        const host = typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com';
+        const proto = (request.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http');
+        json(response, 200, {
+          ok: true,
+          code: started.code,
+          expiresIn: started.expiresIn,
+          verifyUrl: `${proto}://${host}/v1/auth/github/start?device=${encodeURIComponent(started.code)}`,
+        });
+        return;
+      }
+
+      if (route === '/v1/auth/device/poll' && request.method === 'GET') {
+        if (!identity || !options.github) {
+          json(response, 404, { ok: false, error: 'github login disabled' });
+          return;
+        }
+        const polled = deviceFlow.poll(query.get('code') ?? '');
+        if (polled.status === 'expired') {
+          json(response, 404, { ok: false, error: '登录码已过期，请在 VS Code 里重新开始' });
+          return;
+        }
+        if (polled.status === 'pending') {
+          json(response, 200, { ok: true, status: 'pending' });
+          return;
+        }
+        audit.record({ event: 'login', ip: clientIp(request), detail: `device-code ${polled.result?.deviceId ?? ''}` });
+        json(response, 200, { ok: true, status: 'ready', ...polled.result });
+        return;
+      }
+
+      if (route === '/v1/auth/github/start' && request.method === 'GET') {
+        const gh = options.github;
+        if (!gh || !identity) {
+          json(response, 404, { ok: false, error: 'github login disabled' });
+          return;
+        }
+        const next = query.get('next') === 'console' ? 'console' : '';
+        const device = (query.get('device') ?? '').trim();
+        // 设备码塞进 nonce：内容有签名保护，改不动
+        const nonce = device
+          ? `${randomUUID()}~d${device}`
+          : (next ? `${randomUUID()}~${next}` : randomUUID());
+        const state = signState(gh.secret, nonce);
+        response.writeHead(302, {
+          location: buildGitHubAuthorizeUrl(gh.config, state),
+          'cache-control': 'no-store',
+        });
+        response.end();
+        return;
+      }
+
+      if (route === '/v1/auth/github/callback' && request.method === 'GET') {
+        const gh = options.github;
+        if (!gh || !identity) {
+          json(response, 404, { ok: false, error: 'github login disabled' });
+          return;
+        }
+        const check = readState(gh.secret, query.get('state') ?? undefined, ['console']);
+        if (!check.valid) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: 'github state invalid' });
+          json(response, 400, { ok: false, error: 'state 无效或已过期，请重新登录' });
+          return;
+        }
+        const code = query.get('code') ?? '';
+        if (!code) {
+          json(response, 400, { ok: false, error: '缺少 code' });
+          return;
+        }
+        const result = await exchangeGitHubCode(gh.config, code);
+        if (!result.ok) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: `github exchange failed: ${result.error}` });
+          json(response, 502, { ok: false, error: `GitHub 登录失败：${result.error}` });
+          return;
+        }
+
+        const who = result.identity;
+        let member = findMemberByIdentity(identity.state, { githubId: who.githubId });
+        if (!member) {
+          // 首个登录的人自动成为管理员；其余进同一个组织，等被授权频道
+          const org = identity.state.orgs[0] ?? addOrg(identity.state, who.login);
+          member = addMember(identity.state, {
+            orgId: org.id,
+            name: who.name,
+            role: identity.state.members.length === 0 ? 'owner' : 'member',
+            githubId: who.githubId,
+            githubLogin: who.login,
+            ...(who.email ? { email: who.email } : {}),
+          });
+          if (member) {
+            await persistIdentity();
+            audit.record({ event: 'admin', ip: clientIp(request), detail: `github provision ${who.login}` });
+          }
+        }
+        if (!member) {
+          json(response, 409, { ok: false, error: '无法建立成员身份' });
+          return;
+        }
+        // 账号改名 / 补了邮箱：跟上，审计里才是当前的名字
+        let dirty = false;
+        if (member.githubLogin !== who.login) { member.githubLogin = who.login; dirty = true; }
+        if (who.email && member.email !== who.email) { member.email = who.email; dirty = true; }
+        if (dirty) await persistIdentity();
+
+        const deviceCode = /~d([0-9A-Z-]{4,16})$/.exec(check.nonce ?? '')?.[1];
+        if (deviceCode) {
+          const entry = deviceFlow.peek(deviceCode);
+          if (!entry) {
+            response.writeHead(410, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+            response.end(renderAuthResultPage({ ok: false, title: '登录码已过期', body: '回到 VS Code 重新执行一次「开始协作」即可。' }));
+            return;
+          }
+          // 同一个人的其它设备已经在用哪些频道，新设备直接继承 —— 密钥稍后由老设备用它的公钥加密送达
+          const inherited = new Map<string, Role>();
+          for (const device of identity.state.devices) {
+            if (device.memberId !== member.id || device.revokedAt) continue;
+            for (const grant of device.grants) inherited.set(grant.channelId, grant.role);
+          }
+          const created = addDevice(identity.state, {
+            memberId: member.id,
+            name: entry.deviceName,
+            platform: entry.platform,
+            channels: [...inherited].map(([channelId, role]) => ({ channelId, role })),
+          });
+          if (!created) {
+            json(response, 409, { ok: false, error: '设备登记失败' });
+            return;
+          }
+          await persistIdentity();
+          const org = identity.state.orgs.find((item) => item.id === member!.orgId);
+          const flowResult: DeviceFlowResult = {
+            token: created.token,
+            deviceId: created.device.id,
+            memberId: member.id,
+            memberName: member.name,
+            orgId: member.orgId,
+            orgName: org?.name ?? '',
+            grants: created.device.grants,
+          };
+          deviceFlow.bind(deviceCode, flowResult);
+          audit.record({ event: 'admin', ip: clientIp(request), detail: `device login ${member.githubLogin} → ${created.device.name}` });
+          response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+          response.end(renderAuthResultPage({
+            ok: true,
+            title: '登录完成',
+            body: `已为「${created.device.name}」授权。这个窗口可以关掉，回到 VS Code 就会自动继续。`,
+          }));
+          return;
+        }
+
+        const ttl = sessionTtl();
+        const cookie = signSession(sessionSecret(), {
+          memberId: member.id,
+          name: member.name,
+          ...(member.email ? { email: member.email } : {}),
+          exp: Date.now() + ttl,
+        });
+        audit.record({ event: 'login', ip: clientIp(request), detail: member.githubLogin ?? member.name });
+        response.writeHead(302, {
+          location: check.next === 'console' ? '/console' : '/m',
+          'set-cookie': `plaitcode_session=${cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`,
+          'cache-control': 'no-store',
+        });
+        response.end();
         return;
       }
 
@@ -600,8 +832,8 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           member.email = who.email;
           await persistIdentity();
         }
-        const ttl = auth.sessionTtlMs ?? 12 * 60 * 60_000;
-        const cookie = signSession(auth.secret, {
+        const ttl = sessionTtl();
+        const cookie = signSession(sessionSecret(), {
           memberId: member.id,
           name: member.name,
           ...(result.identity.email ? { email: result.identity.email } : {}),
@@ -623,7 +855,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 404, { ok: false, error: 'sso disabled' });
           return;
         }
-        const session = verifySession(auth.secret, parseCookies(request.headers.cookie).plaitcode_session);
+        const session = verifySession(sessionSecret(), parseCookies(request.headers.cookie).plaitcode_session);
         if (!session) {
           json(response, 401, { ok: false, error: '未登录' });
           return;
@@ -710,6 +942,211 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         return;
       }
 
+      /* ---------------- 设备公钥与频道密钥交接 ---------------- */
+
+      /*
+       * 让第二台电脑**自动**拿到频道密钥，不用手粘配对信息。
+       *
+       * 中继在这里仍然看不到密钥：它只转发「用目标设备公钥加密过的包」。
+       * 三步：
+       *  1. 新设备 `POST /v1/devices/pubkey` 登记公钥并声明 needsKey；
+       *  2. 老设备 `GET /v1/handoff` 看到这件事，用对方公钥加密频道材料后 `POST /v1/handoff`；
+       *  3. 新设备 `GET /v1/handoff` 取走、解开，`POST /v1/handoff` 回报完成。
+       */
+      if (route === '/v1/devices/me' && request.method === 'GET') {
+        if (!identity) {
+          json(response, 404, { ok: false, error: 'identity disabled' });
+          return;
+        }
+        const token = bearer(request);
+        const device = token ? deviceByToken(identity.state, token) : undefined;
+        if (!device || device.revokedAt) {
+          json(response, 403, { ok: false, error: '需要用已登记的设备令牌调用' });
+          return;
+        }
+        const member = identity.state.members.find((item) => item.id === device.memberId);
+        const org = member ? identity.state.orgs.find((item) => item.id === member.orgId) : undefined;
+        json(response, 200, {
+          ok: true,
+          deviceId: device.id,
+          deviceName: device.name,
+          memberId: device.memberId,
+          memberName: member?.name ?? '',
+          orgId: member?.orgId ?? '',
+          orgName: org?.name ?? '',
+          grants: device.grants,
+          needsKey: device.needsKey === true,
+        });
+        return;
+      }
+
+      if (route === '/v1/devices/pubkey' && request.method === 'POST') {
+        if (!identity) {
+          json(response, 404, { ok: false, error: 'identity disabled' });
+          return;
+        }
+        const token = bearer(request);
+        const device = token ? deviceByToken(identity.state, token) : undefined;
+        if (!device || device.revokedAt) {
+          json(response, 403, { ok: false, error: '需要用已登记的设备令牌调用' });
+          return;
+        }
+        const raw = await readBody(request);
+        let body: Record<string, unknown> = {};
+        if (raw) {
+          try {
+            body = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            json(response, 400, { ok: false, error: 'invalid json' });
+            return;
+          }
+        }
+        const pubkey = typeof body.pubkey === 'string' ? body.pubkey : '';
+        if (!setDevicePubkey(identity.state, device.id, pubkey, body.needsKey !== false)) {
+          json(response, 400, { ok: false, error: '公钥格式不对' });
+          return;
+        }
+        await persistIdentity();
+        json(response, 200, { ok: true, needsKey: device.needsKey === true });
+        return;
+      }
+
+      if (route === '/v1/handoff') {
+        if (!identity) {
+          json(response, 404, { ok: false, error: 'identity disabled' });
+          return;
+        }
+        const token = bearer(request);
+        const me = token ? deviceByToken(identity.state, token) : undefined;
+        if (!me || me.revokedAt) {
+          json(response, 403, { ok: false, error: '需要用已登记的设备令牌调用' });
+          return;
+        }
+
+        if (request.method === 'GET') {
+          const taken = handoff.take(me.id);
+          // 解密要发送方的公钥：只带 id 的话新设备没法算共享密钥
+          const fromDevice = taken
+            ? identity.state.devices.find((device) => device.id === taken.fromDeviceId)
+            : undefined;
+          const incoming = taken ? { ...taken, fromPubkey: fromDevice?.pubkey ?? '' } : undefined;
+          /**
+           * 谁在等密钥：同一个人的其它设备、还没拿到密钥、且登记了公钥。
+           *
+           * 只给"同一个人"：跨成员的密钥交接不是自动的 —— 那需要显式授权，
+           * 不能因为同组织就替他把钥匙递过去。
+           */
+          const peers = identity.state.devices
+            .filter((device) => device.memberId === me.memberId
+              && device.id !== me.id
+              && !device.revokedAt
+              && device.needsKey === true
+              && typeof device.pubkey === 'string')
+            .map((device) => ({ deviceId: device.id, name: device.name, platform: device.platform, pubkey: device.pubkey }));
+          json(response, 200, {
+            ok: true,
+            ...(incoming ? { incoming } : {}),
+            peers,
+            // 自己有公钥、也还在等密钥时，前端才知道要显示「等待另一台设备」
+            needsKey: me.needsKey === true,
+          });
+          return;
+        }
+
+        if (request.method === 'POST') {
+          const raw = await readBody(request);
+          if (raw === undefined) {
+            json(response, 413, { ok: false, error: 'body too large' });
+            return;
+          }
+          let body: Record<string, unknown> = {};
+          if (raw) {
+            try {
+              body = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              json(response, 400, { ok: false, error: 'invalid json' });
+              return;
+            }
+          }
+
+          // 回报完成：这台设备已经拿到密钥，别再给它投包
+          if (body.done === true) {
+            clearNeedsKey(identity.state, me.id);
+            await persistIdentity();
+            json(response, 200, { ok: true });
+            return;
+          }
+
+          const toDeviceId = String(body.toDeviceId ?? '');
+          const target = identity.state.devices.find((device) => device.id === toDeviceId);
+          if (!target || target.revokedAt || target.needsKey !== true || !target.pubkey) {
+            json(response, 404, { ok: false, error: '目标设备不在等待列表里' });
+            return;
+          }
+          // 只能给「同一个人」的其它设备投放：这条链本身就是身份绑定的，不放开
+          if (target.memberId !== me.memberId) {
+            audit.record({ event: 'denied', ip: clientIp(request), detail: 'handoff cross-member denied' });
+            json(response, 403, { ok: false, error: '只能给自己的其它设备交接' });
+            return;
+          }
+          const pushed = handoff.put({
+            fromDeviceId: me.id,
+            toDeviceId,
+            iv: String(body.iv ?? ''),
+            ct: String(body.ct ?? ''),
+            at: Date.now(),
+          });
+          if (!pushed.ok) {
+            json(response, 400, { ok: false, error: pushed.error });
+            return;
+          }
+          audit.record({ event: 'admin', ip: clientIp(request), detail: `handoff ${me.id} → ${toDeviceId}` });
+          json(response, 200, { ok: true });
+          return;
+        }
+
+        json(response, 405, { ok: false, error: 'method not allowed' });
+        return;
+      }
+
+      /**
+       * 认领一条频道：设备自己生成了密钥，需要中继承认它对这条频道的权限。
+       *
+       * 安全性来自「能说出 channelId」本身 —— 它由密钥单向派生，
+       * 不知道密钥就说不出这个 id。冒领也没用：中继按 keyHash 校验，解不开消息。
+       */
+      if (route === '/v1/channels/claim' && request.method === 'POST') {
+        if (!identity) {
+          json(response, 404, { ok: false, error: 'identity disabled' });
+          return;
+        }
+        const token = bearer(request);
+        const device = token ? deviceByToken(identity.state, token) : undefined;
+        if (!device || device.revokedAt) {
+          json(response, 403, { ok: false, error: '需要用已登记的设备令牌调用' });
+          return;
+        }
+        const raw = await readBody(request);
+        let body: Record<string, unknown> = {};
+        if (raw) {
+          try {
+            body = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            json(response, 400, { ok: false, error: 'invalid json' });
+            return;
+          }
+        }
+        const channelId = String(body.channelId ?? '').trim();
+        if (!claimChannel(identity.state, device.id, channelId)) {
+          json(response, 400, { ok: false, error: '频道 id 格式不对，或设备授权已满' });
+          return;
+        }
+        await persistIdentity();
+        audit.record({ event: 'admin', ip: clientIp(request), detail: `claim ${channelId.slice(0, 8)} by ${device.name}` });
+        json(response, 200, { ok: true, grants: device.grants });
+        return;
+      }
+
       /* ---------------- 飞书机器人通知 ---------------- */
 
       if (route === '/v1/notify' && request.method === 'POST') {
@@ -770,14 +1207,17 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 404, { ok: false, error: 'identity disabled' });
           return;
         }
-        const sso = options.auth;
-        if (!sso) {
+        if (!ssoEnabled()) {
           json(response, 404, { ok: false, error: 'sso disabled' });
           return;
         }
-        const session = verifySession(sso.secret, parseCookies(request.headers.cookie).plaitcode_session);
+        const session = verifySession(sessionSecret(), parseCookies(request.headers.cookie).plaitcode_session);
         if (!session) {
-          json(response, 401, { ok: false, error: '未登录', login: '/v1/auth/feishu/start?next=console' });
+          // 配了 GitHub 就优先跳 GitHub：对开发者来说那才是日常那个账号
+          const login = options.github
+            ? '/v1/auth/github/start?next=console'
+            : '/v1/auth/feishu/start?next=console';
+          json(response, 401, { ok: false, error: '未登录', login });
           return;
         }
         const member = identity.state.members.find((item) => item.id === session.memberId);

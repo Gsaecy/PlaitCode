@@ -25,6 +25,9 @@ import { RelayPhonePanel } from '../views/relayPhonePanel';
 import { RelayClient, enrollRelayDevice, notifyRelay } from './relayClient';
 import { tt } from '../core/i18n';
 import { buildPairingText, deriveKeys, newPairingSecret, parsePairingText } from './relayCrypto';
+import { quickStart } from './collabSetup';
+import { createHandoffKeyPair, type HandoffKeyPair } from './handoffCrypto';
+import { handoffRound, registerHandoffKey } from './handoffClient';
 
 export interface LanSetupOptions {
   context: vscode.ExtensionContext;
@@ -99,6 +102,9 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   /** 企业身份模式下的设备令牌（SecretStorage，不进 settings.json）。 */
   let relayDeviceToken = '';
   const relayDeviceTokenKey = 'plaitcode.relay.deviceToken';
+  /** 频道密钥交接用的本机密钥对（私钥只在 SecretStorage 里）。 */
+  const relayHandoffKeyKey = 'plaitcode.relay.handoffKey';
+  let handoffKeys: HandoffKeyPair | undefined;
 
   const bridge: LanSyncBridge = {
     peer: () => {
@@ -368,6 +374,38 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     relay.start();
     output.info(`[relay] 已连接 ${url}（频道 ${relay.status().channel.slice(0, 8)}…，${relayDeviceToken ? '设备令牌' : '频道密钥'}鉴权）`);
   };
+
+  /**
+   * 交接心跳：每 30 秒一轮。
+   *
+   * 必须常驻：第二台电脑登录后会卡在「等密钥」，而只有**已授权的老设备**在跑这个心跳时
+   * 才能发现有人在等、把密钥加密送过去。心跳一停，新设备就永远等不到。
+   */
+  let handoffTimer: ReturnType<typeof setInterval> | undefined;
+  const startHandoffHeartbeat = (): void => {
+    if (handoffTimer) return;
+    const tick = async (): Promise<void> => {
+      const url = relayUrl();
+      if (!url || !relayDeviceToken || !handoffKeys) return;
+      const secret = relayKey || (await context.secrets.get(relaySecretKey)) || '';
+      const round = await handoffRound({
+        url,
+        token: relayDeviceToken,
+        keyPair: handoffKeys,
+        ...(secret ? { local: { url, secret } } : {}),
+        log: (line) => output.info(line),
+      });
+      if (round.error) output.warn(`[handoff] ${round.error}`);
+      if (round.adopted && round.adopted.secret !== relayKey) {
+        await context.secrets.store(relaySecretKey, round.adopted.secret);
+        await saveRelayUrl(round.adopted.url);
+        startRelay(round.adopted.url, round.adopted.secret);
+        void vscode.window.showInformationMessage('已通过另一台设备自动接入频道，团队群可以直接用。');
+      }
+    };
+    handoffTimer = setInterval(() => { void tick(); }, 30_000);
+    void tick();
+  };
   // 设置里填了固定配对码就以设置为准（高级用法；正常流程根本不需要）。
   const configuredCode = setting('lanSync.pairingCode', '').trim();
   if (configuredCode) await service.setPairingCode(configuredCode);
@@ -425,6 +463,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   const disposables: vscode.Disposable[] = [
     status,
     service,
+    { dispose: () => { if (handoffTimer) clearInterval(handoffTimer); } },
     vscode.commands.registerCommand('plaitcode.lanSync.connect', async () => {
       const result = await service.autoConnect(setting('lanSync.port', 47821));
       if (result.role === 'hub') {
@@ -691,6 +730,78 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     vscode.commands.registerCommand('plaitcode.relay.phone', async () => {
       await relayPhonePanel.open();
     }),
+    /**
+     * 一键开始协作：GitHub 登录 → 建/继承频道 → 自动拿到密钥。
+     *
+     * 这是给「我自己多台电脑」用的唯一入口。正常情况只要点一次、在浏览器里登录一次，
+     * 不需要配对码、二维码或任何字符串。
+     */
+    vscode.commands.registerCommand('plaitcode.collab.start', async () => {
+      let url = relayUrl();
+      if (!url) {
+        const input = await vscode.window.showInputBox({
+          title: '开始协作',
+          prompt: '中继地址只需要填一次，之后会自动记住',
+          placeHolder: 'https://plaitcode.com',
+          ignoreFocusOut: true,
+          validateInput: (value) => (/^https?:\/\/\S+$/i.test(value.trim()) ? undefined : '要以 http:// 或 https:// 开头'),
+        });
+        if (!input) return;
+        url = input.trim().replace(/\/+$/, '');
+        await saveRelayUrl(url);
+      }
+
+      const storedSecret = (await context.secrets.get(relaySecretKey)) ?? '';
+      const storedToken = relayDeviceToken || (await context.secrets.get(relayDeviceTokenKey)) || '';
+      const result = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'PlaitCode 开始协作', cancellable: false },
+        async (progress) => quickStart({
+          relayUrl: url!,
+          deviceName: bridge.peer().name,
+          platform: defaultPlatform(),
+          ...(storedSecret ? { existingSecret: storedSecret } : {}),
+          ...(storedToken ? { existingToken: storedToken } : {}),
+          ...(handoffKeys ? { keyPair: handoffKeys } : {}),
+          onProgress: (message) => progress.report({ message }),
+          openUrl: async (target) => { await vscode.env.openExternal(vscode.Uri.parse(target)); },
+        }),
+      );
+
+      if (result.keyPair) {
+        handoffKeys = result.keyPair;
+        await context.secrets.store(relayHandoffKeyKey, JSON.stringify(result.keyPair));
+      }
+      if (result.token) {
+        relayDeviceToken = result.token;
+        await context.secrets.store(relayDeviceTokenKey, result.token);
+      }
+
+      if (!result.ok) {
+        if (result.waitingForKey) {
+          const choice = await vscode.window.showWarningMessage(
+            result.error ?? '还在等另一台设备递频道密钥。',
+            '重新等待',
+            '取消',
+          );
+          if (choice === '重新等待') await vscode.commands.executeCommand('plaitcode.collab.start');
+          return;
+        }
+        void vscode.window.showErrorMessage(result.error ?? '没能开始协作。');
+        return;
+      }
+
+      if (result.secret) {
+        await context.secrets.store(relaySecretKey, result.secret);
+        startRelay(url, result.secret);
+      }
+      startHandoffHeartbeat();
+      refreshStatus();
+      await groupPanel.open();
+      void vscode.window.showInformationMessage(
+        `已开始协作${result.memberName ? `（${result.memberName}）` : ''}。`
+        + '手机端扫码即可一起看，另一台电脑执行同一个命令就会自动加入同一频道。',
+      );
+    }),
     relayPhonePanel,
     { dispose: () => relay?.stop() },
     groupPanel,
@@ -795,9 +906,25 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    */
   const storedDeviceToken = await context.secrets.get(relayDeviceTokenKey);
   if (storedDeviceToken) relayDeviceToken = storedDeviceToken;
+  // 交接密钥对：没有就现在生成一把并保存，之后所有轮换都用它
+  const storedHandoff = await context.secrets.get(relayHandoffKeyKey);
+  if (storedHandoff) {
+    try {
+      const parsed = JSON.parse(storedHandoff) as HandoffKeyPair;
+      if (parsed?.privateKey && parsed?.publicKey) handoffKeys = parsed;
+    } catch {
+      output.warn('[handoff] 本机密钥对损坏，将重新生成');
+    }
+  }
+  if (!handoffKeys) {
+    handoffKeys = createHandoffKeyPair();
+    await context.secrets.store(relayHandoffKeyKey, JSON.stringify(handoffKeys));
+  }
   const storedRelaySecret = await context.secrets.get(relaySecretKey);
   if (storedRelaySecret && relayUrl()) startRelay(relayUrl(), storedRelaySecret);
   relayKey = storedRelaySecret ?? '';
+  // 有设备令牌就常驻交接心跳：新设备要靠这个心跳才能被递到密钥
+  if (relayDeviceToken) startHandoffHeartbeat();
 
   return { service, disposables };
 }

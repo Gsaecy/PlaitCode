@@ -12,10 +12,13 @@
 
 import { CHANNEL_PREFIX, ENC_PREFIX, RELAY_PREFIX } from './relayCrypto';
 
-export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?: boolean }): string {
+export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?: boolean; loginPath?: string; loginLabel?: string }): string {
   const host = options.relayHost.replace(/[<>&"]/g, '');
   // 身份模式下手机凭登录 Cookie 鉴权（密钥只用于解密，不再当票据用）
   const sessionAuth = options.sessionAuth === true;
+  // 登录入口由服务端决定：配了 GitHub 就跳 GitHub，否则回落到飞书
+  const loginPath = (options.loginPath ?? '/v1/auth/feishu/start').replace(/[^A-Za-z0-9/?=&._-]/g, '');
+  const loginLabel = (options.loginLabel ?? '飞书').replace(/[<>&"']/g, '');
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -456,7 +459,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   }
 
   /**
-   * 未登录 → 跳飞书登录。
+   * 未登录 → 跳登录页（GitHub 或飞书，由服务端决定）。
    *
    * 这一步是"扫码一次走完"的关键：密钥已经存在 localStorage 里，
    * 登录回来落在 /m 会自己接着用，不需要用户再粘一遍配对信息。
@@ -472,9 +475,9 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       }
     } catch (error) {}
     loginAttempted = true;
-    say('需要先用飞书登录，正在跳转…');
+    say('需要先用${loginLabel}登录，正在跳转…');
     try { sessionStorage.setItem('plaitcode.loginRedirect', '1'); } catch (error) {}
-    setTimeout(function () { location.replace('/v1/auth/feishu/start'); }, 400);
+    setTimeout(function () { location.replace('${loginPath}'); }, 400);
     return true;
   }
 
@@ -502,7 +505,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       .then(function (r) {
         if (r.status === 401) {
           if (redirectToLogin()) throw new Error('正在跳转登录');
-          throw new Error(SESSION_AUTH ? '登录已过期，请重新用飞书登录' : '需要登录才能看这个频道');
+          throw new Error(SESSION_AUTH ? '登录已过期，请重新登录' : '需要登录才能看这个频道');
         }
         if (r.status === 403) throw new Error(SESSION_AUTH ? '没有这个频道的权限（找管理员授权设备）' : '频道密钥不对');
         return r.json();

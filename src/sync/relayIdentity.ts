@@ -36,6 +36,10 @@ export interface Member {
   createdAt: number;
   /** SSO 开户时记下的邮箱，用于按邮箱认人。 */
   email?: string;
+  /** GitHub 数字 id（字符串）。改名、换邮箱都不变，是认人的首选主键。 */
+  githubId?: string;
+  /** GitHub 登录名，只用于显示与审计。 */
+  githubLogin?: string;
   /** 飞书 open_id（本应用内唯一）：应用没拿到邮箱权限时靠它认人。 */
   openId?: string;
   /** 飞书 union_id（同开发者多应用间唯一）。 */
@@ -44,6 +48,8 @@ export interface Member {
 
 /** 登录时能从 SSO 拿到的身份标识，任意一个命中就算同一个人。 */
 export interface MemberIdentityKey {
+  /** 优先用 GitHub 数字 id：同一个人换机器、换邮箱都还是同一个成员。 */
+  githubId?: string;
   email?: string;
   openId?: string;
   unionId?: string;
@@ -80,6 +86,20 @@ export interface Device {
   /** 最后一次轮换时间。 */
   rotatedAt?: number;
   revokedAt?: number;
+  /**
+   * 设备公钥（base64，X25519 raw 32 字节）。
+   *
+   * 用来接收「频道密钥交接」的加密包：老设备用这把公钥加密，只有这台设备的私钥能解开。
+   * 公钥是公开信息，放在这里不影响端到端加密。
+   */
+  pubkey?: string;
+  /**
+   * 这台设备还在等频道密钥。
+   *
+   * 登录时它继承到了频道 id，但密钥只存在别的设备上 —— 需要老设备用它的公钥
+   * 加密一份送过来。解开之后把它清掉，避免反复投递。
+   */
+  needsKey?: boolean;
 }
 
 export interface IdentityState {
@@ -149,7 +169,16 @@ export function addOrg(state: IdentityState, name: string): Org {
 /** 加成员（角色默认 member）。 */
 export function addMember(
   state: IdentityState,
-  input: { orgId: string; name: string; role?: Role; email?: string; openId?: string; unionId?: string },
+  input: {
+    orgId: string;
+    name: string;
+    role?: Role;
+    email?: string;
+    githubId?: string;
+    githubLogin?: string;
+    openId?: string;
+    unionId?: string;
+  },
 ): Member | undefined {
   if (!state.orgs.some((org) => org.id === input.orgId)) return undefined;
   const role: Role = isRole(input.role) ? input.role : 'member';
@@ -161,6 +190,8 @@ export function addMember(
     createdAt: Date.now(),
   };
   if (input.email?.trim()) member.email = input.email.trim();
+  if (input.githubId?.trim()) member.githubId = input.githubId.trim();
+  if (input.githubLogin?.trim()) member.githubLogin = input.githubLogin.trim();
   if (input.openId?.trim()) member.openId = input.openId.trim();
   if (input.unionId?.trim()) member.unionId = input.unionId.trim();
   state.members.push(member);
@@ -168,11 +199,16 @@ export function addMember(
 }
 
 /**
- * 按 SSO 身份找成员：邮箱优先，其次 open_id，最后 union_id。
+ * 按 SSO 身份找成员：GitHub id 优先，其次邮箱、open_id、union_id。
  *
- * 邮箱不是必需项——客户不给飞书应用开邮箱权限时，仍能靠 open_id 认人。
+ * GitHub id 放第一位是因为它是唯一不会变的：账号改名、换邮箱、
+ * 换飞书应用都不会影响它，用它认人才不会把同一个人拆成两个成员。
  */
 export function findMemberByIdentity(state: IdentityState, key: MemberIdentityKey): Member | undefined {
+  if (key.githubId) {
+    const byGithub = state.members.find((item) => item.id && item.githubId === key.githubId);
+    if (byGithub) return byGithub;
+  }
   const email = key.email?.trim().toLowerCase();
   if (email) {
     const byEmail = state.members.find((item) => item.id && item.email?.trim().toLowerCase() === email);
@@ -184,6 +220,54 @@ export function findMemberByIdentity(state: IdentityState, key: MemberIdentityKe
   }
   if (key.unionId) return state.members.find((item) => item.id && item.unionId === key.unionId);
   return undefined;
+}
+
+/**
+ * 登记设备公钥（用于接收频道密钥交接的加密包）。
+ *
+ * 只允许改自己那台：拿到别人设备 id 也换不掉它的公钥，否则就能把别人的
+ * 交接包引到自己机器上。
+ */
+export function setDevicePubkey(
+  state: IdentityState,
+  deviceId: string,
+  pubkey: string,
+  needsKey = true,
+): boolean {
+  const device = state.devices.find((item) => item.id === deviceId);
+  if (!device || device.revokedAt) return false;
+  const clean = pubkey.trim();
+  // X25519 raw 公钥 base64 固定 44 字符；放宽到 88 是为了以后换算法时不用改校验
+  if (!/^[A-Za-z0-9+/=]{40,88}$/.test(clean)) return false;
+  device.pubkey = clean;
+  device.needsKey = needsKey;
+  return true;
+}
+
+/** 交接完成：这台设备已经有密钥了，别再给它投包。 */
+export function clearNeedsKey(state: IdentityState, deviceId: string): boolean {
+  const device = state.devices.find((item) => item.id === deviceId);
+  if (!device) return false;
+  device.needsKey = false;
+  return true;
+}
+
+/**
+ * 给设备追加一条频道授权。
+ *
+ * 频道 id 是从频道密钥派生的，只有持有密钥的人才知道它 ——
+ * 所以「能说出这个 id」本身就等于「我有这条频道的钥匙」。
+ * 别人冒领同一个 id 也没用：中继按 keyHash 校验，他解不开消息。
+ */
+export function claimChannel(state: IdentityState, deviceId: string, channelId: string): boolean {
+  const device = state.devices.find((item) => item.id === deviceId);
+  if (!device || device.revokedAt) return false;
+  if (!/^[0-9a-f]{16,64}$/.test(channelId)) return false;
+  if (device.grants.some((grant) => grant.channelId === channelId)) return true;
+  if (device.grants.length >= MAX_GRANTS) return false;
+  const member = state.members.find((item) => item.id === device.memberId);
+  device.grants.push({ channelId, role: member?.role ?? 'member' });
+  return true;
 }
 
 /**
@@ -368,6 +452,8 @@ export function identitySnapshot(state: IdentityState): unknown {
       createdAt: device.createdAt,
       lastSeenAt: device.lastSeenAt,
       revokedAt: device.revokedAt,
+      // 有没有可交接的公钥，对排障有用；公钥本身不是秘密
+      hasPubkey: Boolean(device.pubkey),
     })),
   };
 }

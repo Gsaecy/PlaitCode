@@ -34,14 +34,21 @@ test('state：签名可验证，篡改与过期都过不去', () => {
 
 test('state：能带「登录后回哪」，但只认白名单，防止开放重定向', () => {
   const toConsole = signState('s3cret', 'nonce~console');
-  assert.deepEqual(readState('s3cret', toConsole, ['console']), { valid: true, next: 'console' });
+  const allowed = readState('s3cret', toConsole, ['console']);
+  assert.equal(allowed.valid, true);
+  assert.equal(allowed.next, 'console');
+  // nonce ???????????????????????
+  assert.match(allowed.nonce ?? '', /~console$/);
   // 白名单没列出的落点只返回有效，不返回目标
-  assert.deepEqual(readState('s3cret', toConsole, []), { valid: true });
-  assert.deepEqual(readState('s3cret', toConsole, ['m']), { valid: true });
+  assert.equal(readState('s3cret', toConsole, []).valid, true);
+  assert.equal(readState('s3cret', toConsole, []).next, undefined);
+  assert.equal(readState('s3cret', toConsole, ['m']).next, undefined);
   // 篡改和非 console 的目标都拿不到落点
   assert.equal(readState('s3cret', `${toConsole}x`, ['console']).valid, false);
   const external = signState('s3cret', 'nonce~https://evil.example');
-  assert.deepEqual(readState('s3cret', external, ['console']), { valid: true });
+  const outside = readState('s3cret', external, ['console']);
+  assert.equal(outside.valid, true);
+  assert.equal(outside.next, undefined);
 });
 
 test('会话：内容可读回，篡改无效，过期失效', () => {
