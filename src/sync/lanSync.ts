@@ -898,6 +898,16 @@ export class LanSyncService implements Disposable {
        * 所以听到别的主机广播时按设备 id 谦让：id 大的主动降为从机去加入对方。
        * 只让一边让位，不会两边同时让步。
        */
+      /*
+       * 两台都点了按钮 → 两边都成了主机 → 谁也不连谁。
+       * 这是最容易踩的坑（用户就是这么操作的）。
+       *
+       * 所以听到别的主机广播时按设备 id 谦让：id 大的主动降为从机去加入对方。
+       * 只让一边让位，不会两边同时让步。
+       *
+       * **旧版没有 `peer` 字段，也不会让位**：这时本机无条件让，否则两边会永远对着待命。
+       * 旧版的配对接口是同一套，让位之后照样能连上。
+       */
       if (this.role !== 'hub' || this.yielding) return;
       let other: { magic?: unknown; peer?: unknown; addresses?: unknown; port?: unknown } | undefined;
       try {
@@ -905,9 +915,13 @@ export class LanSyncService implements Disposable {
       } catch {
         return;
       }
-      if (other?.magic !== HUB_MAGIC || typeof other.peer !== 'string' || !other.peer) return;
-      if (other.peer === this.bridge.peer().id) return;
-      if (this.bridge.peer().id <= other.peer) return;
+      if (other?.magic !== HUB_MAGIC) return;
+      const legacyHub = typeof other.peer !== 'string' || !other.peer;
+      if (!legacyHub) {
+        const peerId = other.peer as string;
+        if (peerId === this.bridge.peer().id) return;
+        if (this.bridge.peer().id <= peerId) return;
+      }
       const address = Array.isArray(other.addresses)
         ? other.addresses.find((item): item is string => typeof item === 'string' && Boolean(item) && !isOwnAddress(item))
         : undefined;
