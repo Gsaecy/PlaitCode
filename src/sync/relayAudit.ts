@@ -10,7 +10,7 @@
  * 这对企业是卖点，不是限制。
  */
 
-import { appendFile, mkdir, rename, stat } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, stat } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 export interface AuditEvent {
@@ -86,6 +86,36 @@ export class AuditLog {
   /** 等所有已排队的记录落盘（关服务、测试用）。 */
   async flush(): Promise<void> {
     await this.queue.catch(() => undefined);
+  }
+
+  /**
+   * 读最近若干条（网页控制台用）。
+   *
+   * 只读当前文件不读轮转出来的历史：控制台是"最近发生了什么"，
+   * 要看全量应该去日志平台。返回新的在前。
+   */
+  async tail(count = 200): Promise<Array<Record<string, unknown>>> {
+    const path = this.options.path;
+    if (!path) return [];
+    await this.flush();
+    let raw: string;
+    try {
+      raw = await readFile(path, 'utf8');
+    } catch {
+      return [];
+    }
+    const lines = raw.split('\n').filter((line) => line.trim());
+    const limit = Math.max(1, Math.min(Math.floor(count), 1_000));
+    const out: Array<Record<string, unknown>> = [];
+    for (const line of lines.slice(-limit)) {
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        if (parsed && typeof parsed === 'object') out.push(parsed as Record<string, unknown>);
+      } catch {
+        // 半行（进程被杀时）跳过
+      }
+    }
+    return out.reverse();
   }
 
   private async append(path: string, line: string): Promise<void> {

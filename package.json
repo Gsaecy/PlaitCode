@@ -2,7 +2,7 @@
   "name": "plaitcode",
   "displayName": "PlaitCode",
   "description": "A secure coding agent for VS Code with DeepSeek: approval-controlled workspace tools, plan-tracking task lists, copyable local/server commands and durable local history.",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "publisher": "plaitcode",
   "license": "MIT",
   "icon": "resources/logo.png",
@@ -230,6 +230,11 @@
       {
         "command": "plaitcode.relay.status",
         "title": "PlaitCode: 查看跨网中继状态"
+      },
+      {
+        "command": "plaitcode.relay.console",
+        "title": "PlaitCode: 打开网页控制台",
+        "icon": "$(globe)"
       },
       {
         "command": "plaitcode.relay.device",

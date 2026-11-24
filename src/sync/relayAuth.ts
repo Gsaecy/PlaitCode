@@ -71,20 +71,41 @@ export function signState(secret: string, nonce: string, ttlMs = 10 * 60_000): s
 }
 
 export function verifyState(secret: string, token: string | undefined): boolean {
-  if (!token) return false;
+  return readState(secret, token).valid;
+}
+
+export interface StateCheck {
+  valid: boolean;
+  /** state 里带的「登录后回哪」，只返回调用方白名单里的值。 */
+  next?: string;
+}
+
+/**
+ * 校验 state，并取出它携带的落点。
+ *
+ * 落点只接受站内相对页（`/console`、`/m` 这种），由调用方传入白名单 ——
+ * 绝不接受外部地址，否则登录回调就成了开放重定向。
+ */
+export function readState(secret: string, token: string | undefined, allowed: readonly string[] = []): StateCheck {
+  if (!token) return { valid: false };
   const index = token.lastIndexOf('.');
-  if (index <= 0) return false;
+  if (index <= 0) return { valid: false };
   const encoded = token.slice(0, index);
   const signature = token.slice(index + 1);
   let body: string;
   try {
     body = Buffer.from(encoded, 'base64url').toString('utf8');
   } catch {
-    return false;
+    return { valid: false };
   }
-  if (!safeEqual(hmac(secret, body), signature)) return false;
-  const expiry = Number(body.slice(body.lastIndexOf('.') + 1));
-  return Number.isFinite(expiry) && expiry > Date.now();
+  if (!safeEqual(hmac(secret, body), signature)) return { valid: false };
+  const cut = body.lastIndexOf('.');
+  const expiry = Number(body.slice(cut + 1));
+  if (!Number.isFinite(expiry) || expiry <= Date.now()) return { valid: false };
+  const nonce = cut > 0 ? body.slice(0, cut) : '';
+  const sep = nonce.indexOf('~');
+  const next = sep > 0 ? nonce.slice(sep + 1) : '';
+  return next && allowed.includes(next) ? { valid: true, next } : { valid: true };
 }
 
 /** 会话 Cookie 的值：payload + 签名，客户端改不了内容。 */

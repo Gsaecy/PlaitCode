@@ -14,6 +14,7 @@ import { AuditLog, type AuditOptions } from './relayAudit';
 import { createChannelHistory } from './relayHistory';
 import { sendFeishuNotify, type NotifyPayload } from './relayNotify';
 import { renderRelayMobilePage } from './relayPage';
+import { renderConsolePage, renderLandingPage } from './relaySite';
 import { APP_ICON_SVG, SERVICE_WORKER_JS, renderManifest } from './relayPwa';
 import { parseCookies } from './mobileControl';
 import {
@@ -26,18 +27,20 @@ import {
   identitySnapshot,
   deviceByToken,
   revokeDevice,
+  roleCan,
   saveIdentity,
   type Action,
   type IdentityState,
+  type Member,
 } from './relayIdentity';
 import {
   buildAuthorizeUrl,
   emailAllowed,
   exchangeCode,
+  readState,
   signSession,
   signState,
   verifySession,
-  verifyState,
   type FeishuConfig,
 } from './relayAuth';
 
@@ -306,16 +309,109 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
     return provided.length === expected.length && timingSafeEqual(provided, expected);
   };
 
+  /**
+   * 网页控制台的数据快照。
+   *
+   * 只包含**当前成员所属组织**的设备与通道：跨组织一律不返回，
+   * 口径与 publish/poll 的 `authorizeSession` 保持一致。
+   * 审计同样按「本组织频道」过滤，避免 A 团队看到 B 团队的频道。
+   */
+  const consoleSnapshot = async (
+    member: Member,
+    state: IdentityState,
+  ): Promise<Record<string, unknown>> => {
+    const org = state.orgs.find((item) => item.id === member.orgId);
+    const members = state.members.filter((item) => item.orgId === member.orgId);
+    const memberIds = new Set(members.map((item) => item.id));
+    const devices = state.devices.filter((item) => memberIds.has(item.memberId));
+    const nameOf = new Map(members.map((item) => [item.id, item.name]));
+    const now = Date.now();
+
+    const onlineIn = (channelId: string): Set<string> => {
+      const channel = channels.get(channelId);
+      const online = new Set<string>();
+      if (!channel) return online;
+      for (const [deviceId, info] of channel.presence) {
+        if (now - info.at <= PRESENCE_TTL_MS) online.add(deviceId);
+      }
+      return online;
+    };
+
+    const channelIds = new Set<string>();
+    for (const device of devices) {
+      for (const grant of device.grants) channelIds.add(grant.channelId);
+    }
+    const onlineIds = new Set<string>();
+    for (const channelId of channelIds) {
+      for (const deviceId of onlineIn(channelId)) onlineIds.add(deviceId);
+    }
+
+    const channelRows = [...channelIds].sort().map((channelId) => {
+      const granted = devices.filter((device) => device.grants.some((grant) => grant.channelId === channelId));
+      const online = onlineIn(channelId);
+      const live = granted.filter((device) => online.has(device.id) && !device.revokedAt);
+      const channel = channels.get(channelId);
+      const last = channel?.messages.length ? channel.messages[channel.messages.length - 1] : undefined;
+      return {
+        channelId,
+        devices: granted.length,
+        online: live.length,
+        deviceNames: live.map((device) => device.name).slice(0, 8),
+        ...(last ? { lastMessageAt: last.at } : {}),
+      };
+    });
+
+    const tail = await audit.tail(300);
+    const auditRows = tail
+      .filter((item) => typeof item.channel === 'string' && channelIds.has(item.channel))
+      .slice(0, 120);
+
+    return {
+      ok: true,
+      member: { id: member.id, name: member.name, role: member.role, email: member.email ?? null },
+      org: org ? { id: org.id, name: org.name } : null,
+      members: members.map((item) => ({
+        id: item.id,
+        name: item.name,
+        role: item.role,
+        email: item.email ?? null,
+        createdAt: item.createdAt,
+      })),
+      devices: devices.map((device) => ({
+        id: device.id,
+        memberId: device.memberId,
+        memberName: nameOf.get(device.memberId) ?? '',
+        name: device.name,
+        platform: device.platform,
+        grants: device.grants,
+        createdAt: device.createdAt,
+        ...(device.lastSeenAt ? { lastSeenAt: device.lastSeenAt } : {}),
+        ...(device.expiresAt ? { expiresAt: device.expiresAt } : {}),
+        ...(device.revokedAt ? { revokedAt: device.revokedAt } : {}),
+        online: onlineIds.has(device.id) && !device.revokedAt,
+      })),
+      channels: channelRows,
+      audit: auditRows,
+      counts: {
+        devices: devices.filter((device) => !device.revokedAt).length,
+        online: devices.filter((device) => !device.revokedAt && onlineIds.has(device.id)).length,
+        channels: channelRows.length,
+        members: members.length,
+      },
+    };
+  };
+
   const server: Server = createServer((request, response) => {
     void (async () => {
       const rawUrl = request.url ?? '/';
       const route = rawUrl.split('?')[0] ?? '/';
       const query = new URLSearchParams(rawUrl.slice(rawUrl.indexOf('?') + 1));
 
-      // 健康检查、手机页面与 PWA 静态资源不限流：探活和首次打开都不该占用户额度。
-      const isHealth = route === '/health' || route === '/';
+      // 健康检查、网页与 PWA 静态资源不限流：探活和首次打开都不该占用户额度。
+      const isHealth = route === '/health';
       const isPwa = route === '/manifest.webmanifest' || route === '/sw.js' || route === '/icon.svg';
-      const isStatic = isHealth || isPwa || route === '/m';
+      const isPage = route === '/' || route === '/m' || route === '/console';
+      const isStatic = isHealth || isPwa || isPage;
       if (!isStatic) {
         const ip = clientIp(request);
         if (!allowed(ip)) {
@@ -323,6 +419,42 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 429, { ok: false, error: 'too many requests' });
           return;
         }
+      }
+
+      if (request.method === 'GET' && route === '/') {
+        const page = renderLandingPage({
+          relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com',
+          consoleEnabled: Boolean(options.auth && identity),
+          installUrl: 'https://marketplace.visualstudio.com/items?itemName=plaitcode.plaitcode',
+          repoUrl: 'https://github.com/Gsaecy/PlaitCode',
+        });
+        response.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'content-length': Buffer.byteLength(page),
+          'cache-control': 'public, max-age=300',
+          'x-content-type-options': 'nosniff',
+          'x-frame-options': 'DENY',
+          'referrer-policy': 'no-referrer',
+        });
+        response.end(page);
+        return;
+      }
+
+      if (request.method === 'GET' && route === '/console') {
+        const page = renderConsolePage({
+          relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com',
+          sessionAuth: Boolean(options.auth && identity),
+        });
+        response.writeHead(200, {
+          'content-type': 'text/html; charset=utf-8',
+          'content-length': Buffer.byteLength(page),
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+          'x-frame-options': 'DENY',
+          'referrer-policy': 'no-referrer',
+        });
+        response.end(page);
+        return;
       }
 
       if (request.method === 'GET' && route === '/m') {        const html = renderRelayMobilePage({
@@ -389,7 +521,12 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 404, { ok: false, error: 'sso disabled' });
           return;
         }
-        const state = signState(auth.secret, crypto.randomUUID());
+        // 登录后回哪：只认白名单里的站内页，别的一律回手机端
+        const next = query.get('next') === 'console' ? 'console' : '';
+        const state = signState(
+          auth.secret,
+          next ? `${randomUUID()}~${next}` : randomUUID(),
+        );
         response.writeHead(302, { location: buildAuthorizeUrl(auth.config, state), 'cache-control': 'no-store' });
         response.end();
         return;
@@ -401,7 +538,8 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 404, { ok: false, error: 'sso disabled' });
           return;
         }
-        if (!verifyState(auth.secret, query.get('state') ?? undefined)) {
+        const check = readState(auth.secret, query.get('state') ?? undefined, ['console']);
+        if (!check.valid) {
           audit.record({ event: 'denied', ip: clientIp(request), detail: 'sso state invalid' });
           json(response, 400, { ok: false, error: 'state 无效或已过期，请重新登录' });
           return;
@@ -471,7 +609,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         });
         audit.record({ event: 'login', ip: clientIp(request), detail: member.name });
         response.writeHead(302, {
-          location: '/m',
+          location: check.next === 'console' ? '/console' : '/m',
           'set-cookie': `plaitcode_session=${cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`,
           'cache-control': 'no-store',
         });
@@ -622,6 +760,82 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           detail: `notify ${kind} -> ${result.ok ? 'sent' : `failed: ${result.error}`}`,
         });
         json(response, result.ok ? 200 : 502, result.ok ? { ok: true } : { ok: false, error: result.error });
+        return;
+      }
+
+      /* ---------------- 网页控制台 ---------------- */
+
+      if (route.startsWith('/v1/console/')) {
+        if (!identity) {
+          json(response, 404, { ok: false, error: 'identity disabled' });
+          return;
+        }
+        const sso = options.auth;
+        if (!sso) {
+          json(response, 404, { ok: false, error: 'sso disabled' });
+          return;
+        }
+        const session = verifySession(sso.secret, parseCookies(request.headers.cookie).plaitcode_session);
+        if (!session) {
+          json(response, 401, { ok: false, error: '未登录', login: '/v1/auth/feishu/start?next=console' });
+          return;
+        }
+        const member = identity.state.members.find((item) => item.id === session.memberId);
+        if (!member) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: 'console member missing' });
+          json(response, 403, { ok: false, error: '成员不存在或已被移除' });
+          return;
+        }
+
+        if (route === '/v1/console/state' && request.method === 'GET') {
+          json(response, 200, await consoleSnapshot(member, identity.state));
+          return;
+        }
+
+        if (route === '/v1/console/devices/revoke' && request.method === 'POST') {
+          const raw = await readBody(request);
+          if (raw === undefined) {
+            json(response, 413, { ok: false, error: 'body too large' });
+            return;
+          }
+          let body: Record<string, unknown> = {};
+          if (raw) {
+            try {
+              body = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              json(response, 400, { ok: false, error: 'invalid json' });
+              return;
+            }
+          }
+          const deviceId = String(body.deviceId ?? '');
+          const target = identity.state.devices.find((item) => item.id === deviceId);
+          if (!target) {
+            json(response, 404, { ok: false, error: '设备不存在' });
+            return;
+          }
+          const targetMember = identity.state.members.find((item) => item.id === target.memberId);
+          if (!targetMember || targetMember.orgId !== member.orgId) {
+            json(response, 404, { ok: false, error: '设备不存在' });
+            return;
+          }
+          // 自己的设备随时可以吊销；别人的设备要管理权限
+          if (target.memberId !== member.id && !roleCan(member.role, 'manage')) {
+            audit.record({ event: 'denied', ip: clientIp(request), detail: `console revoke denied: ${member.name}` });
+            json(response, 403, { ok: false, error: '只有管理员能吊销别人的设备' });
+            return;
+          }
+          const revoked = revokeDevice(identity.state, deviceId);
+          if (revoked) await persistIdentity();
+          audit.record({
+            event: 'admin',
+            ip: clientIp(request),
+            detail: `console revoke ${target.name} by ${member.name} -> ${revoked}`,
+          });
+          json(response, revoked ? 200 : 404, { ok: revoked });
+          return;
+        }
+
+        json(response, 404, { ok: false, error: 'not found' });
         return;
       }
 

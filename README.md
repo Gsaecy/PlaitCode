@@ -66,6 +66,19 @@ so the relay forwards ciphertext — the server cannot read your code or your re
 
 Everything is **off by default**: without `policy.json` or `PLAITCODE_IDENTITY`, behavior is identical to before.
 
+### A website, not just a relay (0.15.0)
+
+The relay now serves the product surface itself — no extra host, no extra dependency:
+
+| Path | What it is | Auth |
+|---|---|---|
+| `/` | Landing page: positioning, three-step setup, and the three entry points (install / console / phone) | none |
+| `/console` | Console: devices (revocable), channels, audit tail | Feishu SSO |
+| `/m` | Phone control (unchanged) | session cookie or channel key |
+
+`/` used to return health JSON; probes should use `/health`.
+Design notes and the API list live in [docs/WEBSITE.md](docs/WEBSITE.md).
+
 See [docs/ENTERPRISE.md](docs/ENTERPRISE.md) and [deploy/relay/README.md](deploy/relay/README.md).
 
 ## What's new in 0.5.0

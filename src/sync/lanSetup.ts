@@ -622,6 +622,20 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       await vscode.env.clipboard.writeText(buildPairingText(url, secret));
       void vscode.window.showInformationMessage('配对信息已复制。频道内所有设备共用这一条，直接发给另一台设备粘贴。');
     }),
+    /**
+     * 打开网页控制台：设备、通道、审计。
+     *
+     * 没有登录态时控制台会自己跳到飞书登录再回来，所以这里只负责"把浏览器打开到正确地址"。
+     */
+    vscode.commands.registerCommand('plaitcode.relay.console', async () => {
+      const url = relayUrl();
+      if (!url) {
+        void vscode.window.showWarningMessage('还没有设置中继地址。先「新建跨网频道」或「加入跨网频道」。');
+        return;
+      }
+      const target = `${url.replace(/\/+$/, '')}/console`;
+      await vscode.env.openExternal(vscode.Uri.parse(target));
+    }),
     vscode.commands.registerCommand('plaitcode.relay.status', async () => {
       const state = relay?.status();
       if (!state) {
