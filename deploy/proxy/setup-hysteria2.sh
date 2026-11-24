@@ -69,9 +69,22 @@ else
   openssl ecparam -genkey -name prime256v1 -out "$CERT_DIR/key.pem" 2>/dev/null
   openssl req -new -x509 -days 3650 -key "$CERT_DIR/key.pem" -out "$CERT_DIR/cert.pem" \
     -subj "/CN=${SNI}" 2>/dev/null
-  chmod 600 "$CERT_DIR/key.pem"
   ok "已生成（客户端需要 skip-cert-verify: true，因为这是自签证书）"
 fi
+# 服务以非 root 用户运行（官方脚本建的是 hysteria 用户）。
+# key 若设成 600 且属主是 root，服务会报 "tls.key: permission denied"，
+# 所以这里统一把属主改成服务用户、key 给 640。
+SVC_USER="$(systemctl show hysteria-server -p User --value 2>/dev/null || true)"
+SVC_USER="${SVC_USER:-hysteria}"
+if id -u "$SVC_USER" >/dev/null 2>&1; then
+  chown -R "$SVC_USER:$SVC_USER" "$CERT_DIR"
+  ok "证书属主改为 $SVC_USER"
+else
+  warn "用户 $SVC_USER 不存在，证书保持 root 属主（若服务以 root 运行则无需处理）"
+fi
+chmod 640 "$CERT_DIR/key.pem"
+chmod 644 "$CERT_DIR/cert.pem"
+ok "权限：key 640 / cert 644"
 
 step "4/6 写配置"
 cat > "$CERT_DIR/config.yaml" <<CONF
@@ -127,6 +140,9 @@ else
 fi
 
 PUBLIC_IP="$(curl -s --max-time 5 https://api.ipify.org || true)"
+# 端口与密码以磁盘上的配置为准：重跑脚本时若沿用旧配置，密码可能与本进程变量不同
+CFG_AUTH="$(awk '/^auth:/{f=1;next} f&&/password:/{gsub(/.*password:[[:space:]]*/,"");print;exit}' "$CERT_DIR/config.yaml")"
+CFG_OBFS="$(awk '/obfs:/{f=1} f&&/password:/{gsub(/.*password:[[:space:]]*/,"");print;exit}' "$CERT_DIR/config.yaml")"
 cat <<SUMMARY
 
 ────────────────────────────────────────
@@ -134,8 +150,8 @@ Hysteria2 已就绪
 ────────────────────────────────────────
   服务器   ${PUBLIC_IP:-'<公网IP>'}
   端口     ${PORT}  （UDP）
-  密码     ${AUTH}
-  混淆     salamander / ${OBFS}
+  密码     ${CFG_AUTH:-$AUTH}
+  混淆     salamander / ${CFG_OBFS:-$OBFS}
   SNI      ${SNI}
 
   * 两个密码只显示这一次，请立刻保存。
@@ -146,9 +162,9 @@ Hysteria2 已就绪
     type: hysteria2
     server: ${PUBLIC_IP:-'<公网IP>'}
     port: ${PORT}
-    password: "${AUTH}"
+    password: "${CFG_AUTH:-$AUTH}"
     obfs: salamander
-    obfs-password: "${OBFS}"
+    obfs-password: "${CFG_OBFS:-$OBFS}"
     sni: ${SNI}
     skip-cert-verify: true
     up: "40 Mbps"
