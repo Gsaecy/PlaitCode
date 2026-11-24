@@ -1,9 +1,46 @@
 # 中继服务部署（plaitcode.com）
 
 跨网络协作的中转服务：**只存密文**，负责把消息按频道转发给在线设备。
-部署在阿里云香港 ECS（2 vCPU / 2 GB / Ubuntu 26.04），nginx 终止 TLS，中继只监听 `127.0.0.1`。
 
-## 一条命令部署
+## 两个安装脚本，按机器选
+
+| 脚本 | 适用 | 特点 |
+|---|---|---|
+| `install.sh` | Ubuntu / Debian（香港节点用的这个） | apt + certbot + `sites-available` |
+| **`install-portable.sh`** | **CentOS / Alibaba Cloud Linux / Ubuntu 都行**（新加坡节点用的这个） | 自动识别 apt/dnf/yum；nginx 用 `conf.d` 或 `sites-available`；证书用 acme.sh |
+
+**为什么会有第二个脚本**：`install.sh` 假定 Ubuntu/Debian，在 Alibaba Cloud Linux 上会直接退出；
+而且它会 `rm -f sites-enabled/default` —— 如果机器上已经跑着别的站点，那是破坏性操作。
+`install-portable.sh` **只新增 vhost、不删任何现有配置**，并按 `server_name` 接管域名，
+同一台机器上的其它站点不受影响。
+
+```bash
+# 通用版（推荐先用这个）
+PLAITCODE_DOMAIN=plaitcode.com PLAITCODE_EMAIL=你的邮箱 \
+  bash <(curl -fsSL https://raw.githubusercontent.com/Gsaecy/PlaitCode/main/deploy/relay/install-portable.sh)
+```
+
+### 换节点时怎么保留数据
+
+频道 ID 由密钥派生、身份库与频道历史都在 `/var/lib/plaitcode-relay`。
+把目录整体搬过去，设备不用重新登记、看板历史也接得上：
+
+```bash
+# 旧机器
+tar czf /tmp/relay-data.tgz -C /var/lib/plaitcode-relay .
+# 新机器
+tar xzf relay-data.tgz -C /var/lib/plaitcode-relay
+chown -R plaitcode:plaitcode /var/lib/plaitcode-relay
+systemctl restart plaitcode-relay
+```
+
+环境变量（身份模式 / 飞书 SSO / 审计 / 机器人通知）在
+`/etc/systemd/system/plaitcode-relay.service.d/override.conf`，一起拷过去即可；
+换了域名要同步改 `PLAITCODE_PUBLIC_URL`。
+
+客户端只改地址、频道密钥不变：命令面板 →「PlaitCode: 切换中继地址（保留频道）」。
+
+## 一条命令部署（Ubuntu / Debian）
 
 服务器上用 root 执行：
 
