@@ -39,7 +39,6 @@ type IncomingMessage =
   | { type: 'restoreTrash' }
   | { type: 'openNativeSettings' }
   | { type: 'lanSyncConnect' }
-  | { type: 'collabStart' }
   | { type: 'lanSyncGroup' }
   | { type: 'mobileOpen' }
   | { type: 'lanSyncDisconnect' }
@@ -165,9 +164,6 @@ export class SettingsPanel implements vscode.Disposable {
           break;
         case 'openNativeSettings':
           await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:honor-world.hwchat');
-          break;
-        case 'collabStart':
-          await vscode.commands.executeCommand('hwchat.collab.start');
           break;
         case 'lanSyncConnect':
           await vscode.commands.executeCommand('hwchat.lanSync.connect');
@@ -555,7 +551,6 @@ export class SettingsPanel implements vscode.Disposable {
             <button id="lanSyncGroupButton" type="button">${t(lang, 'settings.collab.group')}</button>
             <button id="mobileButton" type="button">${t(lang, 'settings.collab.mobile')}</button>
             <button id="lanSyncLedgerButton" type="button">${t(lang, 'settings.collab.ledger')}</button>
-            <button id="collabStartButton" type="button">${t(lang, 'settings.collab.start')}</button>
             <button id="lanSyncDisconnectButton" type="button">${t(lang, 'settings.collab.disconnect')}</button>
           </div>
         </section>

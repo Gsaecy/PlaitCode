@@ -2046,7 +2046,16 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
               ...(assignee ? { assignee } : {}),
             }).catch(() => undefined);
             void this.lanSync.shareRequirement(content)
-              .then((result) => this.log(`[sync] 广播需求：${result.message}`))
+              .then(async (result) => {
+                this.log(`[sync] 广播需求：${result.message}`);
+                /*
+                 * 没送到必须当场说。
+                 *
+                 * 用户遇到的正是这个：一边说已同步、一边什么都没有。
+                 * 群里发完只写日志的话，用户会以为两台都在做。
+                 */
+                if (!result.ok) await this.post({ type: 'toast', tone: 'warn', text: tt('sync.notDelivered') });
+              })
               .catch(() => undefined);
             /*
              * 指派给别的设备：本机**不跑**。

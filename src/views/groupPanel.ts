@@ -91,7 +91,7 @@ export function groupHeader(state: GroupHeaderInput): {
   }
   return {
     status: '未连接',
-    sub: '还没有连接另一台设备。先在状态栏点「连接另一台设备」，或「新建 / 加入跨网频道」走中继。',
+    sub: '还没有连接另一台设备。点状态栏或设置页的「连接另一台设备」，两台在同一 WiFi 时各点一次就能连上。',
     on: false,
   };
 }

@@ -636,10 +636,9 @@ const DICTIONARY: Record<string, Entry> = {
   'settings.nav.collab': { zh: '协作', en: 'Collab' },
   'settings.collab.title': { zh: '协作', en: 'Collab' },
   'settings.collab.body': {
-    zh: '点「开始协作」，用 GitHub 授权一次，这台电脑就加入了。之后第二台电脑执行同一个命令会自动跟着加入，手机扫码也能一起看。不需要填地址、不需要配对码。',
-    en: 'Click "Start collaborating" and authorize once with GitHub — this machine joins. Any second machine that runs the same command joins automatically, and the phone can scan a QR to follow along. No address to fill in, no pairing code.',
+    zh: '两台电脑连在同一个 WiFi 时：一台点「连接另一台设备」等着的，另一台点同一个按钮就会连上。连上之后，在「团队群」里发的话，两台电脑的 agent 会一起做。',
+    en: 'When both computers are on the same WiFi: one clicks "Connect another device" and waits; the other clicks the same button and they pair. After that, anything you say in the team group is done by the agents on both machines.',
   },
-  'settings.collab.start': { zh: '开始协作（GitHub 登录）', en: 'Start collaborating (GitHub sign-in)' },
   'settings.collab.connect': { zh: '连接另一台设备', en: 'Connect another device' },
   'settings.collab.group': { zh: '打开团队群', en: 'Open team group' },
   'settings.collab.mobile': { zh: '手机遥控（扫码）', en: 'Phone control (QR)' },
@@ -654,6 +653,10 @@ const DICTIONARY: Record<string, Entry> = {
   'sync.assignedElsewhere': {
     zh: '这条需求已指派给「{device}」，本机不执行（同一份改动做两遍会互相覆盖）。',
     en: 'This request is assigned to “{device}”; this machine will not run it (doing it twice would overwrite each other).',
+  },
+  'sync.notDelivered': {
+    zh: '这条只在**本机**跑了：没有连上另一台设备，对方 agent 收不到。两台在同一 WiFi 时，各点一次「连接另一台设备」就行。',
+    en: 'This ran on **this machine only**: no other device is connected, so the other agent never received it. On the same WiFi, click "Connect another device" once on each machine.',
   },
   'settings.nav.privacy': { zh: '权限与隐私', en: 'Permissions & privacy' },
   'settings.nav.storage': { zh: '存储', en: 'Storage' },

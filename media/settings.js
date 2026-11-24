@@ -51,7 +51,6 @@
     skillCount: document.getElementById('skillCount'),
     skillSummaryList: document.getElementById('skillSummaryList'),
     lanSyncConnectButton: document.getElementById('lanSyncConnectButton'),
-  collabStartButton: document.getElementById('collabStartButton'),
   lanSyncGroupButton: document.getElementById('lanSyncGroupButton'),
   mobileButton: document.getElementById('mobileButton'),
   lanSyncLedgerButton: document.getElementById('lanSyncLedgerButton'),
@@ -455,7 +454,6 @@
   elements.cleanupButton.addEventListener('click', () => post('cleanup'));
   elements.exportAllButton.addEventListener('click', () => post('exportAll'));
   elements.lanSyncConnectButton.addEventListener('click', () => post('lanSyncConnect'));
-elements.collabStartButton.addEventListener('click', () => post('collabStart'));
   elements.lanSyncGroupButton.addEventListener('click', () => post('lanSyncGroup'));
   elements.mobileButton.addEventListener('click', () => post('mobileOpen'));
   elements.lanSyncLedgerButton.addEventListener('click', () => post('lanSyncLedger'));
