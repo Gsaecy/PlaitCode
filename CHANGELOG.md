@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.3（2026-11-24）
+
+### 修：「新建跨网频道」一执行就报「没有注册配置 plaitcode.relay.url」
+
+0.7.2 及更早版本里，「新建 / 加入跨网频道」在最后一步写
+`plaitcode.relay.url` 时直接抛错，命令整体失败：
+
+```
+命令 "PlaitCode: 新建跨网频道" 导致错误
+没有注册配置 plaitcode.relay.url，因此无法写入 用户设置。
+```
+
+原因：这个配置项**只在代码里读写，从没在 `package.json` 的
+`contributes.configuration` 里声明过**。读的时候毫无症状（`getConfiguration().get()`
+对未注册的 key 也会返回默认值），只有 `update()` 才报错——所以之前的测试全绿。
+
+- 补上 `plaitcode.relay.url`（`string`，默认空）声明。
+- 新增 `packageContributions.test.ts`：扫描源码里所有
+  `getConfiguration('plaitcode').update('<key>')`，逐个断言在 `package.json` 里声明过。
+  这类「读得到、写不了」的坑从此会被测试挡住。
+
 ## 0.7.2（2026-11-24）
 
 ### 身份模式打通客户端：设备令牌 + 手机会话鉴权
