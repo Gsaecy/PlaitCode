@@ -620,6 +620,9 @@
   var stored = localStorage.getItem(KEY_STORE);
   if (fromHash && fromHash.length >= 16) {
     localStorage.setItem(KEY_STORE, fromHash);
+    // \u91CD\u65B0\u626B\u4E86\u4E00\u6B21\u7801 = \u7528\u6237\u4E3B\u52A8\u91CD\u6765\uFF0C\u5141\u8BB8\u518D\u8DF3\u4E00\u6B21\u767B\u5F55
+    try { sessionStorage.removeItem('plaitcode.loginRedirect'); } catch (error) {}
+    loginAttempted = false;
     boot(fromHash);
   } else if (stored && stored.length >= 16) {
     boot(stored);

@@ -632,6 +632,9 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   var stored = localStorage.getItem(KEY_STORE);
   if (fromHash && fromHash.length >= 16) {
     localStorage.setItem(KEY_STORE, fromHash);
+    // 重新扫了一次码 = 用户主动重来，允许再跳一次登录
+    try { sessionStorage.removeItem('plaitcode.loginRedirect'); } catch (error) {}
+    loginAttempted = false;
     boot(fromHash);
   } else if (stored && stored.length >= 16) {
     boot(stored);
