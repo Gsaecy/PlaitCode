@@ -95,7 +95,56 @@ export interface SyncNote {
   at: number;
 }
 
-export type SyncMessage = SyncRequirement | SyncReport | SyncNote | SyncGroupMessage;
+/**
+ * 一张「等你批准」的授权卡，跨设备传递。
+ * 为什么单独一种消息而不是塞进群消息：群记录是给人看的项目讨论，
+ * 工具授权是"要不要允许跑这条命令"，混进去会把群刷满，
+ * 而且审批有明确的生命周期（请求 → 决定 → 过期），不适合当聊天记录。
+ *
+ * `phase: 'request'` 由执行设备发出，`phase: 'decision'` 由批准方发回。
+ */
+export interface SyncApprovalMessage {
+  kind: 'approval';
+  id: string;
+  from: SyncPeer;
+  phase: 'request' | 'decision';
+  title: string;
+  summary: string;
+  detail: string;
+  risk: 'read' | 'write' | 'command' | 'dangerous';
+  /** 只有 `decision` 才用到。 */
+  allow?: boolean;
+  at: number;
+}
+
+/** 手机能远程改的权限档位（与 core/permissions 的预设同名）。 */
+export type RemotePreset = 'askAll' | 'review' | 'autopilot' | 'full';
+
+/**
+ * 手机发来的**远程控制**指令：改权限档位、改步数、中止当前任务。
+ *
+ * 为什么需要它：agent 在电脑上跑起来之后，卡点全在"要不要允许这条命令"。
+ * 如果手机只能看不能改，那"用手机指挥"就等于还得有人在电脑旁按允许 ——
+ * 这个功能就没有意义了。
+ */
+export interface SyncControlMessage {
+  kind: 'control';
+  id: string;
+  from: SyncPeer;
+  /**
+   * `state` 是「请把当前设置告诉我」/「当前设置是这样」：
+   * 手机第一次连上时发一次，电脑随后广播自己的真实状态。
+   * 没有它，手机只能显示自己点过什么，和电脑实际设置可能不一致。
+   */
+  action: 'preset' | 'steps' | 'stop' | 'state';
+  preset?: RemotePreset;
+  steps?: number;
+  /** 只有 `state` 用：电脑上是否正在执行任务。 */
+  running?: boolean;
+  at: number;
+}
+
+export type SyncMessage = SyncRequirement | SyncReport | SyncNote | SyncGroupMessage | SyncApprovalMessage | SyncControlMessage;
 
 /**
  * **团队群**里的一条发言（用户 2026-11-23）。
@@ -504,6 +553,55 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       topic: clip(record.topic, MAX_TOPIC_CHARS),
       body,
       replyTo: clip(record.replyTo, 64),
+      at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
+    };
+  }
+  if (record.kind === 'control') {
+    const id = clip(record.id, 64);
+    if (!id) return undefined;
+    const action = record.action === 'preset' || record.action === 'steps'
+      || record.action === 'stop' || record.action === 'state'
+      ? record.action
+      : undefined;
+    if (!action) return undefined;
+    const PRESETS = new Set(['askAll', 'review', 'autopilot', 'full']);
+    const preset = typeof record.preset === 'string' && PRESETS.has(record.preset)
+      ? record.preset as RemotePreset
+      : undefined;
+    const steps = typeof record.steps === 'number' && Number.isFinite(record.steps)
+      ? Math.max(0, Math.min(200, Math.round(record.steps)))
+      : undefined;
+    if (action === 'preset' && !preset) return undefined;
+    if (action === 'steps' && steps === undefined) return undefined;
+    return {
+      kind: 'control',
+      id,
+      from,
+      action,
+      ...(preset ? { preset } : {}),
+      ...(steps !== undefined ? { steps } : {}),
+      ...(record.running === true ? { running: true } : {}),
+      at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
+    };
+  }
+  if (record.kind === 'approval') {
+    const id = clip(record.id, 64);
+    if (!id) return undefined;
+    const phase = record.phase === 'decision' ? 'decision' : 'request';
+    const RISKS = new Set(['read', 'write', 'command', 'dangerous']);
+    const risk = typeof record.risk === 'string' && RISKS.has(record.risk)
+      ? record.risk as SyncApprovalMessage['risk']
+      : 'write';
+    return {
+      kind: 'approval',
+      id,
+      from,
+      phase,
+      title: clip(record.title, 120),
+      summary: clip(record.summary, 400),
+      detail: clipMultiline(record.detail, 1_500),
+      risk,
+      ...(phase === 'decision' ? { allow: record.allow === true } : {}),
       at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
     };
   }

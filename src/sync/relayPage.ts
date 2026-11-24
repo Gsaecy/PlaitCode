@@ -67,6 +67,20 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   .board .card { border:1px solid var(--line); border-radius:10px; padding:6px 8px; margin-bottom:6px;
     background:var(--panel); font-size:12px; line-height:1.35; }
   .board .card .m { font-size:10px; color:var(--muted); margin-top:2px; }
+  .approval { margin:0 0 12px; padding:10px 12px; border-radius:12px; font-size:14px;
+    background:rgba(248,113,113,.10); border:1px solid rgba(248,113,113,.5); }
+  .approval.safe { background:var(--panel2); border-color:var(--line); }
+  .approval .title { font-weight:600; margin-bottom:4px; }
+  .approval .detail { font-size:12px; color:var(--muted); white-space:pre-wrap; word-break:break-word; }
+  .approval .row { display:flex; gap:8px; margin-top:10px; }
+  .approval .row button { flex:1; padding:9px 10px; }
+  .approval .row .allow { background:var(--ok); border-color:var(--ok); color:#06231a; }
+  .approval .row .deny { color:var(--bad); border-color:rgba(248,113,113,.5); }
+  .controls { flex:1 0 100%; display:flex; gap:6px; overflow-x:auto; align-items:center; font-size:12px; color:var(--muted); }
+  .controls .chip { padding:5px 10px; border-radius:999px; border:1px solid var(--line); color:var(--muted);
+    background:var(--panel2); font-size:12px; white-space:nowrap; flex:0 0 auto; }
+  .controls .chip.on { border-color:var(--brand); color:var(--brand); }
+  .controls .chip.stop { color:var(--bad); border-color:rgba(248,113,113,.5); }
   textarea { flex:1; resize:none; min-height:42px; max-height:120px; padding:10px 12px; border-radius:12px;
     background:var(--panel2); color:var(--text); border:1px solid var(--line); font:inherit; font-size:15px; }
   button { padding:10px 12px; border-radius:10px; font-size:15px; border:1px solid var(--line);
@@ -94,6 +108,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
 <div class="board" id="board" style="display:none"></div>
 <main id="main"><div class="empty">正在读取频道…</div></main>
 <footer id="footer" style="display:none">
+  <div class="controls" id="controls"></div>
   <div class="assign" id="assign"></div>
   <textarea id="input" rows="1" placeholder="以甲方身份说一句话（Enter 发送）"></textarea>
   <button class="primary" id="send">发送</button>
@@ -205,8 +220,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     return hit && hit.project ? hit.project : '';
   }
 
-  var STATUS_LABEL = { question:'等你回复', blocked:'未执行', running:'进行中', open:'待接', done:'已完成' };
-  var STATUS_ORDER = ['question', 'blocked', 'running', 'open', 'done'];
+  var STATUS_LABEL = { question:'等你回复', blocked:'未执行', running:'进行中', open:'待接', done:'已完成' };  var STATUS_ORDER = ['question', 'blocked', 'running', 'open', 'done'];
   function boardFor(list) {
     var tasks = {}, order = [];
     list.slice().sort(function (a, b) { return (a.at || 0) - (b.at || 0); }).forEach(function (m) {
@@ -264,7 +278,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   function render(state) {
     dot.className = 'dot' + (state.connected ? ' on' : '');
     renderBoard();
-    var next = JSON.stringify([state.messages, state.question]);
+    var next = JSON.stringify([state.messages, state.question, approvals.length, approvals[0] && approvals[0].id]);
     if (next === signature) return;
     signature = next;
     var atBottom = main.scrollHeight - main.scrollTop - main.clientHeight < 80;
@@ -275,6 +289,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       banner.appendChild(el('span', null, state.question));
       main.appendChild(banner);
     }
+    renderApprovals();
     state.messages.forEach(function (message) {
       var mine = message.author === 'user';
       var wrap = el('div', 'msg' + (mine ? ' user' : ''));
@@ -304,6 +319,135 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     return '';
   }
 
+  var APPROVAL_TTL_MS = 3 * 60 * 1000;
+  var approvals = [];
+  /** 电脑上真实生效的设置（由电脑广播过来，不是手机猜的）。 */
+  var remote = { preset: '', steps: 0, running: false };
+
+  var PRESETS = [
+    { id:'askAll', label:'每次询问' },
+    { id:'review', label:'只审核变更' },
+    { id:'autopilot', label:'自动执行' },
+    { id:'full', label:'完全访问' }
+  ];
+
+  /** 发一条控制指令给电脑（改档位 / 改步数 / 停止 / 查状态）。 */
+  function sendControl(payload) {
+    var messageId = 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    var message = Object.assign({
+      kind: 'control', id: messageId, at: Date.now(),
+      from: { id: deviceId, name: '手机 · 浏览器', platform: 'android', project: 'mobile', version: 'web' }
+    }, payload);
+    return seal(messageId, JSON.stringify(message))
+      .then(function (envelope) { return post('/v1/publish', { channel: keys.channel, id: messageId, from: deviceId, envelope: envelope }); })
+      .then(function (result) {
+        if (!result.ok) { alert(result.error || '没发出去'); return false; }
+        return true;
+      });
+  }
+
+  function renderControls() {
+    var box = document.getElementById('controls');
+    box.textContent = '';
+    box.appendChild(el('span', 'label', '权限'));
+    PRESETS.forEach(function (preset) {
+      var chip = el('button', 'chip' + (remote.preset === preset.id ? ' on' : ''), preset.label);
+      chip.type = 'button';
+      chip.onclick = function () {
+        if (remote.preset === preset.id) return;
+        // 先乐观显示，电脑回传的真实值会覆盖（企业策略可能把它收紧）
+        remote.preset = preset.id;
+        renderControls();
+        sendControl({ action: 'preset', preset: preset.id });
+      };
+      box.appendChild(chip);
+    });
+    box.appendChild(el('span', 'label', '步数'));
+    [12, 24, 48].forEach(function (steps) {
+      var chip = el('button', 'chip' + (remote.steps === steps ? ' on' : ''), String(steps));
+      chip.type = 'button';
+      chip.onclick = function () { sendControl({ action: 'steps', steps: steps }); };
+      box.appendChild(chip);
+    });
+    if (remote.running) {
+      var stop = el('button', 'chip stop', '停止执行');
+      stop.type = 'button';
+      stop.onclick = function () {
+        if (!confirm('要中止电脑上正在跑的任务吗？')) return;
+        sendControl({ action: 'stop' });
+      };
+      box.appendChild(stop);
+    }
+  }
+
+  /** 电脑广播过来的真实状态。 */
+  function acceptControl(message) {
+    if (message.action !== 'state') return;
+    remote = {
+      preset: message.preset || '',
+      steps: message.steps || 0,
+      running: message.running === true,
+    };
+    renderControls();
+  }
+
+  /** 收到的授权卡；phase=decision 表示别人已经处理，撤掉本地这张。 */
+  function acceptApproval(message) {
+    if (message.phase !== 'request') {
+      approvals = approvals.filter(function (item) { return item.id !== message.id; });
+      return;
+    }
+    if (message.from && message.from.id === deviceId) return;
+    if (approvals.some(function (item) { return item.id === message.id; })) return;
+    approvals.push(message);
+    if (approvals.length > 8) approvals = approvals.slice(-8);
+  }
+
+  /** 超过 3 分钟的卡不再显示（电脑端也早就自动拒绝了）。 */
+  function freshApprovals() {
+    var now = Date.now();
+    approvals = approvals.filter(function (item) { return now - (item.at || 0) < APPROVAL_TTL_MS; });
+    return approvals;
+  }
+
+  /** 在手机上点「允许 / 拒绝」：把决定加密送回电脑，电脑据此结算。 */
+  function decide(id, allow, button) {
+    button.disabled = true;
+    var messageId = 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    var message = {
+      kind: 'approval', id: id, phase: 'decision', allow: allow, at: Date.now(),
+      title: '', summary: '', detail: '', risk: 'read',
+      from: { id: deviceId, name: '手机 · 浏览器', platform: 'android', project: 'mobile', version: 'web' }
+    };
+    seal(messageId, JSON.stringify(message))
+      .then(function (envelope) { return post('/v1/publish', { channel: keys.channel, id: messageId, from: deviceId, envelope: envelope }); })
+      .then(function (result) {
+        if (!result.ok) { alert(result.error || '没发出去'); button.disabled = false; return; }
+        approvals = approvals.filter(function (item) { return item.id !== id; });
+        signature = '';
+        render({ connected:true, messages: messages, question: questionFor(messages) });
+      })
+      .catch(function () { alert('网络没连上'); button.disabled = false; });
+  }
+
+  function renderApprovals() {
+    freshApprovals().forEach(function (approval) {
+      var risky = approval.risk === 'command' || approval.risk === 'dangerous';
+      var card = el('div', 'approval' + (risky ? '' : ' safe'));
+      card.appendChild(el('div', 'title', approval.title || '需要你批准'));
+      card.appendChild(el('div', 'detail', (approval.summary || '') + (approval.detail ? '\\n' + approval.detail : '')));
+      var row = el('div', 'row');
+      var deny = el('button', 'deny', '拒绝');
+      deny.onclick = function () { decide(approval.id, false, deny); };
+      var allow = el('button', 'allow', '允许');
+      allow.onclick = function () { decide(approval.id, true, allow); };
+      row.appendChild(deny);
+      row.appendChild(allow);
+      card.appendChild(row);
+      main.appendChild(card);
+    });
+  }
+
   function poll() {
     if (busy) return;
     busy = true;
@@ -323,7 +467,10 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
           if (entry.from === deviceId) return;
           chain = chain.then(function () {
             return open(entry.id, entry.envelope).then(function (message) {
-              if (!message || message.kind !== 'group') return;
+              if (!message) return;
+              if (message.kind === 'approval') { acceptApproval(message); return; }
+              if (message.kind === 'control') { acceptControl(message); return; }
+              if (message.kind !== 'group') return;
               if (messages.some(function (item) { return item.id === message.id; })) return;
               messages.push(message);
               if (messages.length > 200) messages = messages.slice(-200);
@@ -417,7 +564,12 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       setInterval(presence, 30000);
       poll();
       setInterval(poll, 1500);
-      document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
+      // 连上就问一次电脑的真实设置：否则界面上的权限/步数是空的
+      setTimeout(function () { sendControl({ action: 'state' }); }, 800);
+      renderControls();
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) { sendControl({ action: 'state' }); poll(); }
+      });
     }).catch(function () { say('浏览器不支持 WebCrypto，无法加密'); });
   }
 

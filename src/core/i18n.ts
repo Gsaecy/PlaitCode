@@ -562,6 +562,8 @@ const DICTIONARY: Record<string, Entry> = {
   'notice.relayStarted': { zh: '已在「{project}」开始处理这条需求。', en: 'Started working on this request in “{project}”.' },
   'notice.relayBlocked': { zh: '电脑上的 agent 没有开始处理：{reason}', en: 'The agent on the computer did not start: {reason}' },
   'notice.relayUnknownReason': { zh: '原因未知，请在那台电脑上查看 PlaitCode 输出面板。', en: 'Unknown reason; check the PlaitCode output channel on that computer.' },
+  'notice.relayFinished': { zh: '已完成「{project}」里的这条需求。', en: 'Finished this request in “{project}”.' },
+  'notice.relayInterrupted': { zh: '这一轮没有跑完（被停止或出错）。', en: 'This round did not finish (stopped or failed).' },
   'notice.voiceTitle': { zh: '允许 PlaitCode 使用语音输入？', en: 'Allow PlaitCode to use voice input?' },
   'notice.voiceDetail': {
     zh: 'PlaitCode 只接收语音识别后的文字，不保存音频，也不会把音频写入对话缓存。具体的语音识别服务由 VS Code/Webview 和系统浏览器实现，可能会按你的系统设置处理音频。识别出的文字只有在你点击发送后才会发送给当前 API。',

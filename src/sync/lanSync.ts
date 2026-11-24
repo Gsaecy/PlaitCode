@@ -43,6 +43,9 @@ import {
   type GroupPhase,
   type ReportStatus,
   type SyncGroupMessage,
+  type SyncApprovalMessage,
+  type SyncControlMessage,
+  type RemotePreset,
   type SyncMessage,
   type SyncNote,
   type SyncPeer,
@@ -120,6 +123,18 @@ export interface LanSyncBridge {
    * 这条不会 —— 中继已经把消息发给所有设备了，再广播就是环。
    */
   onRelayUserMessage?(text: string): Promise<void> | void;
+  /**
+   * 手机发来的远程控制：改权限档位 / 改步数 / 中止当前任务。
+   *
+   * 返回一句给人看的结果（手机上会显示）。
+   */
+  onRemoteControl?(control: {
+    action: 'preset' | 'steps' | 'stop' | 'state';
+    preset?: RemotePreset;
+    steps?: number;
+  }): Promise<{ ok: boolean; message: string }>;
+  /** 向频道广播「本机当前的权限档位 / 步数 / 是否在跑」，手机据此显示真实状态。 */
+  onBroadcastControl?(state: { preset: RemotePreset; steps: number; running: boolean }): void;
 }
 
 export type LanSyncRole = 'off' | 'hub' | 'peer';
@@ -190,6 +205,9 @@ export class LanSyncService implements Disposable {
   private mobileEnabled = false;
   private readonly gate = new MobileGate();
   private readonly approvals = new Map<string, { view: MobileApprovalView; resolve: (allow: boolean) => void; timer: NodeJS.Timeout }>();
+  /** 本地 id → 线上 id / 反向（桌面用本地 id 收卡，跨网手机用线上 id）。 */
+  private readonly localToWire = new Map<string, string>();
+  private readonly wireToLocal = new Map<string, string>();
   private approvalSequence = 0;
 
   constructor(
@@ -327,6 +345,18 @@ export class LanSyncService implements Disposable {
    */
   async ingestRelayMessage(message: SyncMessage): Promise<void> {
     /*
+     * 审批决定走独立分支：它不是"项目讨论"，不进群记录、也不触发 agent。
+     * 混进 applyMessage 会让看板把一张授权卡当成进度。
+     */
+    if (message.kind === 'approval') {
+      this.ingestRelayApproval(message);
+      return;
+    }
+    if (message.kind === 'control') {
+      await this.ingestRelayControl(message);
+      return;
+    }
+    /*
      * 手机（或另一台设备）以**甲方**身份在群里发的需求，本机也要真的开跑。
      *
      * 群消息本身不触发执行（那是防「两个 agent 互相接龙」的设计），但甲方发的话
@@ -352,6 +382,75 @@ export class LanSyncService implements Disposable {
     } catch (error) {
       this.bridge.log(`[relay] 处理甲方需求失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
     }
+  }
+
+  /**
+   * 中继上收到 **远程控制** 指令（改权限档位 / 改步数 / 中止）。
+   *
+   * 只接受「允许手机批准授权」开启时的指令：这是同一条信任边界的延伸，
+   * 关掉后手机只能看和说话，不能动电脑上的权限。
+   */
+  private async ingestRelayControl(message: SyncControlMessage): Promise<void> {
+    if (message.from.id === this.bridge.peer().id) return;
+    if (message.action === 'state') {
+      /* 手机在问「你现在是什么设置」：直接把真实状态广播回去。 */
+      if (this.bridge.canApproveFromPhone?.() ?? false) {
+        const result = await this.bridge.onRemoteControl?.({ action: 'state' });
+        if (result) this.bridge.log(`[relay] 已回复手机的状态查询：${result.message}`);
+      }
+      return;
+    }
+    if (!(this.bridge.canApproveFromPhone?.() ?? false)) {
+      this.bridge.log(`[relay] 收到远程控制（${message.action}），但本机没允许手机操作，已忽略`, 'warn');
+      return;
+    }
+    const apply = this.bridge.onRemoteControl;
+    if (!apply) return;
+    try {
+      const result = await apply({
+        action: message.action,
+        ...(message.preset ? { preset: message.preset } : {}),
+        ...(message.steps !== undefined ? { steps: message.steps } : {}),
+      });
+      this.bridge.log(`[relay] 远程控制 ${message.action}：${result.message}`);
+    } catch (error) {
+      this.bridge.log(`[relay] 远程控制失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+    }
+  }
+
+  /**
+   * 中继上收到一条**审批决定**：结算本机挂着的授权卡。
+   *
+   * 只认自己名下的卡（id 带本机设备前缀），别的设备的卡不归这里管。
+   * 已经处理过 / 过期的不再结算 —— 桌面弹窗可能抢先点了。
+   */
+  private ingestRelayApproval(message: SyncApprovalMessage): void {
+    if (message.phase !== 'decision') return;
+    if (message.from.id === this.bridge.peer().id) return;
+    const applied = this.resolveApproval(message.id, message.allow === true);
+    this.bridge.log(
+      `[relay] 来自 ${message.from.name} 的授权：${message.allow ? '允许' : '拒绝'} ${message.id}`
+      + (applied ? '' : '（这张卡已处理或已过期，或不属于本机）'),
+    );
+  }
+
+  /**
+   * 把「当前权限档位 / 步数 / 是否在跑」广播给频道。
+   *
+   * 手机不是猜的：它显示的一定是电脑上真实生效的值。
+   * 走 control 通道而不是群消息，避免把设置变更写进项目讨论记录。
+   */
+  broadcastControl(state: { preset: RemotePreset; steps: number; running: boolean }): void {
+    this.relayOut({
+      kind: 'control',
+      id: `ctl-${this.bridge.peer().id.slice(0, 16)}-${Date.now().toString(36)}`,
+      from: this.bridge.peer(),
+      action: 'state',
+      preset: state.preset,
+      steps: state.steps,
+      running: state.running,
+      at: Date.now(),
+    });
   }
 
   /** 本机产生的消息交给中继（没接中继时是空操作）。 */
@@ -476,22 +575,49 @@ export class LanSyncService implements Disposable {
     input: { title: string; summary: string; detail: string; risk: MobileApprovalView['risk'] },
     id = `m-${++this.approvalSequence}`,
   ): Promise<boolean> {
+    /* 线上 id 带设备前缀：两台电脑都可能有 approval-7，不带前缀会互相销卡。 */
+    const wireId = `${this.bridge.peer().id.slice(0, 20)}:${id}`.slice(0, 64);
+    this.localToWire.set(id, wireId);
+    this.wireToLocal.set(wireId, id);
     return new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => this.resolveApproval(id, false), REMOTE_APPROVAL_TTL_MS);
       timer.unref?.();
       this.approvals.set(id, {
+        // 局域网手机页看到的仍是原 id（行为不变）；跨网手机看到的是 wireId
         view: { id, at: Date.now(), ...input },
         resolve,
         timer,
       });
+      /*
+       * 跨网时把这张卡广播出去：手机不在同一个 WiFi，只能经中继看到它。
+       * 局域网/中继都可能没连，`onOutgoing` 内部是空操作，不影响本机弹窗。
+       * 授权细节（要跑的命令）不写进群记录，只走这条专用消息。
+       */
+      this.bridge.onOutgoing?.({
+        kind: 'approval',
+        id: wireId,
+        from: this.bridge.peer(),
+        phase: 'request',
+        title: input.title,
+        summary: input.summary,
+        detail: input.detail,
+        risk: input.risk,
+        at: Date.now(),
+      });
     });
   }
 
-  /** 结算一张授权卡；返回 false 表示它已经不在（被桌面抢先处理或过期了）。 */
+  /** 结算一张授权卡；返回 false 表示它已经不在（被抢先处理或过期了）。 */
   resolveApproval(id: string, allow: boolean): boolean {
-    const entry = this.approvals.get(id);
+    /* 三个入口都会来：桌面/局域网手机用本地 id，跨网手机用带前缀的线上 id。 */
+    const local = this.approvals.has(id) ? id : this.wireToLocal.get(id);
+    if (!local) return false;
+    const entry = this.approvals.get(local);
     if (!entry) return false;
-    this.approvals.delete(id);
+    this.approvals.delete(local);
+    const wire = this.localToWire.get(local);
+    if (wire) this.wireToLocal.delete(wire);
+    this.localToWire.delete(local);
     clearTimeout(entry.timer);
     entry.resolve(allow);
     return true;
@@ -1022,6 +1148,15 @@ export class LanSyncService implements Disposable {
   }
 
   private async applyMessage(message: SyncMessage, options: { relay: boolean; from?: string }): Promise<void> {
+    // 审批卡与远程控制不是"项目事件"：它们有自己的生命周期，不写进需求/报告/群记录
+    if (message.kind === 'approval') {
+      if (message.phase === 'decision') this.ingestRelayApproval(message);
+      return;
+    }
+    if (message.kind === 'control') {
+      void this.ingestRelayControl(message);
+      return;
+    }
     if (message.kind === 'requirement') {
       const exists = this.requirements.some((item) => item.id === message.id);
       if (!exists) {

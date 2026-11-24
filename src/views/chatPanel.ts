@@ -236,6 +236,13 @@ interface SendOptions {
    * 所以每个提前返回的分支都必须回一条可读的原因。
    */
   onOutcome?: (outcome: { ok: boolean; reasonKey?: string; vars?: Record<string, string | number> }) => void;
+  /**
+   * 这一轮结束时的结果回执（同样只给 `origin === 'sync'` 用）。
+   *
+   * 手机发了需求、agent 也跑完了，但**结果只有电脑屏幕上能看到** ——
+   * 真机验证时这就是最刺眼的一条：手机上永远只有"开始处理"。
+   */
+  onFinished?: (result: { ok: boolean; summary: string; files: string[] }) => void;
 }
 
 /**
@@ -960,16 +967,18 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
    * 手机已经把这条消息通过中继发给所有设备了，这里再广播就是环；
    * 用 `origin: 'sync'` 正好跳过广播分支（也不会弹「只发给本机」的提示）。
    *
-   * `onOutcome` 把「跑没跑起来 / 为什么没跑」交回给调用方 —— 手机那头看不见
-   * 电脑上的弹窗，不回执就等于消息石沉大海。
+   * `onOutcome` / `onFinished` 把结果交回给调用方 —— 手机那头看不见
+   * 电脑上的弹窗和最终回复，不回执就等于消息石沉大海。
    */
   async runRelayedUserRequirement(
     text: string,
     onOutcome?: (outcome: { ok: boolean; reasonKey?: string; vars?: Record<string, string | number> }) => void,
+    onFinished?: (result: { ok: boolean; summary: string; files: string[] }) => void,
   ): Promise<void> {
     await this.send(text, undefined, undefined, undefined, undefined, undefined, {
       origin: 'sync',
       ...(onOutcome ? { onOutcome } : {}),
+      ...(onFinished ? { onFinished } : {}),
     });
   }
 
@@ -2645,6 +2654,21 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         await this.settleTodosAfterRun(conversationId, runOutcome);
         // 同步需求：把本端结果回报给对端（对方的账本据此更新）。
         await this.reportSyncOutcome(run, runOutcome);
+        /*
+         * 远程发起的需求：把结果送回群里。
+         *
+         * 手机看不到电脑屏幕，没有这条它永远停在"已开始处理"。
+         * 摘要用最后一轮的回复，文件清单取本轮真正改过的；两者都可能为空，
+         * 前端会退化成只显示状态。
+         */
+        options?.onFinished?.({
+          ok: runOutcome === 'completed',
+          summary: [...run.responses.values()]
+            .map((response) => response.content.trim())
+            .filter(Boolean)
+            .slice(-1)[0] ?? '',
+          files: [...new Set(run.globalTools.flatMap((tool) => tool.changedFiles ?? []))].slice(0, 40),
+        });
         // 任务树就是下一轮的「记忆」：运行一结束立刻落库，不能等去抖计时器。
         await this.flushTaskMemory(conversationId);
         /*
@@ -4773,6 +4797,66 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       tt('notice.permissionConfirm'),
     );
     return answer === tt('notice.permissionConfirm');
+  }
+
+  /**
+   * 手机端远程控制：改权限档位 / 改步数 / 中止当前任务。
+   *
+   * 与界面上的 `setPermissionPreset` 的关键区别：**不弹二次确认**。
+   * 确认对话框开在电脑上，而用户此刻在手机上，弹了就等于永远卡住 ——
+   * 那正是"必须有人守在电脑旁"的根因。所以信任边界前移到
+   * 「本机是否允许手机操作」（`canApproveFromPhone`，lanSync 已挡）。
+   */
+  async applyRemoteControl(input: {
+    action: 'preset' | 'steps' | 'stop';
+    preset?: PermissionPreset;
+    steps?: number;
+  }): Promise<{ ok: boolean; message: string }> {
+    const conversationId = this.activeConversationId;
+    if (input.action === 'stop') {
+      const run = this.runFor(conversationId);
+      if (!run) return { ok: false, message: '当前没有正在执行的任务' };
+      this.stop();
+      return { ok: true, message: '已请求中止当前任务' };
+    }
+    if (input.action === 'preset') {
+      if (!input.preset || !isPermissionPreset(input.preset)) {
+        return { ok: false, message: '权限档位不合法' };
+      }
+      // 企业策略只能收紧：手机上要求的档位也要过一遍 clamp
+      const policyLoad = await loadPolicy(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
+      const effective = clampPreset(policyLoad.policy ?? undefined, input.preset);
+      await this.persistControls(conversationId, { permissionPreset: effective });
+      await this.post({ type: 'permissionPresetChanged', permissionPreset: effective });
+      const label = permissionPresetDetail(effective, currentLanguage()).label;
+      return {
+        ok: true,
+        message: effective === input.preset
+          ? `权限已设为「${label}」（下一轮开始生效）`
+          : `权限要求「${input.preset}」被企业策略收紧为「${label}」`,
+      };
+    }
+    if (input.action === 'steps') {
+      if (input.steps === undefined) return { ok: false, message: '缺少步数' };
+      const steps = normalizeAgentMaxSteps(input.steps);
+      await this.persistControls(conversationId, { agentMaxSteps: steps });
+      await this.post({ type: 'controlsChanged' });
+      return { ok: true, message: steps > 0 ? `最大步数已设为 ${steps}` : '最大步数已设为不限制' };
+    }
+    return { ok: false, message: '不认识的控制指令' };
+  }
+
+  /** 手机界面上要显示的「真实生效值」。 */
+  async remoteControlState(): Promise<{ preset: PermissionPreset; steps: number; running: boolean }> {
+    const conversation = this.activeConversationId
+      ? await this.storage.getConversation(this.activeConversationId)
+      : undefined;
+    const controls = this.currentControls(conversation);
+    return {
+      preset: controls.permissionPreset,
+      steps: controls.agentMaxSteps,
+      running: this.runs.size > 0,
+    };
   }
 
   private modelDiscoveryKey(profileId: string, baseUrl: string): string {

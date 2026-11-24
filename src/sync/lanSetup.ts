@@ -39,7 +39,20 @@ export interface LanSetupOptions {
     runRelayedUserRequirement(
       text: string,
       onOutcome?: (outcome: { ok: boolean; reasonKey?: string; vars?: Record<string, string | number> }) => void,
+      onFinished?: (result: { ok: boolean; summary: string; files: string[] }) => void,
     ): Promise<void>;
+    /** 手机发来的远程控制（改权限档位 / 改步数 / 中止 / 查状态）。 */
+    applyRemoteControl(input: {
+      action: 'preset' | 'steps' | 'stop';
+      preset?: import('./lanProtocol').RemotePreset;
+      steps?: number;
+    }): Promise<{ ok: boolean; message: string }>;
+    /** 手机界面上要显示的「真实生效值」，不是手机自己猜的。 */
+    remoteControlState(): Promise<{
+      preset: import('./lanProtocol').RemotePreset;
+      steps: number;
+      running: boolean;
+    }>;
   };
   version: string;
 }
@@ -184,6 +197,25 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       });
     },
     /**
+     * 手机发来的远程控制：改权限档位 / 改步数 / 中止当前任务。
+     *
+     * 手机上必须能改这些，否则 agent 一卡在"要不要允许这条命令"，
+     * 用户还是得跑到电脑前点一次，"用手机指挥"就失去意义。
+     */
+    onRemoteControl: async (control) => {
+      if (control.action === 'state') {
+        service.broadcastControl(await chat.remoteControlState());
+        return { ok: true, message: '已把当前设置同步给手机' };
+      }
+      const result = await chat.applyRemoteControl({
+        action: control.action,
+        ...(control.preset ? { preset: control.preset } : {}),
+        ...(control.steps !== undefined ? { steps: control.steps } : {}),
+      });
+      if (result.ok) service.broadcastControl(await chat.remoteControlState());
+      return result;
+    },
+    /**
      * 手机在群里发的需求（经中继到达）：本机开跑。
      * 不再广播 —— 中继已经发给所有设备了。
      *
@@ -202,6 +234,24 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       // 用户看到的却是"根本没跑"，那是假信息。
       void service.postGroup({ author: 'agent', phase: outcome.ok ? 'progress' : 'blocked', body })
         .catch((error: unknown) => output.warn(`[relay] 回执发送失败：${error instanceof Error ? error.message : String(error)}`));
+    }, (result) => {
+      /*
+       * 跑完了：把结论送回群里。
+       *
+       * 手机看不到电脑屏幕，没有这一条它永远停在"已在 X 开始处理"。
+       * 结论太长会刷屏，截断到 800 字；改了哪些文件单独列一行。
+       */
+      const head = result.ok
+        ? tt('notice.relayFinished', { project: bridge.peer().project })
+        : tt('notice.relayInterrupted');
+      const body = [
+        head,
+        result.summary ? result.summary.slice(0, 800) : '',
+        result.files.length ? `改动 ${result.files.length} 个文件：${result.files.slice(0, 8).join('、')}` : '',
+      ].filter(Boolean).join('\n\n');
+      output.info(`[relay] 甲方需求${result.ok ? '已完成' : '未完成'}：${result.files.length} 个文件`);
+      void service.postGroup({ author: 'agent', phase: result.ok ? 'result' : 'blocked', body })
+        .catch((error: unknown) => output.warn(`[relay] 结果回传失败：${error instanceof Error ? error.message : String(error)}`));
     }),
   };
 
