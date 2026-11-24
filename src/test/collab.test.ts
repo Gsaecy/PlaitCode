@@ -153,12 +153,15 @@ test('GitHub 换身份：用数字 id 认人；token 或用户信息失败都要
 });
 
 /** 一个只够 quickStart 用的假中继：记住令牌与已认领频道。 */
-function fakeRelay(options: { existingSecret?: string } = {}) {
-  const state = { claimed: [] as string[], pubkeys: [] as string[], handoffs: [] as Array<{ toDeviceId: string }> };
+function fakeRelay(options: { existingSecret?: string; linkedGithub?: boolean; revoked?: boolean } = {}) {
+  const state = { claimed: [] as string[], pubkeys: [] as string[], handoffs: [] as Array<{ toDeviceId: string }>, logins: 0 };
   const oldDevice = createHandoffKeyPair();
   const newDevice = createHandoffKeyPair();
   const existingSecret = options.existingSecret ?? '';
   const existingChannel = existingSecret ? deriveKeys(existingSecret).channel : '';
+  // 默认：旧令牌是有效的 GitHub 登录留下的
+  const linkedGithub = options.linkedGithub !== false;
+  const revoked = options.revoked === true;
   let logins = 0;
   let polls = 0;
   const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), {
@@ -169,6 +172,8 @@ function fakeRelay(options: { existingSecret?: string } = {}) {
     const url = new URL(String(input));
     const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
     if (url.pathname === '/v1/auth/device/start') {
+      logins += 1;
+      state.logins = logins;
       return json({ ok: true, code: 'ABCD-EFGH', expiresIn: 600, verifyUrl: `${url.origin}/v1/auth/github/start?device=ABCD-EFGH` });
     }
     if (url.pathname === '/v1/auth/device/poll') {
@@ -197,12 +202,15 @@ function fakeRelay(options: { existingSecret?: string } = {}) {
       return json({ ok: true, needsKey: body.needsKey === true });
     }
     if (url.pathname === '/v1/devices/me') {
+      if (revoked) return json({ ok: false, error: 'relay says no' }, 403);
       return json({
         ok: true,
         deviceId: 'dev_new',
         deviceName: 'macOS 版',
         memberId: 'mem_1',
         memberName: '我',
+        // 有这一项才代表「这台设备确实用 GitHub 登录过」
+        ...(linkedGithub ? { githubId: '424242', githubLogin: 'gsaecy' } : {}),
         orgId: 'org_1',
         orgName: 'acme',
         grants: existingChannel ? [{ channelId: existingChannel, role: 'member' }] : [],
@@ -287,6 +295,67 @@ test('开始协作：第二台设备等老设备把密钥加密送过来后自�
   // 拿到的是老设备那份密钥，而不是自己新造的
   assert.equal(result.secret, secret);
   assert.equal(result.channelId, deriveKeys(secret).channel);
+});
+
+test('开始协作：旧令牌没有关联 GitHub（或已失效）时，重新弹浏览器登录', async () => {
+  // 场景一：早期用管理员发的令牌登记过，没走过 GitHub
+  const unlinked = fakeRelay({ linkedGithub: false });
+  const opened: string[] = [];
+  const first = await quickStart({
+    relayUrl: 'https://relay.example.com',
+    deviceName: 'Windows 版',
+    platform: 'win32',
+    keyPair: unlinked.newDevice,
+    existingToken: 'tok_from_admin',
+    fetchImpl: unlinked.fetchImpl,
+    sleep: noSleep,
+    openUrl: (url) => { opened.push(url); },
+    loginTimeoutMs: 30_000,
+  });
+  assert.equal(first.ok, true);
+  // 必须真的又走了一次登录（用户点了按钮就该看到浏览器）
+  assert.equal(opened.length, 1);
+  assert.equal(unlinked.state.logins, 1);
+
+  // 场景二：令牌被吊销 → 同样重新登录
+  const revokedRelay = fakeRelay({ revoked: true });
+  const openedAgain: string[] = [];
+  const second = await quickStart({
+    relayUrl: 'https://relay.example.com',
+    deviceName: 'Mac',
+    platform: 'darwin',
+    keyPair: revokedRelay.newDevice,
+    existingToken: 'tok_revoked',
+    fetchImpl: revokedRelay.fetchImpl,
+    sleep: noSleep,
+    openUrl: (url) => { openedAgain.push(url); },
+    loginTimeoutMs: 30_000,
+  });
+  assert.equal(second.ok, true);
+  assert.equal(openedAgain.length, 1);
+});
+
+test('开始协作：已用 GitHub 登录过的设备重跑，不再弹浏览器', async () => {
+  const secret = 'm'.repeat(32);
+  const relay = fakeRelay({ existingSecret: secret });
+  const opened: string[] = [];
+  const result = await quickStart({
+    relayUrl: 'https://relay.example.com',
+    deviceName: 'Windows 版',
+    platform: 'win32',
+    keyPair: relay.newDevice,
+    existingSecret: secret,
+    existingToken: 'tok_valid',
+    fetchImpl: relay.fetchImpl,
+    sleep: noSleep,
+    openUrl: (url) => { opened.push(url); },
+    loginTimeoutMs: 5_000,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.secret, secret);
+  // 令牌有效且已经关联 GitHub：直接复用，不打扰用户
+  assert.equal(opened.length, 0);
+  assert.equal(relay.state.logins, 0);
 });
 
 test('交接客户端：拿到包就认账；本机有密钥时主动投给在等的设备', async () => {

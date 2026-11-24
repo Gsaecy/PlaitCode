@@ -66,7 +66,38 @@ export async function quickStart(deps: QuickStartDeps): Promise<QuickStartResult
   let memberName = '';
   let grants: Array<{ channelId: string; role: string }> = [];
 
-  /* ---------- 1. 没有令牌就先登录 ---------- */
+  /* ---------- 1. 先确认手上的令牌还算数 ---------- */
+
+  /*
+   * 不能假设「有令牌就等于已经加入」：
+   *  - 重装、换机、清理过 SecretStorage 之后，令牌还在但频道密钥丢了；
+   *  - 也可能是早期用管理员发的令牌登记的，并没有关联 GitHub 账号。
+   * 这两种情况都要重新走一次 GitHub 登录 —— 用户点了按钮，就该看到浏览器弹出来。
+   */
+  if (token) {
+    try {
+      const response = await doFetch(`${base}/v1/devices/me`, { headers: { authorization: `Bearer ${token}` } });
+      if (!response.ok) {
+        token = '';
+      } else {
+        const me = await response.json() as {
+          memberName?: string;
+          githubLogin?: string;
+          grants?: Array<{ channelId: string; role: string }>;
+        };
+        if (!me.githubLogin) {
+          token = '';
+        } else {
+          grants = me.grants ?? [];
+          if (!memberName && me.memberName) memberName = me.memberName;
+        }
+      }
+    } catch {
+      // 网络不通：保守地保留令牌，后面 claim 会给出确切错误
+    }
+  }
+
+  /* ---------- 2. 没有有效令牌就登录（这就是用户看到的"弹浏览器授权"） ---------- */
 
   if (!token) {
     progress('正在打开浏览器，请用 GitHub 登录…');
@@ -114,29 +145,7 @@ export async function quickStart(deps: QuickStartDeps): Promise<QuickStartResult
     progress(`已登录${memberName ? `：${memberName}` : ''}`);
   }
 
-  /* ---------- 1b. 已有令牌时，问一次这台设备自己有哪些授权 ---------- */
-
-  /*
-   * 不能假设「有令牌就等于有密钥」：重装、换机、清理过 SecretStorage 之后，
-   * 令牌还在但频道密钥丢了。这时必须走交接，而不是自己另开一条频道。
-   */
-  if (token && grants.length === 0) {
-    try {
-      const response = await doFetch(`${base}/v1/devices/me`, { headers: { authorization: `Bearer ${token}` } });
-      if (response.ok) {
-        const me = await response.json() as {
-          memberName?: string;
-          grants?: Array<{ channelId: string; role: string }>;
-        };
-        grants = me.grants ?? [];
-        if (!memberName && me.memberName) memberName = me.memberName;
-      }
-    } catch {
-      // 查不到就按「这个账号还没有频道」处理，后面 claim 会给出确切错误
-    }
-  }
-
-  /* ---------- 2. 决定这条设备要进哪条频道 ---------- */
+  /* ---------- 3. 决定这条设备要进哪条频道 ---------- */
 
   let secret = deps.existingSecret?.trim() ?? '';
   let channelId = '';

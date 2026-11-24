@@ -978,6 +978,9 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           deviceName: device.name,
           memberId: device.memberId,
           memberName: member?.name ?? '',
+          // 有没有关联 GitHub 账号：客户端据此判断"这台是否真的用 GitHub 登录过"
+          ...(member?.githubId ? { githubId: member.githubId } : {}),
+          ...(member?.githubLogin ? { githubLogin: member.githubLogin } : {}),
           orgId: member?.orgId ?? '',
           orgName: org?.name ?? '',
           grants: device.grants,

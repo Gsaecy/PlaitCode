@@ -53,7 +53,8 @@ nav button.active { color: var(--nav-active-fg); background: var(--nav-active-bg
 .toolbar-actions { display: flex; gap: 8px; }
 .toolbar-actions button, .storage-actions button { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; color: var(--fg); background: var(--surface); }
 .toolbar-actions button:hover, .storage-actions button:hover { color: var(--surface-hover-fg); background: var(--surface-hover); }
-.toolbar-actions .primary { color: var(--accent-text); border-color: transparent; background: var(--accent); font-weight: 620; }
+.toolbar-actions .primary, .storage-actions .primary { color: var(--accent-text); border-color: transparent; background: var(--accent); font-weight: 620; }
+.storage-actions .primary:hover { color: var(--accent-text); background: var(--accent); filter: brightness(1.08); }
 .toolbar-actions button:disabled { opacity: .5; cursor: default; }
 
 .settings-content { width: min(820px, calc(100% - 48px)); margin: 0 auto; padding: 10px 0 70px; }
