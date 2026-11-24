@@ -260,6 +260,48 @@ export function normalizeInviteCode(input: string): string {
   return input.replace(/[\s-]/g, '').toUpperCase();
 }
 
+/**
+ * 挑一个最可能被对方连上的本机地址。
+ *
+ * 一台机器常有 WiFi + 有线 + WSL/Hyper-V/VMware 虚拟网卡，取「第一个」经常取到
+ * 虚拟网卡（`172.x`），对方根本连不上，所以按常见家庭/办公网段排序。
+ */
+export function preferredAddress(): string {
+  const score = (ip: string): number => {
+    if (ip.startsWith('192.168.')) return 0;
+    if (ip.startsWith('10.')) return 1;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return 2;
+    if (ip.startsWith('169.254.')) return 4;
+    return 3;
+  };
+  return [...lanAddresses()].sort((left, right) => score(left) - score(right))[0] ?? '';
+}
+
+/**
+ * 邀请串：**一段文本同时带地址和码**，复制粘贴就能进群。
+ *
+ * 为什么不只给 6 位码：找群要靠 UDP 广播，而广播在开着代理 TUN、
+ * 或路由器禁广播的环境里会完全失效（实测 macOS 一个包都收不到）。
+ * 把地址写进邀请串里，就不再依赖广播。
+ */
+export function makeInviteText(code: string, port: number): string {
+  const host = preferredAddress();
+  return host ? `${host}:${port}#${code}` : code;
+}
+
+/** 解析邀请串：`192.168.0.3:47821#K7M2QX`、`K7M2QX`、纯地址都能认。 */
+export function parseInviteText(input: string): { code: string; address?: string } {
+  const raw = input.trim();
+  const hash = raw.indexOf('#');
+  if (hash >= 0) {
+    const left = raw.slice(0, hash).trim();
+    const code = normalizeInviteCode(raw.slice(hash + 1));
+    return left ? { code, address: left } : { code };
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(raw)) return { code: '', address: raw };
+  return { code: normalizeInviteCode(raw) };
+}
+
 export class LanSyncService implements Disposable {
   private server?: Server;
   private udp?: UdpSocket;
@@ -812,13 +854,18 @@ export class LanSyncService implements Disposable {
     return this.inviteCode;
   }
 
+  /** 复制给别人用的邀请串（带地址，粘贴即可，不依赖广播）。 */
+  currentInviteText(): string {
+    return this.inviteCode ? makeInviteText(this.inviteCode, this.port) : '';
+  }
+
   /**
    * 启动群聊：生成邀请码并成为主机，等别人填码进来。
    *
    * 这是新的、也是唯一的开群入口 —— 不做「自动找设备然后互相比谁让位」那一套。
    * 谁开群谁当主机，谁想进来谁填码，角色永远清楚。
    */
-  async startGroup(port?: number): Promise<{ ok: boolean; message: string; code?: string }> {
+  async startGroup(port?: number): Promise<{ ok: boolean; message: string; code?: string; text?: string }> {
     const code = makeInviteCode();
     const started = await this.startHub(port);
     if (!started.ok) {
@@ -828,9 +875,15 @@ export class LanSyncService implements Disposable {
     this.inviteCode = code;
     // 立刻用新码广播一次，别让从机等下一个周期。
     this.announceNow();
-    this.bridge.log(`[sync] 群聊已开，邀请码 ${code}`);
+    const text = makeInviteText(code, this.port);
+    this.bridge.log(`[sync] 群聊已开，邀请码 ${code}（邀请串 ${text}）`);
     this.bridge.onState?.();
-    return { ok: true, code, message: `群聊已开。让另一台设备「加入群聊」并填邀请码 ${code}。` };
+    return {
+      ok: true,
+      code,
+      text,
+      message: `群聊已开。邀请码 ${code} —— 在另一台点「加入群聊」，把「复制邀请码」复制到的那一整串粘进去即可。`,
+    };
   }
 
   /**
@@ -842,9 +895,17 @@ export class LanSyncService implements Disposable {
    * `address` 只在广播被拦时兜底（高级用法 / 测试），正常路径不要传。
    */
   async joinGroup(code: string, port?: number, address?: string): Promise<{ ok: boolean; message: string }> {
-    const wanted = normalizeInviteCode(code);
-    if (!wanted) return { ok: false, message: '请填写邀请码。' };
-    this.bridge.log(`[sync] 加入群聊：规范化后的邀请码 ${wanted}`);
+    /*
+     * 输入可以是纯邀请码，也可以是完整邀请串（`192.168.0.3:47821#K7M2QX`）。
+     * 后者不需要广播 —— 在广播被拦的环境里这是**唯一**能走通的路。
+     */
+    const parsed = parseInviteText(code);
+    const wanted = parsed.code;
+    const direct = address?.trim() || parsed.address;
+    if (!wanted) {
+      return { ok: false, message: '请填写邀请码（或直接粘贴对方「复制邀请码」复制的那一整串）。' };
+    }
+    this.bridge.log(`[sync] 加入群聊：规范化后的邀请码 ${wanted}${direct ? `，直连 ${direct}` : ''}`);
     this.usePort(port ?? this.configuredPort);
     this.stopListener();
     try {
@@ -854,22 +915,28 @@ export class LanSyncService implements Disposable {
       this.bridge.log(`[sync] 加入群聊失败：本机监听起不来（${message}）`, 'warn');
       return { ok: false, message: `本机监听失败：${message}` };
     }
-    this.bridge.log(`[sync] 加入群聊：本机已在 ${this.port} 监听，开始在 ${this.discoveryPort} 上找群`);
-    const typed = address?.trim();
-    const target = typed ? normalizeHubAddress(typed, this.port) : await this.discover(wanted);
+    let target: string;
+    if (direct) {
+      // 有地址就直连，完全不碰广播。
+      target = normalizeHubAddress(direct, this.port);
+      this.bridge.log(`[sync] 加入群聊：按邀请串直连 ${target}`);
+    } else {
+      this.bridge.log(`[sync] 加入群聊：本机已在 ${this.port} 监听，开始在 ${this.discoveryPort} 上找群`);
+      target = await this.discover(wanted);
+    }
     if (!target) {
       this.role = 'off';
       this.stopListener();
       /*
        * 分清两种失败：
-       *  - 一个群都没听到 → 网络/防火墙/对方没开群；
+       *  - 一个群都没听到 → 广播被拦（代理 TUN / 路由器禁广播 / 防火墙）；
        *  - 听到了群但码不对 → 只是抄错了码。
        * 混成一句「没找到」会让用户去查根本没问题的那一项。
        */
       const heard = [...new Set(this.lastHeard.map((item) => item.code).filter(Boolean))];
       const detail = heard.length
-        ? `这台电脑听到了 ${heard.length} 个群（${heard.join('、')}），但没有一个和 ${wanted} 一致 —— 请核对另一台电脑状态栏上显示的邀请码。`
-        : '这台电脑没有听到任何群聊广播。请确认另一台已点「启动群聊」且还开着，两台在同一个 WiFi，并且没有被防火墙/代理拦掉局域网广播。';
+        ? `这台电脑听到了 ${heard.length} 个群（${heard.join('、')}），但没有一个和 ${wanted} 一致 —— 请核对另一台电脑上显示的邀请码。`
+        : '这台电脑收不到群聊广播（常见于开着代理 TUN、路由器禁广播、或防火墙拦截）。请让对方点「复制邀请码」，然后把整串（形如 192.168.0.3:47821#XXXXXX）粘进来。';
       this.bridge.log(`[sync] 加入群聊失败：${detail}`, 'warn');
       return { ok: false, message: `加入失败：${detail}` };
     }

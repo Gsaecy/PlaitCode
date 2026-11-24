@@ -18,7 +18,7 @@ import { ALIGNMENT_FILE, type SyncPeer } from './lanProtocol';
 
 /** 团队群记录文件（与对齐账本并列，一个记状态、一个记过程）。 */
 const TRANSCRIPT_FILE = 'docs/TEAM-CHAT.md';
-import { LanSyncService, defaultDeviceName, defaultPlatform, lanAddresses, peerIdFor, type LanSyncBridge } from './lanSync';
+import { LanSyncService, defaultDeviceName, defaultPlatform, lanAddresses, parseInviteText, peerIdFor, type LanSyncBridge } from './lanSync';
 import { GroupPanel } from '../views/groupPanel';
 import { MobilePanel } from '../views/mobilePanel';
 import { RelayPhonePanel } from '../views/relayPhonePanel';
@@ -490,9 +490,10 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       } else if (invite) {
         status.tooltip = [
           `邀请码：${invite}`,
+          `邀请串：${service.currentInviteText()}`,
           `本机地址：${lanAddresses().join(' / ') || '未发现局域网地址'}`,
           '',
-          '在另一台电脑上打开 HWChat →「加入群聊」，填这个邀请码。',
+          '到另一台点「加入群聊」，把邀请串整段粘进去即可（不依赖广播）。',
           state.text,
         ].join('\n');
       } else {
@@ -568,7 +569,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     else lines.push(`状态：已加入 ${state.address || '（未知主机）'}`);
     lines.push(`监听端口：${ports.listen}（发现端口 ${ports.discovery}）`);
     const invite = service.currentInviteCode();
-    if (invite) lines.push(`邀请码：${invite}（等另一台填码加入）`);
+    if (invite) lines.push(`邀请码：${invite} · 邀请串 ${service.currentInviteText()}`);
     lines.push(`对端设备：${peers.length} 台`);
     for (const item of peers) lines.push(`  - ${item.name} · ${item.platform}${item.address ? ` · ${item.address}` : ''}`);
     lines.push('', '[中继]（跨网才需要）');
@@ -625,14 +626,26 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         void vscode.window.showWarningMessage(result.message);
         return;
       }
+      /*
+       * 邀请串直接放进剪贴板 —— 用户不用抄、不用记 IP。
+       * 广播在开着代理 TUN 的环境里会完全失效，粘贴整串是唯一稳的路。
+       */
+      try {
+        await vscode.env.clipboard.writeText(result.text ?? result.code ?? '');
+      } catch { /* 剪贴板不可用时仍然显示在下面 */ }
       await groupPanel.open();
       const choice = await vscode.window.showInformationMessage(
-        `群聊已开。邀请码：${result.code}\n\n在另一台电脑上打开 HWChat →「加入群聊」，填这个码。`,
-        '复制邀请码',
+        [
+          `群聊已开。邀请码：${result.code}`,
+          '',
+          '已复制到剪贴板。到另一台电脑点「加入群聊」，直接粘贴即可（里面带了地址，不依赖广播）。',
+          `手动填写也可以：${result.text ?? result.code}`,
+        ].join('\n'),
+        '再复制一次',
         '打开团队群',
       );
-      if (choice === '复制邀请码') {
-        await vscode.env.clipboard.writeText(result.code ?? '');
+      if (choice === '再复制一次') {
+        await vscode.env.clipboard.writeText(result.text ?? result.code ?? '');
       } else if (choice === '打开团队群') {
         await groupPanel.open();
       }
@@ -644,10 +657,10 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     vscode.commands.registerCommand('hwchat.lanSync.joinGroup', async () => {
       const typed = await vscode.window.showInputBox({
         title: '加入群聊',
-        prompt: '填另一台电脑上显示的邀请码（6 位字母数字）',
-        placeHolder: '例如 K7M2QX',
+        prompt: '粘贴对方「复制邀请码」复制的那一整串（形如 192.168.0.3:47821#K7M2QX）——也可以只填 6 位邀请码',
+        placeHolder: '直接 Ctrl+V 粘贴，或填 6 位邀请码',
         ignoreFocusOut: true,
-        validateInput: (value) => (value.trim() ? undefined : '请填写邀请码'),
+        validateInput: (value) => (parseInviteText(value).code ? undefined : '没看出邀请码，请粘贴对方复制的那一整串'),
       });
       if (!typed) {
         output.info('[sync] 加入群聊：用户取消了输入');
@@ -713,6 +726,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         '',
         `角色：${state.role}`,
         `邀请码：${service.currentInviteCode() || '（没有，说明这台不是群主）'}`,
+        `邀请串：${service.currentInviteText() || '（无）'}`,
         `HTTP 端口：${ports.listen} · 发现端口：${ports.discovery}`,
         `对端设备：${service.remotePeers().length} 台`,
         ...service.remotePeers().map((peer) => `  - ${peer.name} · ${peer.platform} · ${peer.address}`),

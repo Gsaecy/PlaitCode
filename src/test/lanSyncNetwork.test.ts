@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { LanSyncService, makeInviteCode, normalizeHubAddress, normalizeInviteCode, yieldDecision } from '../sync/lanSync';
+import { LanSyncService, makeInviteCode, normalizeHubAddress, normalizeInviteCode, parseInviteText, yieldDecision } from '../sync/lanSync';
 import type { SyncNote, SyncPeer, SyncRequirement } from '../sync/lanProtocol';
 
 /**
@@ -492,6 +492,46 @@ test('填码进群（走真实广播，不传地址）', async () => {
     peer.dispose();
     await rm(hub.dir, { recursive: true, force: true });
     await rm(peerDir, { recursive: true, force: true });
+  }
+});
+
+test('邀请串：解析出地址与码，粘贴即可直连（不依赖广播）', () => {
+  assert.deepEqual(parseInviteText('192.168.0.3:47821#K7M2QX'), { code: 'K7M2QX', address: '192.168.0.3:47821' });
+  assert.deepEqual(parseInviteText('  k7m-2qx '), { code: 'K7M2QX' });
+  assert.deepEqual(parseInviteText('192.168.0.3'), { code: '', address: '192.168.0.3' });
+  assert.deepEqual(parseInviteText('#K7M2QX'), { code: 'K7M2QX' });
+  // 只给码时没有地址，才需要广播。
+  assert.equal(parseInviteText('K7M2QX').address, undefined);
+});
+
+test('传整串邀请文本就能进群：完全不走广播', async () => {
+  const HUB_PORT = 49_331;
+  const PEER_PORT = 49_332;
+
+  const hub = await makeService(winPeer);
+  const peer = await makeService(macPeer);
+
+  try {
+    const started = await hub.service.startGroup(HUB_PORT);
+    assert.equal(started.ok, true, started.message);
+    const code = started.code ?? '';
+    assert.ok(started.text, '启动群聊必须给出可粘贴的邀请串');
+    assert.match(started.text ?? '', /#/);
+
+    /*
+     * 模拟用户粘贴：把邀请串里的地址换成 127.0.0.1（测试在同一台机器上跑）。
+     * 关键是**只传这一段文本**，不额外给地址 —— 这条路径必须不碰广播。
+     */
+    const pasted = `127.0.0.1:${HUB_PORT}#${code}`;
+    const joined = await peer.service.joinGroup(pasted, PEER_PORT);
+    assert.equal(joined.ok, true, joined.message);
+    assert.equal(peer.service.state().role, 'peer');
+    assert.equal(hub.service.remotePeers().length, 1);
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
   }
 });
 

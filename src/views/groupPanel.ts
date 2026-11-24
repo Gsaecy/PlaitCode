@@ -138,8 +138,7 @@ export class GroupPanel implements vscode.Disposable {
     this.panel = panel;
     panel.webview.html = this.html(panel.webview);
     this.disposables.push(panel.webview.onDidReceiveMessage(async (message: unknown) => {
-      const record = (message ?? {}) as { type?: unknown; text?: unknown; command?: unknown; assignee?: unknown };
-      if (record.type === 'ready') await this.refresh();
+      const record = (message ?? {}) as { type?: unknown; text?: unknown; command?: unknown; assignee?: unknown };      if (record.type === 'ready') await this.refresh();
       if (record.type === 'send' && typeof record.text === 'string') {
         const text = record.text.trim();
         if (!text) return;
@@ -154,6 +153,15 @@ export class GroupPanel implements vscode.Disposable {
           : undefined;
         await this.callbacks.send(text, assignee);
         await this.refresh();
+      }
+      if (record.type === 'copyInvite') {
+        const text = typeof record.text === 'string' && record.text ? record.text : this.service.currentInviteText();
+        if (text) {
+          await vscode.env.clipboard.writeText(text);
+          this.callbacks.log(`[group] 已复制邀请码 ${text}`);
+        }
+        await this.refresh();
+        return;
       }
       if (record.type === 'control' && record.command === 'stop') {
         const result = await this.callbacks.control?.('stop');
@@ -183,6 +191,10 @@ export class GroupPanel implements vscode.Disposable {
       type: 'state',
       role: state.role,
       relay: relayState,
+      /* 邀请码（只有主机有）：一直显示在窗口顶部，并带可复制的整串。 */
+      invite: this.service.currentInviteCode(),
+      inviteText: this.service.currentInviteText(),
+      inviteWaiting: this.service.currentInviteCode() !== '' && this.service.remotePeers().length === 0,
       header: groupHeader({ role: state.role, ...(relayState ? { relay: relayState } : {}) }),
       peers: (() => {
         const local = this.service.localPeer();
@@ -334,6 +346,16 @@ export class GroupPanel implements vscode.Disposable {
   .task .t { font-size: 12px; line-height: 1.35; margin-bottom: 3px; }
   .task .m { font-size: 10px; color: var(--muted); }
   .task .badge { display: inline-block; font-size: 9px; padding: 0 5px; border-radius: 999px; border: 1px solid var(--line); margin-right: 4px; }
+  /* 邀请码：一直摆在窗口里，不靠一闪而过的通知 */
+  .invite { display: none; margin: 10px 0 0; padding: 10px 12px; border: 1px solid var(--accent);
+    border-radius: 8px; background: var(--accent-soft); }
+  .invite .k { font-size: 11px; color: var(--muted); }
+  .invite .v { display: flex; align-items: center; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
+  .invite .code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 22px; font-weight: 700;
+    letter-spacing: 3px; color: var(--accent); user-select: all; }
+  .invite .how { font-size: 11px; color: var(--muted); }
+  .invite button { font-size: 11px; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--accent);
+    background: transparent; color: var(--accent); cursor: pointer; }
 </style></head>
 <body>
 <header>
@@ -347,6 +369,14 @@ export class GroupPanel implements vscode.Disposable {
     <button data-command="hwchat.lanSync.openLedger">对齐账本</button>
     <button data-command="hwchat.lanSync.status">连接状态</button>
     <button data-command="hwchat.lanSync.advanced">高级设置</button>
+  </div>
+  <div class="invite" id="invite">
+    <div class="k">把这台电脑的邀请码给对方，另一台点「加入群聊」填进来</div>
+    <div class="v">
+      <span class="code" id="inviteCode"></span>
+      <button id="copyInvite">复制邀请码</button>
+      <span class="how" id="inviteHow"></span>
+    </div>
   </div>
 </header>
 <div class="banner" id="banner"><b>乙方在等你回答</b><span id="bannerText"></span></div>
@@ -433,6 +463,25 @@ function render(state) {
   status.textContent = head.status;
   status.classList.toggle('on', head.on);
   sub.textContent = head.sub;
+
+  /*
+   * 邀请码：主机才显示，一直挂在窗口顶部。
+   *
+   * 用户之前只能在「右下角一闪而过」的通知里看到它，错过就得重开群（码会变）。
+   * 这里同时给出可复制的整串（带地址），对方粘贴即可，不依赖广播。
+   */
+  const inviteBox = el('invite');
+  const inviteText = state.inviteText || '';
+  if (inviteText) {
+    inviteBox.style.display = 'block';
+    el('inviteCode').textContent = state.invite || '';
+    el('inviteHow').textContent = state.inviteWaiting
+      ? '正在等对方填码…（点「复制邀请码」把整串发给对方）'
+      : '';
+    inviteBox.dataset.text = inviteText;
+  } else {
+    inviteBox.style.display = 'none';
+  }
 
   members.textContent = '';
   for (const peer of state.peers) {
@@ -549,6 +598,9 @@ text.addEventListener('keydown', (event) => {
 for (const button of document.querySelectorAll('.toolbar button')) {
   button.addEventListener('click', () => vscode.postMessage({ type: 'command', command: button.dataset.command }));
 }
+el('copyInvite').addEventListener('click', () => {
+  vscode.postMessage({ type: 'copyInvite', text: el('invite').dataset.text || el('inviteCode').textContent || '' });
+});
 window.addEventListener('message', (event) => { if (event.data?.type === 'state') render(event.data); });
 vscode.postMessage({ type: 'ready' });
 </script>
