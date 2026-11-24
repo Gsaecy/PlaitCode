@@ -2027,6 +2027,15 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
        * 在主对话说「所有平台都加上」只会让**本机**做，其它设备收不到；所以下面还加了
        * 一次提示，避免用户以为已经同步了。
        */
+      /*
+       * 群里发的消息必须有服务接住。
+       *
+       * 以前 `setLanSync` 从没被调用，群消息被静默跳过：群里一片空白，
+       * agent 却在主对话说他一个人干完了。这里补一个明确提示，不让它再静默。
+       */
+      if (options?.origin === 'group' && !this.lanSync) {
+        await this.post({ type: 'toast', tone: 'warn', text: tt('sync.groupUnavailable') });
+      }
       if (this.lanSync && !options?.resumedTodos && content) {
         if (options?.origin === 'group') {
           const openRequirement = this.lanSync.openQuestionRequirement();

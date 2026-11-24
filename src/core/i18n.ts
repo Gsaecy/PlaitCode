@@ -658,6 +658,10 @@ const DICTIONARY: Record<string, Entry> = {
     zh: '这条只在**本机**跑了：没有连上另一台设备，对方 agent 收不到。两台在同一 WiFi 时，各点一次「连接另一台设备」就行。',
     en: 'This ran on **this machine only**: no other device is connected, so the other agent never received it. On the same WiFi, click "Connect another device" once on each machine.',
   },
+  'sync.groupUnavailable': {
+    zh: '团队群的协作服务没启动，这条只在本机跑了，群里也没记录。请重载窗口（命令面板 → Developer: Reload Window）。',
+    en: 'The team-group service is not running, so this ran on this machine only and was not recorded in the group. Reload the window (Command Palette → Developer: Reload Window).',
+  },
   'settings.nav.privacy': { zh: '权限与隐私', en: 'Permissions & privacy' },
   'settings.nav.storage': { zh: '存储', en: 'Storage' },
   'settings.nativeButton': { zh: 'VS Code 设置', en: 'VS Code settings' },

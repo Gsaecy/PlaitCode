@@ -221,6 +221,19 @@ function isOwnAddress(value: string): boolean {
   return lanAddresses().includes(value);
 }
 
+/**
+ * 两台都点了按钮、各自成了主机时，谁该让位。
+ *
+ * 规则：id 大的让位，id 小的继续当主机。只让一边让，不会两边同时让步。
+ * **旧版广播里没有 `peer` 字段，也不会让位** —— 这时本机无条件让，
+ * 否则两边会永远对着待命。
+ */
+export function yieldDecision(selfId: string, otherPeerId: unknown): 'stay' | 'yield' {
+  if (typeof otherPeerId !== 'string' || !otherPeerId) return 'yield';
+  if (otherPeerId === selfId) return 'stay';
+  return selfId > otherPeerId ? 'yield' : 'stay';
+}
+
 export class LanSyncService implements Disposable {
   private server?: Server;
   private udp?: UdpSocket;
@@ -916,12 +929,7 @@ export class LanSyncService implements Disposable {
         return;
       }
       if (other?.magic !== HUB_MAGIC) return;
-      const legacyHub = typeof other.peer !== 'string' || !other.peer;
-      if (!legacyHub) {
-        const peerId = other.peer as string;
-        if (peerId === this.bridge.peer().id) return;
-        if (this.bridge.peer().id <= peerId) return;
-      }
+      if (yieldDecision(this.bridge.peer().id, other.peer) === 'stay') return;
       const address = Array.isArray(other.addresses)
         ? other.addresses.find((item): item is string => typeof item === 'string' && Boolean(item) && !isOwnAddress(item))
         : undefined;
@@ -939,10 +947,24 @@ export class LanSyncService implements Disposable {
       }, 0);
     });
     this.udp = udp;
-    this.announceTimer = setInterval(() => {
-      const payload = Buffer.from(JSON.stringify({ magic: HUB_MAGIC, port: this.port, addresses: lanAddresses() }));
+    /*
+     * 广播自己「已经是主机」。
+     *
+     * `peer` 必须带上：让位要靠它比 id。漏掉的话两台新版会互相把对方当成旧版，
+     * **双方同时让位**，结果都变成从机，谁也连不上。
+     */
+    const announce = (): void => {
+      const payload = Buffer.from(JSON.stringify({
+        magic: HUB_MAGIC,
+        peer: this.bridge.peer().id,
+        port: this.port,
+        addresses: lanAddresses(),
+      }));
       for (const target of broadcastTargets()) udp.send(payload, this.configuredPort, target, () => { /* 广播失败无所谓 */ });
-    }, 15_000);
+    };
+    // 先立刻喊一声：否则两台同时点按钮时要干等 15 秒才知道对方也是主机。
+    announce();
+    this.announceTimer = setInterval(announce, 5_000);
     this.announceTimer.unref?.();
   }
 

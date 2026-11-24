@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { LanSyncService, normalizeHubAddress } from '../sync/lanSync';
+import { LanSyncService, normalizeHubAddress, yieldDecision } from '../sync/lanSync';
 import type { SyncNote, SyncPeer, SyncRequirement } from '../sync/lanProtocol';
 
 /**
@@ -311,6 +311,18 @@ test('中继需求按指派门控：指名别人时本机不跑，指名本机�
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('两台都成主机时，只有 id 大的让位（不会两边同时让步）', () => {
+  // 新版对新版：id 大的让，id 小的留。方向必须相反，不能两边都让或都不让。
+  assert.equal(yieldDecision('p-b', 'p-a'), 'yield');
+  assert.equal(yieldDecision('p-a', 'p-b'), 'stay');
+  // 自己收到自己的广播：不能让，否则把自己拆了。
+  assert.equal(yieldDecision('p-a', 'p-a'), 'stay');
+  // 旧版广播没有 peer 字段，且旧版不会让位 —— 只能本机让，否则两边永远待命。
+  assert.equal(yieldDecision('p-a', undefined), 'yield');
+  assert.equal(yieldDecision('p-a', ''), 'yield');
+  assert.equal(yieldDecision('p-a', 42), 'yield');
 });
 
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {

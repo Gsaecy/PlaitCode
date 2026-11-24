@@ -299,6 +299,14 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   const service = new LanSyncService(join(context.globalStorageUri.fsPath, 'lan-sync.json'), bridge);
   await service.load();
   /*
+   * 把服务交给对话面板 —— **这一步以前漏了**。
+   *
+   * `chatPanel.lanSync` 一直是 undefined，于是团队群窗口里发的话根本没进群记录、
+   * 也没广播出去，只有本机主对话照常跑一轮：用户看到「群里没有发言」，
+   * 而 agent 在右侧说他是一个人在干活。
+   */
+  chat.setLanSync(service);
+  /*
    * 团队群窗口：独立面板，不进主对话。
    *
    * 发消息复用 `chat.send()` —— 它已经知道「这是回答追问还是新需求」，
@@ -437,11 +445,30 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 中继状态放进 tooltip，不抢位置。
      */
     if (state.role !== 'off') {
-      status.text = `$(broadcast) ${state.peers}台 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
+      /*
+       * 「N台」必须是**连到的对方台数**，不能把本机算进去。
+       *
+       * 以前这里是 `peers.size + 1`（含本机），于是「一台都没连上」显示成「1台」，
+       * 用户以为成功了 —— 而实际上两台各自都是主机，谁也没连谁。
+       */
+      const others = service.remotePeers().length;
+      /*
+       * 从机端 `peers` 清单天然为空（主机把它自己那条过滤掉了），
+       * 所以「连上了没有」要看角色，不能只看清单。
+       */
+      if (state.role === 'peer') {
+        status.text = `$(broadcast) 已连主机 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
+      } else if (others > 0) {
+        status.text = `$(broadcast) 已连 ${others} 台 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
+      } else {
+        status.text = '$(broadcast) 等待另一台加入';
+      }
       const relayLine = relayState
         ? `\n\n中继：${relayState.connected ? '已连接' : `连不上${relayState.lastError ? `（${relayState.lastError}）` : ''}`}`
         : '';
-      status.tooltip = `${state.text}\n点击查看详情 / 打开对齐账本。${relayLine}`;
+      status.tooltip = state.role === 'peer' || others > 0
+        ? `${state.text}\n点击查看详情 / 打开对齐账本。${relayLine}`
+        : `这台已就绪（${lanAddresses().join(' / ') || '未发现局域网地址'}），还没有另一台连过来。\n请到另一台设备上点一次「连接另一台设备」。\n\n${state.text}${relayLine}`;
       status.command = 'hwchat.lanSync.status';
       status.show();
       return;
@@ -552,6 +579,8 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   const disposables: vscode.Disposable[] = [
     status,
     service,
+    // 面板不能继续持有已经 dispose 的服务，否则关掉协作后发消息还会去碰死掉的 socket。
+    { dispose: () => chat.setLanSync(undefined) },
     { dispose: () => { if (handoffTimer) clearInterval(handoffTimer); } },
     vscode.commands.registerCommand('hwchat.lanSync.connect', async () => {
       const result = await service.autoConnect(setting('lanSync.port', 47821));
