@@ -94,6 +94,9 @@ WorkingDirectory=${APP_DIR}
 Environment=PLAITCODE_PORT=${PORT}
 Environment=PLAITCODE_HOST=127.0.0.1
 Environment=NODE_ENV=production
+# 审计日志：一行一条 JSON，默认落数据目录；设成 - 就只走 journald
+Environment=PLAITCODE_AUDIT=${DATA_DIR}/audit.jsonl
+Environment=PLAITCODE_AUDIT_STDOUT=1
 ExecStart=${NODE_DIR}/bin/node ${APP_DIR}/server.cjs
 Restart=always
 RestartSec=2

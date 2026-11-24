@@ -553,6 +553,10 @@ const DICTIONARY: Record<string, Entry> = {
   'notice.processAttachments': { zh: '请处理已添加的文件。', en: 'Please work with the attached files.' },
   'notice.privacyRequired': { zh: '需要确认隐私说明后才能向配置的模型接口发送内容。', en: 'Confirm the privacy notice before sending content to the configured model endpoint.' },
   'notice.configureApiKey': { zh: '请先为“{profile}”配置 API Key。', en: 'Configure an API key for “{profile}” first.' },
+  'notice.modelBlockedByPolicy': {
+    zh: '企业策略限制了所有可用模型，请联系管理员调整 .plaitcode/policy.json。',
+    en: 'Corporate policy blocks every available model. Ask your administrator to update .plaitcode/policy.json.',
+  },
   'notice.archivedResume': { zh: '该对话已归档，请恢复后继续。', en: 'This conversation is archived. Restore it to continue.' },
   'notice.voiceTitle': { zh: '允许 PlaitCode 使用语音输入？', en: 'Allow PlaitCode to use voice input?' },
   'notice.voiceDetail': {

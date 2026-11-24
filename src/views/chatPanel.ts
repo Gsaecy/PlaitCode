@@ -7,6 +7,7 @@ import { AgentRunner } from '../agent/agentRunner';
 import { attachmentCacheName, planAttachmentOpen } from '../agent/attachmentOpen';
 import { messagesSignatureKey } from './messageSignature';
 import { isInsideWorkspace, normalizeFileReference, revealTargetFor } from '../agent/fileReveal';
+import { STRICT_PRESET, clampPreset, loadPolicy, modelAllowed } from '../core/policy';
 import { embedMentionedImages, rehostWebviewImageUrls, resolveLocalImage, rewriteMarkdownImagePaths } from '../agent/markdownImages';
 import { imageCapabilityPrompt, looksLikeImageRequest } from '../agent/imageRequest';
 import { blockedToolReason, detectPlaybooks, detectTestCommand, hasWriteIntent, narrowToolNames, type ToolPlaybook } from '../agent/toolPlaybooks';
@@ -2010,6 +2011,17 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         }
       }
       let configuredSettings = readSettings();
+      /*
+       * 企业策略：管理员在 `.plaitcode/policy.json` 里下发的限制。
+       *
+       * 解析失败时**按最严格处理**（askAll）——静默失效比没有策略更危险。
+       * 没有这个文件时，下面所有分支的行为与以前完全一致。
+       */
+      const policyRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const policyLoad = await loadPolicy(policyRoot);
+      const policy = policyLoad.policy
+        ?? (policyLoad.error ? { version: 1 as const, permissionPreset: STRICT_PRESET } : undefined);
+      if (policyLoad.error) this.log(`[policy] ${policyLoad.error}（按最严格处理）`);
       let conversationId = this.activeConversationId;
       const existingConversation = conversationId ? await this.storage.getConversation(conversationId) : undefined;
       // 权限预设 / 最大步骤 / 思考深度取「这条对话自己的值」，全局设置只作为新对话的默认值。
@@ -2017,22 +2029,34 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       const controls = this.currentControls(existingConversation);
       // 发送瞬间带上来的值等同一次「本对话」的设置变更（它本身已经走过各自的确认流程）。
       // 预设只接受与当前对话一致的值：外部伪造一个未确认的“完全访问”不会被采纳。
-      const effectivePreset = isPermissionPreset(requestedPermissionPreset) && requestedPermissionPreset === controls.permissionPreset
+      const requestedPreset = isPermissionPreset(requestedPermissionPreset) && requestedPermissionPreset === controls.permissionPreset
         ? requestedPermissionPreset
         : controls.permissionPreset;
+      // 策略只能收紧：比策略更宽松的预设会被降级，更严格的一律保留。
+      const effectivePreset = clampPreset(policy, requestedPreset);
+      if (policy && effectivePreset !== requestedPreset) {
+        this.log(`[policy] 权限预设被企业策略从 ${requestedPreset} 收紧到 ${effectivePreset}`);
+      }
       const effectiveSteps = requestedAgentMaxSteps === undefined
         ? controls.agentMaxSteps
         : normalizeAgentMaxSteps(requestedAgentMaxSteps);
       const requestedReasoning = requestedReasoningEffort === undefined || !isReasoningEffort(requestedReasoningEffort)
         ? controls.reasoningEffort
         : normalizeReasoningEffort(requestedReasoningEffort);
+      const internetReference = policy?.allowInternetReference === false ? false : controls.internetReference;
       configuredSettings = {
         // 互联网参考按这条对话自己的存档打开；运行开始时快照一次，本轮所有工具与提示词都读它。
-        ...applyRuntimeControls(configuredSettings, effectivePreset, effectiveSteps, controls.internetReference),
+        ...applyRuntimeControls(configuredSettings, effectivePreset, effectiveSteps, internetReference),
         reasoningEffort: requestedReasoning,
+        ...(policy ? { policy } : {}),
       };
       const profile = profileFor(configuredSettings, existingConversation?.apiProfileId);
-      const availableModels = this.modelOptionsForProfile(profile);
+      const availableModels = this.modelOptionsForProfile(profile)
+        .filter((option) => modelAllowed(policy, option.id));
+      if (!availableModels.length) {
+        await this.rejectSend(content, 'notice.modelBlockedByPolicy');
+        return;
+      }
       const selectedModel = existingConversation?.model
         && availableModels.some((option) => option.id === existingConversation.model)
         ? existingConversation.model

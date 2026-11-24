@@ -20,6 +20,7 @@ import { commandPathViolation, maskPatternFlagArguments, missingPathsInCommandOu
 import { safeSlice } from '../core/textSafety';
 import { isPathWithin, normalizeWorkspaceGlob, resolveWorkspacePath, samePath } from './workspacePaths';
 import { isAutoExecPath } from '../core/permissions';
+import { deniedCommand } from '../core/policy';
 import { projectDocMode } from '../core/settings';
 import {
   PROJECT_DOC_MARKER,
@@ -497,6 +498,15 @@ export class ToolExecutor implements vscode.Disposable {
     }
 
     if (approvalRequest) {
+      /*
+       * 企业策略在**问用户之前**先拦一刀：管理员明确禁止的命令，不该再弹窗让员工"点一下试试"。
+       */
+      const policyDenied = deniedCommand(settings.policy, typeof args.command === 'string' ? args.command : '');
+      if (policyDenied) {
+        const result = deniedResult(policyDenied);
+        await this.auditResult(call, result, conversationId);
+        return result;
+      }
       const approved = await requestApproval(approvalRequest);
       if (!approved) {
         const result = deniedResult(tt('tool.deniedByUser'));

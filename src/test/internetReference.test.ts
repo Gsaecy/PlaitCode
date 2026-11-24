@@ -183,7 +183,9 @@ test('接线：开关按对话存储，运行开始时快照；工具与提示�
   // 1) 只有布尔 true 才算开启
   const SETTINGS = readFileSync('src/core/settings.ts', 'utf8');
   assert.match(SETTINGS, /internetReference: internetReference === true/, 'applyRuntimeControls 的入参判定（只有布尔 true 打开）');
-  assert.match(PANEL, /applyRuntimeControls\(configuredSettings, effectivePreset, effectiveSteps, controls\.internetReference\)/, 'send 时按对话快照');
+  // 企业策略可以强制关掉联网参考；没有策略时仍然是「按对话快照」。
+  assert.match(PANEL, /const internetReference = policy\?\.allowInternetReference === false \? false : controls\.internetReference;/, '策略可强制关闭，否则按对话快照');
+  assert.match(PANEL, /applyRuntimeControls\(configuredSettings, effectivePreset, effectiveSteps, internetReference\)/, 'send 时按对话快照');
   // 2) 提示词随每次请求注入（含「继续」）
   assert.match(PANEL, /withInternetReference\(this\.agentSystemPrompt/, '系统提示词要按开关注入');
   // 3) 工具按开关下发

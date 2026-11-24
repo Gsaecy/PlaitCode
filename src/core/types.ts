@@ -435,6 +435,13 @@ export interface ChatSettings {
   activeApiProfileId: string;
   baseUrl: string;
   model: string;
+  /**
+   * 企业策略（`.plaitcode/policy.json`）。
+   *
+   * 由 ChatPanel 在每轮开始时读入并挂在这里，工具执行侧只读不写。
+   * 声明为可选：没有策略文件时整条链路的行为与以前完全一致。
+   */
+  policy?: import('./policy').EnterprisePolicy;
   temperature: number;
   maxTokens: number;
   systemPrompt: string;

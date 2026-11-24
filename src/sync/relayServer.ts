@@ -10,6 +10,7 @@
 
 import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { AuditLog, type AuditOptions } from './relayAudit';
 import { renderRelayMobilePage } from './relayPage';
 
 export interface RelayOptions {
@@ -21,6 +22,8 @@ export interface RelayOptions {
   maxWaitMs?: number;
   /** 每个 IP 每分钟最多多少个请求。 */
   rateLimit?: number;
+  /** 审计日志（企业客户要的「谁在什么时候发了什么」）。 */
+  audit?: AuditOptions;
   log?: (line: string) => void;
 }
 
@@ -114,6 +117,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
   const maxWaitMs = Math.max(1_000, Math.min(options.maxWaitMs ?? 22_000, 25_000));
   const rateLimit = Math.max(10, options.rateLimit ?? 240);
   const log = options.log ?? ((): void => undefined);
+  const audit = new AuditLog(options.audit);
   const channels = new Map<string, Channel>();
   const buckets = new Map<string, { count: number; resetAt: number }>();
 
@@ -159,6 +163,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       if (!isStatic) {
         const ip = clientIp(request);
         if (!allowed(ip)) {
+          audit.record({ event: 'denied', ip, detail: 'rate limited' });
           json(response, 429, { ok: false, error: 'too many requests' });
           return;
         }
@@ -258,15 +263,18 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         }
         const channel = channelFor(id, bearer(request));
         if (!channel) {
+          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: 'channel denied' });
           json(response, 403, { ok: false, error: 'channel denied' });
           return;
         }
         if (channel.seen.has(messageId)) {
+          audit.record({ event: 'publish', channel: id, device: from, message: messageId, ip: clientIp(request), detail: 'duplicate' });
           json(response, 200, { ok: true, duplicate: true, seq: channel.seq });
           return;
         }
         channel.seq += 1;
         channel.seen.add(messageId);
+        audit.record({ event: 'publish', channel: id, device: from, message: messageId, ip: clientIp(request), bytes: ct.length });
         if (channel.seen.size > maxMessages * 4) {
           // 只保留最近的一段，防止内存被长期占用。
           channel.seen = new Set([...channel.seen].slice(-maxMessages * 2));
@@ -344,14 +352,18 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
   const address = server.address();
   const port = address && typeof address === 'object' ? address.port : (options.port ?? 8787);
   log(`[relay] 监听 ${options.host ?? '0.0.0.0'}:${port}`);
+  audit.record({ event: 'startup', detail: `listen ${options.host ?? '0.0.0.0'}:${port}` });
 
   return {
     port,
     close: () => new Promise<void>((resolve) => {
+      audit.record({ event: 'shutdown' });
       for (const channel of channels.values()) {
         for (const wake of [...channel.waiters]) wake();
       }
-      server.close(() => resolve());
+      server.close(() => {
+        void audit.flush().then(() => resolve());
+      });
       // 长轮询会把 close 拖住，给一个上限。
       setTimeout(() => resolve(), 1_500).unref?.();
     }),

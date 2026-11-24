@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.2（2026-11-24）
+
+### 企业级：审计流水 + 策略下发
+
+对着「企业客户能用吗」这个问题的阶段一/二，先补最容易被安全问卷问到的两块。
+
+**中继审计（`src/sync/relayAudit.ts`）**
+
+- 一行一条 JSONL：`ts / event / channel / device / message / ip / bytes`；
+- **只有元数据，没有正文** —— 端到端加密下中继本来就看不懂，这对客户是卖点；
+- 单文件上限 + 轮转（默认 20 MB × 5 份），可按需关掉 IP（部分地区 IP 属个人信息）；
+- 同时写 stdout，`journalctl -u plaitcode-relay | grep '[audit]'` 直接可查。
+
+**企业策略（`src/core/policy.ts` + `.plaitcode/policy.json`）**
+
+- `permissionPreset`：**只能收紧**，比策略更宽松的预设会被降级，更严格的一律保留；
+- `denyCommands`：子串或 `/正则/`，命中在**弹授权窗之前**就拒绝，并说明命中的规则；
+- `modelAllowlist`：支持 `*` 通配；全被禁时拒绝发送并提示联系管理员；
+- `allowInternetReference: false`：强制关闭联网参考；
+- **坏文件按最严处理**（回落到 `askAll` 并告警），静默失效比没有策略更危险。
+
+没有 `policy.json` 时，所有行为与 0.5.1 **完全一致**（策略字段是可选的）。
+
+新增 8 条单测：策略解析 / 收紧语义 / 命令黑名单 / 模型白名单 / 文件读取与坏 JSON；
+审计的字段、无正文、关 IP、轮转。
+
 ## 0.5.1（2026-11-24）
 
 ### 补齐跨网中继的命令入口

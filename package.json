@@ -2,7 +2,7 @@
   "name": "plaitcode",
   "displayName": "PlaitCode",
   "description": "A secure coding agent for VS Code with DeepSeek: approval-controlled workspace tools, plan-tracking task lists, copyable local/server commands and durable local history.",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "publisher": "plaitcode",
   "license": "MIT",
   "icon": "resources/logo.png",
