@@ -183,6 +183,21 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
           });
       }
     },
+    /**
+     * 主机没了：立刻告诉用户，别让界面继续显示「已连接」。
+     *
+     * 之前没有这条，主机重启或改 IP 之后，另一台会永远停在「已连接 + 旧群记录」，
+     * 两台看到的群完全不一样。
+     */
+    onHostLost: (address) => {
+      refreshStatus();
+      void groupPanel?.refresh().catch(() => undefined);
+      void vscode.window
+        .showWarningMessage(`${address} 的连接断了。如果对方重启过 VS Code，请让对方重新点「启动群聊」，再把新的邀请码复制过来。`, '重新加入')
+        .then(async (choice) => {
+          if (choice === '重新加入') await vscode.commands.executeCommand('hwchat.lanSync.joinGroup');
+        });
+    },
     log: (line, level) => {
       if (level === 'warn') output.warn(line);
       else output.info(line);

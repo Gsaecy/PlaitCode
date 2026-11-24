@@ -88,6 +88,12 @@ export interface LanSyncBridge {
    */
   onGroupMessage?(message: SyncGroupMessage): Promise<void>;
   /**
+   * 主机没了（重启、改 IP、或对方断开）。
+   *
+   * 用来提示用户「你已经不在群里了」，而不是让界面继续显示「已连接」。
+   */
+  onHostLost?(address: string): void;
+  /**
    * 有一台陌生设备想连进来，问一下用户。
    *
    * 这是「傻瓜式」的关键：用户不用抄配对码，只要在弹窗上点一次「允许」。
@@ -337,6 +343,9 @@ export class LanSyncService implements Disposable {
   private lastPort = 0;
   /** 正在让位给另一台主机：避免重复触发。 */
   private yielding = false;
+  /** peer 心跳：主机没了要能发现，否则界面会一直显示「已连接」。 */
+  private heartbeatTimer?: NodeJS.Timeout;
+  private hostMisses = 0;
   /** 本机群聊的邀请码（主机才有值）。空串表示这不是一个「等邀请码的群聊」。 */
   private inviteCode = '';
   /**
@@ -1034,11 +1043,14 @@ export class LanSyncService implements Disposable {
         };
       }
       if (/EHOSTUNREACH|ETIMEDOUT|ENETUNREACH/i.test(reason)) {
+        const host = (() => {
+          try { return new URL(target).hostname; } catch { return target; }
+        })();
         return {
           ok: false,
           message:
-            `网络到不了 ${target}。请先在对方电脑上 \`ping ${target.split(':')[2]?.replace('//', '') || '对方IP'}\` 试一下；` +
-            '如果 ping 都不通，通常是代理开了 TUN 模式、或两台没接在同一个路由器/同一个 WiFi。',
+            `网络到不了对方（${target}）。请在那台电脑上执行 \`ping ${host}\` 确认：` +
+            '如果 ping 也不通，通常是代理开了 TUN 模式、或两台没接在同一个网络。',
         };
       }
       return { ok: false, message: `加入失败：这台电脑连不上 ${target}（${reason || '没有响应'}）。请确认两台在同一个 WiFi。` };
@@ -1048,6 +1060,8 @@ export class LanSyncService implements Disposable {
     this.role = 'peer';
     this.hubAddress = target;
     this.inviteCode = '';
+    this.hostMisses = 0;
+    this.startPeerHeartbeat();
     this.bridge.log(`[sync] 已加入群聊 ${target}（邀请码 ${code}）`);
     this.bridge.onState?.();
     if (response.already === true) {
@@ -1135,6 +1149,7 @@ export class LanSyncService implements Disposable {
 
   stop(): void {
     this.stopDiscovery();
+    this.stopPeerHeartbeat();
     this.role = 'off';
     this.hubAddress = '';
     /*
@@ -2127,9 +2142,81 @@ export class LanSyncService implements Disposable {
     }
   }
 
+  /**
+   * peer 心跳：定期确认主机还在。
+   *
+   * 没有它就会出现用户遇到的那种假状态 —— 主机重启、改 IP、或断开了，
+   * 而界面一直显示「已连接」，群记录也是旧的那一份，两台看到的群完全不一样。
+   */
+  private startPeerHeartbeat(): void {
+    this.stopPeerHeartbeat();
+    this.heartbeatTimer = setInterval(() => { void this.checkHost(); }, 8_000);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private stopPeerHeartbeat(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = undefined;
+  }
+
+  /** 连一次主机；连上就算活着。 */
+  private pingHost(address: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      let url: URL;
+      try {
+        url = new URL('/hwchat-sync/v1/ping', address);
+      } catch {
+        resolve(false);
+        return;
+      }
+      const request = httpRequest({
+        hostname: url.hostname,
+        port: url.port || 80,
+        path: url.pathname,
+        method: 'GET',
+        timeout: 3_000,
+      }, (response) => {
+        response.resume();
+        resolve((response.statusCode ?? 500) < 500);
+      });
+      request.on('timeout', () => { request.destroy(); resolve(false); });
+      request.on('error', () => resolve(false));
+      request.end();
+    });
+  }
+
+  /** 立刻做一次主机存活检查（心跳定时器内部用，也给诊断/测试用）。 */
+  async checkHostOnce(): Promise<void> {
+    await this.checkHost();
+  }
+
+  private async checkHost(): Promise<void> {
+    if (this.role !== 'peer' || !this.hubAddress) {
+      this.stopPeerHeartbeat();
+      return;
+    }
+    const alive = await this.pingHost(this.hubAddress);
+    if (alive) {
+      this.hostMisses = 0;
+      return;
+    }
+    this.hostMisses += 1;
+    // 容忍一次抖动：网络短时波动不该直接踢人。
+    if (this.hostMisses < 2) return;
+    const lost = this.hubAddress;
+    this.stopPeerHeartbeat();
+    this.role = 'off';
+    this.hubAddress = '';
+    this.hostMisses = 0;
+    this.bridge.log(`[sync] 主机 ${lost} 连续无响应，已断开（界面不再显示「已连接」）`, 'warn');
+    this.bridge.onState?.();
+    this.bridge.onHostLost?.(lost);
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.stopPeerHeartbeat();
     for (const id of [...this.approvals.keys()]) this.resolveApproval(id, false);
     this.gate.revokeAll();
     this.stopListener();

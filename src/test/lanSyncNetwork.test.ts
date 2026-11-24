@@ -586,6 +586,55 @@ test('重启后邀请码仍然有效：群主自动恢复监听', async () => {
   }
 });
 
+test('主机没了要能发现：界面不能一直显示「已连接」', async () => {
+  const HUB_PORT = 49_351;
+  const PEER_PORT = 49_352;
+
+  const lostCalls: string[] = [];
+  const hub = await makeService(winPeer);
+  const peerDir = await mkdtemp(join(tmpdir(), 'hwchat-sync-'));
+  const peer = new LanSyncService(join(peerDir, 'state.json'), {
+    peer: () => macPeer,
+    runRequirement: async () => true,
+    runNote: async () => true,
+    writeLedger: async () => undefined,
+    writeTranscript: async () => undefined,
+    log: () => undefined,
+    onHostLost: (address) => { lostCalls.push(address); },
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
+  await peer.load();
+
+  try {
+    const started = await hub.service.startGroup(HUB_PORT);
+    assert.equal(started.ok, true, started.message);
+    const joined = await peer.joinGroup(`127.0.0.1:${HUB_PORT}#${started.code}`, PEER_PORT);
+    assert.equal(joined.ok, true, joined.message);
+    assert.equal(peer.state().role, 'peer');
+
+    // 主机活着时心跳不应该踢人。
+    await peer.checkHostOnce();
+    await peer.checkHostOnce();
+    assert.equal(peer.state().role, 'peer', '主机还在，不能被误踢');
+
+    /*
+     * 主机消失（重启 / 改 IP / 用户断开）。
+     * 以前没有心跳，peer 会永远停在 'peer'，界面一直显示「已连接」，
+     * 两台看到的群记录也完全不同 —— 这正是用户遇到的情况。
+     */
+    hub.service.dispose();
+    await peer.checkHostOnce();      // 第 1 次失败：容忍抖动
+    assert.equal(peer.state().role, 'peer', '单次抖动不应该断开');
+    await peer.checkHostOnce();      // 第 2 次失败：降级
+    assert.equal(peer.state().role, 'off', '主机连续无响应必须降级为未连接');
+    assert.equal(lostCalls.length, 1, '必须通知上层，好让界面提示用户');
+  } finally {
+    hub.service.dispose();
+    peer.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peerDir, { recursive: true, force: true });
+  }
+});
+
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {
   assert.equal(normalizeHubAddress('192.168.0.3', 47821), 'http://192.168.0.3:47821');
   assert.equal(normalizeHubAddress('192.168.0.3:5000', 47821), 'http://192.168.0.3:5000', '显式端口不能被覆盖');

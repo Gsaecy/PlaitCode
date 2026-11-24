@@ -51,11 +51,47 @@ nav button.active { color: var(--nav-active-fg); background: var(--nav-active-bg
 #saveState { color: var(--muted); font-size: 10px; }
 #saveState.dirty { color: var(--warning); }
 .toolbar-actions { display: flex; gap: 8px; }
-.toolbar-actions button, .storage-actions button { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; color: var(--fg); background: var(--surface); }
+.toolbar-actions button, .storage-actions button { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 6px; color: var(--fg); background: var(--surface);
+  transition: background-color .14s ease-out, border-color .14s ease-out, filter .14s ease-out, transform .1s ease-out; }
 .toolbar-actions button:hover, .storage-actions button:hover { color: var(--surface-hover-fg); background: var(--surface-hover); }
 .toolbar-actions .primary, .storage-actions .primary { color: var(--accent-text); border-color: transparent; background: var(--accent); font-weight: 620; }
 .storage-actions .primary:hover { color: var(--accent-text); background: var(--accent); filter: brightness(1.08); }
 .toolbar-actions button:disabled { opacity: .5; cursor: default; }
+
+/*
+ * 点击反馈：按下立刻下沉 + 变暗。
+ *
+ * 异步操作（启动群聊、加入群聊）要等好几秒，期间如果界面毫无变化，
+ * 用户根本不知道有没有点上，只会反复点。按下态是"我收到了"的最快回应。
+ */
+.toolbar-actions button:active:not(:disabled), .storage-actions button:active:not(:disabled) {
+  transform: translateY(1px) scale(.985);
+  filter: brightness(.90);
+}
+.storage-actions .primary:active:not(:disabled) { filter: brightness(.90); }
+
+/*
+ * 处理中：文字变淡 + 右侧转圈，并禁止重复点击。
+ * 只保留原文字位置，避免按钮宽度跳动导致下方内容位移。
+ */
+button.is-busy { position: relative; pointer-events: none; opacity: .75; }
+button.is-busy::after {
+  content: '';
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  width: 11px;
+  height: 11px;
+  margin-top: -5.5px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  animation: hwchat-button-spin .7s linear infinite;
+}
+@keyframes hwchat-button-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  button.is-busy::after { animation-duration: 1.6s; }
+}
 
 .settings-content { width: min(820px, calc(100% - 48px)); margin: 0 auto; padding: 10px 0 70px; }
 .settings-section { scroll-margin-top: 78px; padding: 30px 0 10px; }

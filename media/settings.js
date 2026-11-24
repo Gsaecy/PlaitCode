@@ -83,6 +83,36 @@
     vscode.postMessage({ type, ...payload });
   }
 
+  /*
+   * 异步操作的按钮：点下去立刻显示「处理中」并挡住重复点击。
+   *
+   * 这类操作要等好几秒（找群、启动监听），以前点完界面毫无变化，
+   * 用户会以为没点上而反复点 —— 反而把状态弄乱。
+   * 宿主处理完会用 `busy` 消息把按钮恢复；万一没收到，超时兜底恢复。
+   */
+  const busyTimers = new Set();
+  function postBusy(type, button, payload = {}) {
+    if (!button || button.classList.contains('is-busy')) return;
+    button.classList.add('is-busy');
+    post(type, payload);
+    const timer = setTimeout(() => releaseBusy(button), 20000);
+    busyTimers.add(timer);
+    button.dataset.busyTimer = String(timer);
+  }
+  function releaseBusy(button) {
+    if (!button) return;
+    button.classList.remove('is-busy');
+    const raw = button.dataset.busyTimer;
+    if (raw) {
+      clearTimeout(Number(raw));
+      busyTimers.delete(Number(raw));
+      delete button.dataset.busyTimer;
+    }
+  }
+  function releaseAllBusy() {
+    for (const node of document.querySelectorAll('button.is-busy')) releaseBusy(node);
+  }
+
   function markDirty() {
     elements.saveState.textContent = t('settings.unsaved');
     elements.saveState.classList.add('dirty');
@@ -454,8 +484,8 @@
   });
   elements.cleanupButton.addEventListener('click', () => post('cleanup'));
   elements.exportAllButton.addEventListener('click', () => post('exportAll'));
-  elements.lanSyncConnectButton.addEventListener('click', () => post('lanSyncConnect'));
-  elements.lanSyncJoinButton?.addEventListener('click', () => post('lanSyncJoin'));
+  elements.lanSyncConnectButton.addEventListener('click', (event) => postBusy('lanSyncConnect', event.currentTarget));
+  elements.lanSyncJoinButton?.addEventListener('click', (event) => postBusy('lanSyncJoin', event.currentTarget));
   elements.lanSyncGroupButton.addEventListener('click', () => post('lanSyncGroup'));
   elements.mobileButton.addEventListener('click', () => post('mobileOpen'));
   elements.lanSyncLedgerButton.addEventListener('click', () => post('lanSyncLedger'));
