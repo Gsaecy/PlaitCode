@@ -75,8 +75,11 @@ chmod 600 "$DROPIN"
 ok "已写入（权限 600，因为里面有 secret）"
 
 mkdir -p "$(dirname "$IDENTITY_PATH")"
-chown -R "$(systemctl show -p User --value "$SERVICE" 2>/dev/null || echo root)": \
-  "$(dirname "$IDENTITY_PATH")" 2>/dev/null || true
+# 服务可能以 root 或专用用户运行：读不到就按 root 处理，别让空用户名把 chown 弄成语法错
+SERVICE_USER="$(systemctl show -p User --value "$SERVICE" 2>/dev/null || true)"
+SERVICE_USER="${SERVICE_USER:-root}"
+chown -R "${SERVICE_USER}:" "$(dirname "$IDENTITY_PATH")" 2>/dev/null || true
+chmod 750 "$(dirname "$IDENTITY_PATH")" 2>/dev/null || true
 
 systemctl daemon-reload
 systemctl restart "$SERVICE"
