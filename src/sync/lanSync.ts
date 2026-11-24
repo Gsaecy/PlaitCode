@@ -14,6 +14,7 @@
  */
 
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createConnection } from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { createHash, randomBytes } from 'node:crypto';
 import { createSocket, type Socket as UdpSocket } from 'node:dgram';
@@ -87,6 +88,31 @@ export interface LanSyncBridge {
    * 失败不影响同步本身：记录文件照样写，用户仍能在 `docs/TEAM-CHAT.md` 里回看。
    */
   onGroupMessage?(message: SyncGroupMessage): Promise<void>;
+  /**
+   * 有更新的用户消息要执行，正在跑的那条必须停下。
+   *
+   * 用户明确要求：多台设备、多位用户在同一项目下发的命令冲突时，
+   * **按时间先后执行最新的那条**。不打断旧的那条，两个 agent 会各做一半、
+   * 改动互相覆盖，比谁都不做更难查。
+   */
+  onSuperseded?(info: { stopped: string; next: string; from: string }): void;
+  /** 本机工作区里的项目名（供面板展示与选择）。 */
+  localProjects?(): string[];
+  /**
+   * 项目不一致：**先追问，别直接开跑**。
+   *
+   * 用户要求：选中不同项目时 agent 要问清楚，确认后才调整。
+   * 同一 GitHub 账号、只是本机还没这个项目 → 提示去拉取。
+   */
+  onProjectMismatch?(info: {
+    required: string;
+    local: string;
+    from: string;
+    sameAccount: boolean;
+    hasLocalCandidate: boolean;
+  }): void;
+  /** 本机 GitHub 登录名（拿不到就返回空串）。 */
+  localLogin?(): string;
   /**
    * 主机没了（重启、改 IP、或对方断开）。
    *
@@ -346,8 +372,31 @@ export class LanSyncService implements Disposable {
   /** peer 心跳：主机没了要能发现，否则界面会一直显示「已连接」。 */
   private heartbeatTimer?: NodeJS.Timeout;
   private hostMisses = 0;
+  /** 正在跑的需求（用来判断「新消息该不该顶掉它」）。 */
+  private runningRequirement?: { id: string; createdAt: number };
+  /**
+   * Lamport 逻辑时钟：让**所有设备**对「谁更新」的判定一致。
+   *
+   * 只用本机 `Date.now()` 不行 —— 两台机器的时钟差几秒就会出现
+   * 「A 认为 B 更新、B 认为 A 更新」，于是两边各跑各的，冲突反而更多。
+   */
+  private lastClock = 0;
   /** 本机群聊的邀请码（主机才有值）。空串表示这不是一个「等邀请码的群聊」。 */
   private inviteCode = '';
+  /**
+   * 加入别人群聊时用的邀请码。
+   *
+   * 之后每条消息都要带它 —— 否则主机按旧配对码校验会一律 403，
+   * 表现就是「加入成功，但群消息和需求都传不过去」。
+   */
+  private joinedCode = '';
+  /**
+   * 本机参与协作的项目名（工作区文件夹名）。
+   *
+   * 每台设备各自选一个项目；两台选到**同名项目**才是一起做同一件事。
+   * 空串表示用默认（当前工作区文件夹名）。
+   */
+  private collabProject = '';
   /**
    * UDP 发现端口（固定，不随 HTTP 端口变化）。
    * 可注入只是为了让测试与真实运行中的实例隔离；生产永远用 `DISCOVERY_PORT`。
@@ -845,7 +894,7 @@ export class LanSyncService implements Disposable {
    * 转发给所有已登记的设备。
    */
   async startHub(port = this.configuredPort): Promise<{ ok: boolean; message: string }> {
-    if (this.role === 'hub' && this.server) return { ok: true, message: `已在主机模式（:${this.port}）` };
+    if (this.role === 'hub' && this.server) return { ok: true, message: `群聊已在运行（端口 ${this.port}）` };
     this.stopListener();
     this.usePort(port);
     try {
@@ -853,11 +902,11 @@ export class LanSyncService implements Disposable {
       await this.startDiscovery();
       this.role = 'hub';
       this.hubAddress = '';
-      this.bridge.log(`[sync] 主机已启动，端口 ${this.port}（发现端口 ${this.configuredPort}），配对码 ${this.code}`);
+      this.bridge.log(`[sync] 群聊监听已启动，端口 ${this.port}（发现端口 ${this.configuredPort}）`);
       this.bridge.onState?.();
       return {
         ok: true,
-        message: `主机已启动。同一 WiFi 的另一台设备点一次「连接另一台设备」就能加入；配对码 ${this.code}。`,
+        message: `群聊已就绪（端口 ${this.port}）。把邀请码给对方，对方点「加入群聊」粘贴即可。`,
       };
     } catch (error) {
       this.role = 'off';
@@ -867,9 +916,49 @@ export class LanSyncService implements Disposable {
     }
   }
 
+  /** 本机协作项目名（空串=用默认）。 */
+  currentProject(): string {
+    return this.collabProject;
+  }
+
+  /** 选定本机参与协作的项目；下一轮协作消息就会带上它。 */
+  async setCollabProject(name: string): Promise<void> {
+    this.collabProject = name.trim().slice(0, 80);
+    await this.persist();
+    this.bridge.log(`[sync] 协作项目设为「${this.collabProject || '（默认）'}」`);
+    this.bridge.onState?.();
+  }
+
+  /**
+   * 本机有没有对方那个项目。
+   *
+   * 用来判断「项目不一致」是不是真的不一致：同一个人另一台设备上
+   * 只是还没建/没拉这个项目，那就不是冲突，可以提示去拉取。
+   */
+  hasProject(name: string): boolean {
+    if (!name) return false;
+    if (this.collabProject === name) return true;
+    return this.bridge.localProjects?.().includes(name) ?? false;
+  }
+
+  /** 本机工作区里的项目名（面板展示 / 选择用）。 */
+  localProjects(): string[] {
+    return this.bridge.localProjects?.() ?? [];
+  }
+
   /** 本机群聊的邀请码；不是主机时为空串。 */
   currentInviteCode(): string {
     return this.inviteCode;
+  }
+
+  /**
+   * 请求要带的通行证。
+   *
+   * 当主机的用自己群的邀请码；加入别人的用加入时那个码；
+   * 都没有才退回旧配对码（高级手动连接）。
+   */
+  private credential(): string {
+    return this.inviteCode || this.joinedCode || this.code;
   }
 
   /** 复制给别人用的邀请串（带地址，粘贴即可，不依赖广播）。 */
@@ -921,7 +1010,7 @@ export class LanSyncService implements Disposable {
     port?: number,
     address?: string,
     options: { allowWhileHosting?: boolean } = {},
-  ): Promise<{ ok: boolean; message: string }> {
+  ): Promise<{ ok: boolean; message: string; needsSwitch?: boolean }> {
     /*
      * 正在当群主的机器不该去加入别人。
      *
@@ -930,11 +1019,17 @@ export class LanSyncService implements Disposable {
      * 这里直接拦住并说清该怎么做。
      */
     if (this.role === 'hub' && this.inviteCode && !options.allowWhileHosting) {
+      /*
+       * 不硬拦，交给上层问用户。
+       *
+       * 两台都点了「启动群聊」是极常见的操作，直接拒绝会让人以为坏了；
+       * 但**默默离开自己的群**更糟 —— 对方还拿着旧码在等。
+       * 所以这里只如实返回「需要确认」，由界面弹一次选择。
+       */
       return {
         ok: false,
-        message:
-          `这台电脑正在当群主（邀请码 ${this.inviteCode}），不需要加入别人的群。` +
-          '请让另一台点「加入群聊」填这个码；如果你确实想加入别人的群，先点「断开」。',
+        needsSwitch: true,
+        message: `这台电脑正在当群主（邀请码 ${this.inviteCode}）。`,
       };
     }
     /*
@@ -1002,18 +1097,63 @@ export class LanSyncService implements Disposable {
     target: string,
     body: Record<string, unknown>,
   ): Promise<{ ok: boolean; error?: string; data?: Record<string, unknown> }> {
-    try {
-      const text = await postRaw(target, '/hwchat-sync/v1/pair', JSON.stringify(body));
-      const data = JSON.parse(text) as Record<string, unknown>;
-      return { ok: true, data };
-    } catch (error) {
-      const raw = error instanceof Error ? error.message : String(error);
-      const match = raw.match(/\{"ok":false,"error":"([^"]*)"\}/);
-      return { ok: false, error: match?.[1] || raw.slice(0, 160) };
+    /*
+     * 网络层的瞬时失败要重试。
+     *
+     * 真机踩过：对方 DHCP 换了 IP（.3 → .2），本机 ARP 缓存里还没有新地址，
+     * 第一次连接直接 EHOSTUNREACH；过了几十秒再连就通了。
+     * 一次失败就放弃，用户只会看到「连不上」，而实际上再试就好。
+     */
+    let lastError = '';
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const text = await postRaw(target, '/hwchat-sync/v1/pair', JSON.stringify(body));
+        const data = JSON.parse(text) as Record<string, unknown>;
+        return { ok: true, data };
+      } catch (error) {
+        const raw = error instanceof Error ? error.message : String(error);
+        lastError = raw;
+        // 业务错误（邀请码不对等）重试没有意义，只会重复打扰对方。
+        if (/\{"ok":false/.test(raw)) break;
+        const transient = /EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAGAIN|ECONNRESET/i.test(raw);
+        if (!transient || attempt === 3) break;
+        this.bridge.log(`[sync] 连接 ${target} 暂时失败（${attempt}/3），稍后重试：${raw.slice(0, 80)}`);
+        await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+      }
     }
+    const match = lastError.match(/\{"ok":false,"error":"([^"]*)"\}/);
+    return { ok: false, error: match?.[1] || lastError.slice(0, 160) };
+  }
+
+  /**
+   * 连接前先把 ARP 打通。
+   *
+   * 对方 DHCP 换过 IP 时，本机 ARP 里没有新地址，第一次连接会 EHOSTUNREACH。
+   * 先做一次短超时的 TCP 尝试（不看结果），让系统把 ARP 解析出来，
+   * 后续真正的请求就不用再等这一轮。
+   */
+  private warmUp(target: string): Promise<void> {
+    return new Promise((resolve) => {
+      let host = '';
+      let port = 80;
+      try {
+        const url = new URL(target);
+        host = url.hostname;
+        port = Number(url.port) || 80;
+      } catch {
+        resolve();
+        return;
+      }
+      const socket = createConnection({ host, port, timeout: 1_200 });
+      const done = (): void => { socket.destroy(); resolve(); };
+      socket.once('connect', done);
+      socket.once('timeout', done);
+      socket.once('error', done);
+    });
   }
 
   private async finishJoin(target: string, code: string): Promise<{ ok: boolean; message: string }> {
+    await this.warmUp(target);
     const answer = await this.pairRequest(target, {
       protocol: SYNC_PROTOCOL_VERSION,
       code,
@@ -1042,15 +1182,18 @@ export class LanSyncService implements Disposable {
             '请在对方点「启动群聊」，然后把新的邀请串复制给你（重启过 VS Code 后旧邀请码会失效）。',
         };
       }
-      if (/EHOSTUNREACH|ETIMEDOUT|ENETUNREACH/i.test(reason)) {
+      if (/EHOSTUNREACH|ENETUNREACH|ETIMEDOUT/i.test(reason)) {
         const host = (() => {
           try { return new URL(target).hostname; } catch { return target; }
         })();
         return {
           ok: false,
           message:
-            `网络到不了对方（${target}）。请在那台电脑上执行 \`ping ${host}\` 确认：` +
-            '如果 ping 也不通，通常是代理开了 TUN 模式、或两台没接在同一个网络。',
+            `连不上 ${target}。常见原因（按可能性排序）：\n` +
+            `1. 对方电脑的 IP 变了（重启路由器后很常见）→ 请对方重新点「启动群聊」，把新邀请码复制给你；\n` +
+            `2. 代理开了 TUN / 增强模式，把局域网流量劫走了 → 两台都关掉代理再试；\n` +
+            `3. 两台没接在同一个 WiFi。\n` +
+            `可以先在终端跑 \`ping ${host}\` 确认网络通不通。`,
         };
       }
       return { ok: false, message: `加入失败：这台电脑连不上 ${target}（${reason || '没有响应'}）。请确认两台在同一个 WiFi。` };
@@ -1060,6 +1203,8 @@ export class LanSyncService implements Disposable {
     this.role = 'peer';
     this.hubAddress = target;
     this.inviteCode = '';
+    // 记住加入时用的码：后面每条消息都要带它，否则主机会 403。
+    this.joinedCode = normalizeInviteCode(code);
     this.hostMisses = 0;
     this.startPeerHeartbeat();
     this.bridge.log(`[sync] 已加入群聊 ${target}（邀请码 ${code}）`);
@@ -1534,8 +1679,18 @@ export class LanSyncService implements Disposable {
        * `/pair` 例外：它的放行判断在下面（已允许过的设备 / 对得上码 / 用户点「允许」
        * 三种途径），所以不能在这里一刀切 —— 否则「傻瓜式」的弹窗永远走不到。
        */
-      if (route !== '/hwchat-sync/v1/pair' && !pairingMatches(parsed.code, this.code)) {
-        json(403, { ok: false, error: 'pairing code mismatch' });
+      /*
+       * 通行证：**邀请码或旧配对码，任一正确即可**。
+       *
+       * 以前这里只认旧配对码，而「填邀请码进群」之后发消息带的是邀请码 ——
+       * 于是主机一律 403：加入看着成功，群消息和需求却一条都传不过去。
+       */
+      const suppliedCode = normalizeInviteCode(typeof parsed.code === 'string' ? parsed.code : '');
+      const codeAccepted = this.inviteCode
+        ? suppliedCode === normalizeInviteCode(this.inviteCode)
+        : pairingMatches(parsed.code, this.code);
+      if (route !== '/hwchat-sync/v1/pair' && !codeAccepted) {
+        json(403, { ok: false, error: 'group code mismatch' });
         return;
       }
       if (route === '/hwchat-sync/v1/pair') {
@@ -1799,6 +1954,11 @@ export class LanSyncService implements Disposable {
       return;
     }
     if (message.kind === 'requirement') {
+      /*
+       * 先推进逻辑时钟：之后本机发的消息一定比这条更新。
+       * 多台设备、多位用户在同一项目下并发发言时，靠它排出全序。
+       */
+      this.observeClock(message.createdAt);
       const exists = this.requirements.some((item) => item.id === message.id);
       if (!exists) {
         this.requirements = [...this.requirements, message].slice(-STATE_LIMIT);
@@ -1806,11 +1966,36 @@ export class LanSyncService implements Disposable {
         this.bridge.log(`[sync] 收到需求 ${message.id}：${message.title}（来自 ${message.from.name}）`);
         // 本机执行（除发起方自己）。
         if (message.from.id !== this.bridge.peer().id) {
-          const accepted = await this.bridge.runRequirement(message).catch((error: unknown) => {
-            this.bridge.log(`[sync] 本机执行需求失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
-            return false;
-          });
-          if (!accepted) this.bridge.log('[sync] 面板正忙，需求已记录，稍后可手动继续', 'warn');
+          /*
+           * 项目门禁：**不是同一个项目就不能直接开跑**。
+           *
+           * 用户要求：多台设备的用户选中同一个项目才能协同；选的不一样时
+           * agent 先追问，确认后才调整。同账号只是本机还没这个项目 → 提示去拉取。
+           */
+          const required = message.project || message.from.project || '';
+          const local = this.collabProject || this.bridge.peer().project;
+          if (required && local && required !== local && !this.hasProject(required)) {
+            const mine = this.bridge.localLogin?.() ?? '';
+            const theirs = message.from.login ?? '';
+            this.bridge.log(
+              `[sync] 项目不一致（对方「${required}」/ 本机「${local}」），先追问，不执行需求 ${message.id}`,
+              'warn',
+            );
+            this.bridge.onProjectMismatch?.({
+              required,
+              local,
+              from: message.from.name,
+              sameAccount: Boolean(mine) && mine === theirs,
+              hasLocalCandidate: false,
+            });
+            return;
+          }
+          const outcome = await this.runNewest(message, async (item) => this.bridge.runRequirement(item)
+            .catch((error: unknown) => {
+              this.bridge.log(`[sync] 本机执行需求失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+              return false;
+            }));
+          if (outcome === 'busy') this.bridge.log('[sync] 面板正忙，需求已记录，稍后可手动继续', 'warn');
         }
       }
     } else {
@@ -1870,7 +2055,7 @@ export class LanSyncService implements Disposable {
       }
     }
     if (options.relay && this.role === 'hub') {
-      const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message });
+      const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message });
       const targets = this.peerList().filter((entry) => entry.address && entry.peer.id !== options.from);
       await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     }
@@ -1898,16 +2083,32 @@ export class LanSyncService implements Disposable {
    * 不会让本机白等一次网络超时。
    */
   async shareRequirement(text: string): Promise<{ ok: boolean; message: string; requirement?: SyncRequirement }> {
-    const requirement = makeRequirement(this.bridge.peer(), text);
+    // 用逻辑时钟而不是本机 Date.now()：多设备并发时才能排出全序。
+    const requirement = makeRequirement(this.bridge.peer(), text, this.nextClock());
     if (!requirement) return { ok: false, message: '需求内容为空。' };
+      // 带上本机选中的项目：对方据此判断「是不是同一个项目」。
+      const project = this.collabProject || this.bridge.peer().project;
+      if (project) requirement.project = project;
     const exists = this.requirements.some((item) => item.id === requirement.id);
     if (!exists) this.requirements = [...this.requirements, requirement].slice(-STATE_LIMIT);
     await this.persist();
     await this.refreshLedger();
+    /*
+     * 本机用户刚说的话一定是最新的：先把正在跑的旧需求停掉。
+     * 这样「多台设备、多位用户、命令冲突」时，永远只执行最后说的那条。
+     */
+    if (this.runningRequirement && this.runningRequirement.id !== requirement.id) {
+      this.bridge.onSuperseded?.({
+        stopped: this.runningRequirement.id,
+        next: requirement.id,
+        from: '本机用户',
+      });
+      this.runningRequirement = { id: requirement.id, createdAt: requirement.createdAt };
+    }
     const relayResult = await this.relayOut(requirement);
 
     if (this.role !== 'off') {
-      const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message: requirement });
+      const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message: requirement });
       if (this.role === 'hub') {
         const targets = this.peerList().filter((entry) => entry.address);
         const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
@@ -1924,7 +2125,7 @@ export class LanSyncService implements Disposable {
       }
       const response = await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', {
         protocol: SYNC_PROTOCOL_VERSION,
-        code: this.code,
+        code: this.credential(),
         message: requirement,
       }).catch(() => undefined);
       this.bridge.onState?.();
@@ -1963,7 +2164,7 @@ export class LanSyncService implements Disposable {
       this.bridge.onState?.();
       return { ok: true, message: '本机已记录。局域网同步未启用，没有发出。' };
     }
-    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message: note });
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message: note });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
       const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
@@ -1976,7 +2177,7 @@ export class LanSyncService implements Disposable {
     }
     const response = await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', {
       protocol: SYNC_PROTOCOL_VERSION,
-      code: this.code,
+      code: this.credential(),
       message: note,
     }).catch(() => undefined);
     this.bridge.onState?.();
@@ -2016,12 +2217,12 @@ export class LanSyncService implements Disposable {
     this.bridge.onState?.();
     if (this.role === 'off') return { ok: true, message: '已记入团队群（未启用局域网同步，没有发给队友）。', group };
 
-    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message: group });
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message: group });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
       await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     } else {
-      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.code, message: group }).catch(() => undefined);
+      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.credential(), message: group }).catch(() => undefined);
     }
     return { ok: true, message: '已发到团队群。', group };
   }
@@ -2117,12 +2318,12 @@ export class LanSyncService implements Disposable {
     await this.refreshLedger();
     void this.relayOut(report);
     if (this.role === 'off') return;
-    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message: report });
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), message: report });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
       await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     } else {
-      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.code, message: report }).catch(() => undefined);
+      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.credential(), message: report }).catch(() => undefined);
     }
     this.bridge.onState?.();
   }
@@ -2211,6 +2412,73 @@ export class LanSyncService implements Disposable {
     this.bridge.log(`[sync] 主机 ${lost} 连续无响应，已断开（界面不再显示「已连接」）`, 'warn');
     this.bridge.onState?.();
     this.bridge.onHostLost?.(lost);
+  }
+
+  /**
+   * 下一个逻辑时间戳。
+   *
+   * 取「本机时钟」和「见过的时间 +1」的较大值：本机用户刚打的字一定比之前
+   * 任何一条更新；收到别人的消息则把时钟推上去，后续本机消息不会反被判断成旧的。
+   */
+  private nextClock(): number {
+    this.lastClock = Math.max(Date.now(), this.lastClock + 1);
+    return this.lastClock;
+  }
+
+  /** 收到别人的需求时把时钟推上去（Lamport 规则）。 */
+  private observeClock(value: number): void {
+    if (Number.isFinite(value) && value > this.lastClock) this.lastClock = value;
+  }
+
+  /**
+   * 两条需求谁更新。**纯函数式比较**，所有设备算出来一样。
+   *
+   * 先比逻辑时间，再比 id（时间相同时的确定性 tie-break）。
+   */
+  private isNewer(
+    candidate: { id: string; createdAt: number },
+    current: { id: string; createdAt: number } | undefined,
+  ): boolean {
+    if (!current) return true;
+    if (candidate.createdAt !== current.createdAt) return candidate.createdAt > current.createdAt;
+    return candidate.id > current.id;
+  }
+
+  /**
+   * 执行一条需求，并保证「只有最新的那条在跑」。
+   *
+   * 用户明确要求：两台（或更多）设备的用户发的消息冲突时，按时间先后执行，
+   * **执行最新的那条**。所以新需求到达时要把正在跑的旧需求停下来 —
+   * 否则两个 agent 各做一半，改动还会互相覆盖。
+   */
+  private async runNewest(
+    requirement: SyncRequirement,
+    runner: (requirement: SyncRequirement) => Promise<boolean>,
+  ): Promise<'ran' | 'superseded' | 'busy'> {
+    if (!this.isNewer(requirement, this.runningRequirement)) {
+      this.bridge.log(
+        `[sync] 需求 ${requirement.id} 比正在执行的 ${this.runningRequirement?.id ?? ''} 旧，跳过（执行最新的）`,
+      );
+      return 'superseded';
+    }
+    if (this.runningRequirement && this.runningRequirement.id !== requirement.id) {
+      this.bridge.log(
+        `[sync] 有新消息 ${requirement.id}，停掉正在执行的 ${this.runningRequirement.id}（执行最新的）`,
+      );
+      this.bridge.onSuperseded?.({
+        stopped: this.runningRequirement.id,
+        next: requirement.id,
+        from: requirement.from.name,
+      });
+    }
+    this.runningRequirement = { id: requirement.id, createdAt: requirement.createdAt };
+    try {
+      const accepted = await runner(requirement);
+      return accepted ? 'ran' : 'busy';
+    } finally {
+      // 只有自己还是"当前那条"时才清空，避免把后来的需求状态抹掉。
+      if (this.runningRequirement?.id === requirement.id) this.runningRequirement = undefined;
+    }
   }
 
   dispose(): void {

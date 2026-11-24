@@ -34,6 +34,8 @@ export interface LanSetupOptions {
   output: vscode.LogOutputChannel;
   chat: {
     setLanSync(service: LanSyncService | undefined): void;
+    /** 停掉当前正在跑的一轮（有更新的用户消息时用）。 */
+    stop?(): void;
     runSyncRequirement(requirement: import('./lanProtocol').SyncRequirement): Promise<boolean>;
     runSyncNote(note: import('./lanProtocol').SyncNote): Promise<boolean>;
     /** 群窗口里发一句话（需求或回答），由面板决定走哪条路径。 */
@@ -120,11 +122,30 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   /** 频道密钥交接用的本机密钥对（私钥只在 SecretStorage 里）。 */
   const relayHandoffKeyKey = 'hwchat.relay.handoffKey';
   let handoffKeys: HandoffKeyPair | undefined;
+  /**
+   * 本机 GitHub 登录名。
+   *
+   * 用 VS Code 自带的 GitHub 登录（不需要我们自己的服务器），
+   * 拿不到就留空 —— 只是少了「同账号」这一层判断，不阻塞协作。
+   */
+  let githubLogin = '';
+  /** 本机选中的协作项目（空=用工作区文件夹名）。 */
+  let collabProjectName = '';
+  /** 本机所有工作区文件夹名。 */
+  const projects = (): string[] => (vscode.workspace.workspaceFolders ?? [])
+    .map((folder) => basename(folder.uri.fsPath))
+    .filter(Boolean);
 
   const bridge: LanSyncBridge = {
     peer: () => {
       const root = workspaceRoot();
-      return localPeer({ deviceName, version: options.version, project: root ? basename(root) : 'workspace' });
+      return localPeer({
+        deviceName,
+        version: options.version,
+        project: collabProjectName || (root ? basename(root) : 'workspace'),
+        ...(githubLogin ? { login: githubLogin } : {}),
+        ...(projects().length ? { projects: projects() } : {}),
+      });
     },
     runRequirement: (requirement) => chat.runSyncRequirement(requirement),
     runNote: (note) => chat.runSyncNote(note),
@@ -182,6 +203,66 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
             if (choice) await vscode.commands.executeCommand('hwchat.lanSync.openGroup');
           });
       }
+    },
+    /** 本机工作区里的项目名：面板用来展示和选择。 */
+    localProjects: () => (vscode.workspace.workspaceFolders ?? [])
+      .map((folder) => basename(folder.uri.fsPath))
+      .filter(Boolean),
+    /** 本机 GitHub 登录名（拿不到就是空串，不阻塞协作）。 */
+    localLogin: () => githubLogin,
+    /**
+     * 项目不一致：**先追问，不执行**。
+     *
+     * 同账号只是本机还没这个项目 → 提示去拉取/新建；
+     * 不同账号 → 让用户确认要不要继续。
+     */
+    onProjectMismatch: (info) => {
+      const lines = [
+        `对方（${info.from}）在项目「${info.required}」上发来了需求，`,
+        `而这台电脑当前协作的项目是「${info.local}」。`,
+        '',
+        info.sameAccount
+          ? '两边是同一个 GitHub 账号，所以本机把这个项目拉下来就能一起做。'
+          : '两边的 GitHub 账号不同，先确认一下是不是同一个项目。',
+      ];
+      output.warn(`[sync] ${lines.join(' ')}`);
+      void vscode.window
+        .showWarningMessage(
+          lines.join('\n'),
+          '切换到这个项目',
+          info.sameAccount ? '告诉我怎么拉取' : '就当同一个项目继续',
+        )
+        .then(async (choice) => {
+          if (choice === '切换到这个项目') {
+            await service.setCollabProject(info.required);
+            void vscode.window.showInformationMessage(`已切到「${info.required}」。请让对方重发一次需求。`);
+          } else if (choice === '告诉我怎么拉取') {
+            const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+            void vscode.window.showInformationMessage(
+              `在本机打开 <项目根>，执行 git clone 把「${info.required}」拉下来${folder ? `（当前工作区：${folder}）` : ''}，然后重新点「启动群聊」。`,
+            );
+          } else if (choice) {
+            // 用户认定是同一个项目：按本机项目继续，不再反复询问。
+            await service.setCollabProject(info.local);
+            void vscode.window.showInformationMessage('已按「同一个项目」处理，请让对方重发一次需求。');
+          }
+        });
+    },
+    /**
+     * 有更新的用户消息：立刻停掉正在跑的那条。
+     *
+     * 多台设备、多位用户在同一个项目下发命令冲突时，只执行最新的那条。
+     * 不打断旧的，两个 agent 会各做一半、改动互相覆盖。
+     */
+    onSuperseded: (info) => {
+      output.info(`[sync] 有更新的消息（来自 ${info.from}），停止正在执行的需求 ${info.stopped}`);
+      try {
+        chat.stop?.();
+      } catch (error) {
+        output.warn(`[sync] 停止旧需求失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+      void groupPanel?.refresh().catch(() => undefined);
+      refreshStatus();
     },
     /**
      * 主机没了：立刻告诉用户，别让界面继续显示「已连接」。
@@ -328,6 +409,17 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
 
   const service = new LanSyncService(join(context.globalStorageUri.fsPath, 'lan-sync.json'), bridge);
   await service.load();
+  /*
+   * 读一次 GitHub 登录名（静默，不弹登录框）。
+   * 用来判断「多台设备是不是同一个人在协作」—— 不同账号就不该直接往同一项目里写。
+   */
+  try {
+    const session = await vscode.authentication.getSession('github', ['read:user'], { silent: true });
+    githubLogin = session?.account.label ?? '';
+    if (githubLogin) output.info(`[sync] GitHub 账号：${githubLogin}`);
+  } catch {
+    githubLogin = '';
+  }
   /*
    * 把服务交给对话面板 —— **这一步以前漏了**。
    *
@@ -490,18 +582,18 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       const others = service.remotePeers().length;
       const invite = service.currentInviteCode();
       /*
-       * 从机端 `peers` 清单天然为空（主机把它自己那条过滤掉了），
-       * 所以「连上了没有」要看角色，不能只看清单。
+       * 只说「群聊」和台数 —— 「主机/从机」是实现细节，不该出现在界面上。
+       * 群是用户的，两台电脑上的 agent 都只是成员。
        */
-      if (state.role === 'peer') {
-        status.text = `$(broadcast) 已进群 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
-      } else if (others > 0) {
-        status.text = `$(broadcast) 群聊 ${invite} · 已连 ${others} 台`;
-      } else if (invite) {
-        // 开了群还没人进来：把邀请码直接摆在状态栏，用户不用再翻通知。
+      if (others > 0) {
+        status.text = invite
+          ? `$(broadcast) 群聊 ${invite} · ${others + 1} 台`
+          : `$(broadcast) 群聊中 · ${others + 1} 台`;
+      } else if (state.role === 'hub' && invite) {
+        // 开了群还没人进来：把邀请码摆在状态栏，用户不用翻通知。
         status.text = `$(broadcast) 群聊 ${invite} · 等加入`;
       } else {
-        status.text = '$(broadcast) 启动群聊';
+        status.text = '$(broadcast) 群聊中 · 等对方';
       }
       const relayLine = relayState
         ? `\n\n中继：${relayState.connected ? '已连接' : `连不上${relayState.lastError ? `（${relayState.lastError}）` : ''}`}`
@@ -695,13 +787,36 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
        * VS Code 只在后台记录，界面上什么都没有，用户无法判断是在等、还是已经失败。
        */
       try {
-        const result = await vscode.window.withProgress(
+        const attempt = async (force: boolean) => vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: 'HWChat 加入群聊', cancellable: false },
           async (progress) => {
-            progress.report({ message: '正在同一个 WiFi 里找这个邀请码…' });
-            return service.joinGroup(typed, setting('lanSync.port', 47821));
+            progress.report({ message: '正在连接对方的群聊…' });
+            return service.joinGroup(typed, setting('lanSync.port', 47821), undefined, {
+              ...(force ? { allowWhileHosting: true } : {}),
+            });
           },
         );
+        let result = await attempt(false);
+        /*
+         * 自己也在当群主时，先问一句再决定。
+         *
+         * 两台都点「启动群聊」是最常见的操作；默默离开自己的群会让对方
+         * 拿着旧码空等，硬拦又会让人以为坏了 —— 所以给一次明确选择。
+         */
+        if (!result.ok && result.needsSwitch) {
+          const choice = await vscode.window.showWarningMessage(
+            `${result.message}\n要放弃自己的群、改为加入对方的群吗？`,
+            { modal: true },
+            '放弃并加入',
+          );
+          if (choice !== '放弃并加入') {
+            output.info('[sync] 加入群聊：用户选择保留自己的群');
+            return;
+          }
+          service.stop();
+          refreshStatus();
+          result = await attempt(true);
+        }
         output.info(`[sync] 加入群聊：${result.ok ? '成功' : '失败'} — ${result.message}`);
         refreshStatus();
         if (!result.ok) {
@@ -802,6 +917,32 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       } catch {
         void vscode.window.showInformationMessage('同步核对已输出到 HWChat 日志面板。');
       }
+    }),
+    /*
+     * 选择本机参与协作的项目。
+     *
+     * 每台设备各自选一个；两台选到**同名项目**才会一起做同一件事。
+     */
+    vscode.commands.registerCommand('hwchat.lanSync.pickProject', async () => {
+      const folders = projects();
+      if (!folders.length) {
+        void vscode.window.showWarningMessage('当前没有打开任何文件夹。请先打开要协作的项目，再执行这个命令。');
+        return;
+      }
+      const current = service.currentProject() || folders[0];
+      const picked = await vscode.window.showQuickPick(
+        folders.map((name) => ({
+          label: name,
+          description: name === current ? '当前协作项目' : '',
+        })),
+        { title: '选择要参与协作的项目', placeHolder: '另一台设备选同一个项目，才能一起做同一件事' },
+      );
+      if (!picked) return;
+      await service.setCollabProject(picked.label);
+      refreshStatus();
+      void vscode.window.showInformationMessage(
+        `已把「${picked.label}」设为协作项目。请让对方也选同一个项目。`,
+      );
     }),
     vscode.commands.registerCommand('hwchat.lanSync.openGroup', async () => {
       await groupPanel.open();

@@ -77,29 +77,24 @@ export function groupHeader(state: GroupHeaderInput): {
   const relay = state.relay;
   const lanOn = state.role !== 'off';
   const relayOn = !!(relay && relay.connected);
-  if (state.role === 'hub') {
-    return {
-      status: '主机（等待队友）',
-      sub: '甲方提需求，乙方（频道里各台设备上的 agent）先解析、必要时追问，达成一致后才动手。',
-      on: true,
-    };
-  }
+  const members = typeof state.peerCount === 'number' ? state.peerCount : undefined;
+  /*
+   * 对用户只说「群聊」和「几台设备」。
+   *
+   * 主机/从机是实现细节：群是**用户的**，两台电脑上的 agent 都只是成员。
+   * 把「主机（等待队友）」这类字眼露出来，会让人以为某台电脑是"上级"。
+   */
   if (lanOn) {
-    /*
-     * 从机说「已连接」必须真有主机在。
-     * `peerCount` 是**除本机以外**的设备数；主机也算一台，所以至少要 1。
-     * 这里不做网络探测（那是心跳的事），只挡住「一台都不认识还宣称已连接」。
-     */
-    if (typeof state.peerCount === 'number' && state.peerCount < 1) {
+    if (members !== undefined && members < 1) {
       return {
-        status: '正在确认连接',
-        sub: '还没看到主机。如果一直停在这里，说明对方已经不在群里了 —— 请让对方重新点「启动群聊」。',
+        status: '群聊已开 · 等对方加入',
+        sub: '把邀请码复制给对方，让对方点「加入群聊」粘贴进来。两台加入后，在这个窗口说的话两边 agent 会一起做。',
         on: false,
       };
     }
     return {
-      status: '已连接',
-      sub: '甲方提需求，乙方（频道里各台设备上的 agent）先解析、必要时追问，达成一致后才动手。',
+      status: members === undefined ? '群聊中' : `群聊中 · ${members + 1} 台设备`,
+      sub: '每台设备上有一位甲方（你）和一个乙方（agent）。你在哪天说需求都行，群里的乙方先解析、必要时追问，达成一致后才动手。',
       on: true,
     };
   }
@@ -400,7 +395,7 @@ export class GroupPanel implements vscode.Disposable {
     <h1>团队群</h1>
     <span class="pill" id="status">未连接</span>
   </div>
-  <div class="sub" id="sub">甲方提需求，乙方（频道里各台设备上的 agent）先解析、必要时追问，达成一致后才动手。</div>
+  <div class="sub" id="sub">在这个窗口说需求，群里的 agent 先解析、必要时追问，达成一致后才动手。</div>
   <div class="members" id="members"></div>
   <div class="toolbar">
     <button data-command="hwchat.lanSync.openLedger">对齐账本</button>
@@ -439,7 +434,8 @@ const banner = el('banner'), bannerText = el('bannerText'), text = el('text');
 function avatar(who, side) {
   const node = document.createElement('div');
   node.className = 'avatar ' + side;
-  node.textContent = side === 'user' ? '甲' : who.replace(/^.*?·\\s*/, '').slice(0, 1) || '乙';
+  // 角色固定：用户=甲方，agent=乙方。不按平台取首字母，否则每个方块都是 W/M。
+  node.textContent = side === 'user' ? '甲' : '乙';
   return node;
 }
 
@@ -527,8 +523,12 @@ function render(state) {
     node.appendChild(avatar(peer.name, 'agent'));
     const label = document.createElement('span');
     label.textContent = peer.name;
+    /*
+     * 每台设备上都有一位甲方（用户）和一个乙方（agent）。
+     * 标清角色，用户才不会以为另一台只有"一台机器"在跟他协作。
+     */
     const tag = document.createElement('small');
-    tag.textContent = peer.isLocal ? '本机' : '队友';
+    tag.textContent = peer.isLocal ? '本机 · 甲方(你) + 乙方' : '队友 · 甲方 + 乙方';
     node.appendChild(label);
     node.appendChild(tag);
     members.appendChild(node);

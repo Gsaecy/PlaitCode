@@ -129,6 +129,8 @@ test('端到端：配对后主机发需求，对端真的收到并执行；对�
   }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
   await peerWithHook.load();
   await peerWithHook.setPairingCode('TEST-CODE');
+  // 项目对齐：新版本要求「同一个项目」才执行，否则会先追问。
+  await peerWithHook.setCollabProject('app-win');
 
   try {
     const started = await hub.service.startHub(HUB_PORT);
@@ -632,6 +634,156 @@ test('主机没了要能发现：界面不能一直显示「已连接」', async
     peer.dispose();
     await rm(hub.dir, { recursive: true, force: true });
     await rm(peerDir, { recursive: true, force: true });
+  }
+});
+
+test('自己也在当群主时，加入要能返回「需要确认」而不是硬拒或默默离开', async () => {
+  const HUB_PORT = 49_361;
+  const PEER_PORT = 49_362;
+
+  // 两台用**不同的发现端口**，避免它们通过广播自动收敛（现实中广播不通时就是这个状态）。
+  const a = await makeService(winPeer, { discoveryPort: 48_961 });
+  const b = await makeService(macPeer, { discoveryPort: 48_962 });
+
+  try {
+    // 两台都点了「启动群聊」—— 这是最常见的误操作。
+    const startedA = await a.service.startGroup(HUB_PORT);
+    const startedB = await b.service.startGroup(PEER_PORT);
+    assert.equal(startedA.ok, true, startedA.message);
+    assert.equal(startedB.ok, true, startedB.message);
+
+    const blocked = await b.service.joinGroup(`127.0.0.1:${HUB_PORT}#${startedA.code}`, PEER_PORT);
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.needsSwitch, true, '要返回需要确认，交给界面问用户');
+    assert.equal(b.service.state().role, 'hub', '没确认之前不能悄悄退出自己的群');
+
+    // 用户确认后才真正切换。
+    b.service.stop();
+    const switched = await b.service.joinGroup(`127.0.0.1:${HUB_PORT}#${startedA.code}`, PEER_PORT, undefined, {
+      allowWhileHosting: true,
+    });
+    assert.equal(switched.ok, true, switched.message);
+    assert.equal(b.service.state().role, 'peer');
+    assert.equal(a.service.remotePeers().length, 1);
+  } finally {
+    a.service.dispose();
+    b.service.dispose();
+    await rm(a.dir, { recursive: true, force: true });
+    await rm(b.dir, { recursive: true, force: true });
+  }
+});
+
+test('多个设备多个用户：命令冲突时只执行最新的那条，旧的被顶掉', async () => {
+  const HUB_PORT = 49_371;
+  const A_PORT = 49_372;
+  const B_PORT = 49_373;
+
+  const ran: string[] = [];
+  const stopped: string[] = [];
+  const hubDir = await mkdtemp(join(tmpdir(), 'hwchat-sync-'));
+
+  /*
+   * 三台设备在**同一个项目**上（项目对齐是新版本的前提）；
+   * 执行故意不是瞬间结束（真实 agent 要跑好几分钟），
+   * 只有这样才会出现「正在跑的时候又来了一条」。
+   */
+  const sameProject = { ...winPeer, project: 'app' };
+  const hub = new LanSyncService(join(hubDir, 'state.json'), {
+    peer: () => sameProject,
+    runRequirement: async (item) => {
+      ran.push(item.title);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      return true;
+    },
+    runNote: async () => true,
+    writeLedger: async () => undefined,
+    writeTranscript: async () => undefined,
+    log: () => undefined,
+    onSuperseded: (info) => { stopped.push(info.stopped); },
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
+  await hub.load();
+
+  const a = await makeService({ ...macPeer, project: 'app' });
+  const b = await makeService({ id: 'p-linux', name: 'PC · Linux', platform: 'linux', project: 'app', version: 'test' });
+
+  try {
+    const started = await hub.startGroup(HUB_PORT);
+    assert.equal(started.ok, true, started.message);
+    const code = started.code ?? '';
+    assert.equal((await a.service.joinGroup(`127.0.0.1:${HUB_PORT}#${code}`, A_PORT)).ok, true);
+    assert.equal((await b.service.joinGroup(`127.0.0.1:${HUB_PORT}#${code}`, B_PORT)).ok, true);
+
+    /*
+     * 两位用户先后发**冲突**的命令（A 的用户先说，B 的用户后说）。
+     * 群主正在跑第一条时，第二条到达必须把第一条顶掉。
+     */
+    const firstRun = a.service.shareRequirement('把按钮改成红色');
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const secondRun = b.service.shareRequirement('不要红色，改成蓝色');
+    await Promise.all([firstRun, secondRun]);
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    assert.ok(stopped.length >= 1, `正在跑的旧需求必须被叫停（实际被叫停 ${stopped.length} 次）`);
+    assert.ok(ran.length >= 1, '至少执行过一条');
+    assert.equal(
+      ran[ran.length - 1],
+      '不要红色，改成蓝色',
+      `最终执行的必须是**最新**那条，实际执行顺序：${ran.join(' → ')}`,
+    );
+  } finally {
+    hub.dispose();
+    a.service.dispose();
+    b.service.dispose();
+    await rm(hubDir, { recursive: true, force: true });
+    await rm(a.dir, { recursive: true, force: true });
+    await rm(b.dir, { recursive: true, force: true });
+  }
+});
+
+test('只靠邀请码进群后，群消息必须真的能传过去（不能 403）', async () => {
+  const HUB_PORT = 49_391;
+  const PEER_PORT = 49_392;
+
+  /*
+   * 这条是给一个**真实事故**兜底的：
+   * 0.5.0~0.5.7 里「填邀请码进群」之后，主机按旧配对码校验，一律 403 ——
+   * 加入看着成功，但群里发的每一条都传不过去，两台 agent 从来没真正同群。
+   *
+   * 之前所有测试都设了旧配对码，正好绕过了这条路径，所以一直没发现。
+   * 这里**故意不设配对码**，只用邀请码。
+   */
+  const received: string[] = [];
+  const hub = await makeService(winPeer, {
+    onGroupMessage: async (message) => { received.push(String(message.body)); },
+  });
+  const peer = await makeService(macPeer);
+
+  try {
+    const started = await hub.service.startGroup(HUB_PORT);
+    assert.equal(started.ok, true, started.message);
+    // 关键：完全不调用 setPairingCode。
+    const joined = await peer.service.joinGroup(`127.0.0.1:${HUB_PORT}#${started.code}`, PEER_PORT);
+    assert.equal(joined.ok, true, joined.message);
+
+    const posted = await peer.service.postGroup({
+      author: 'user',
+      phase: 'requirement',
+      body: '成员在群里说的一句话',
+    });
+    assert.equal(posted.ok, true, posted.message);
+    assert.ok(
+      received.includes('成员在群里说的一句话'),
+      `群消息被主机拒绝了（403），实际收到：${JSON.stringify(received)}`,
+    );
+
+    // 需求也要能过去（否则对端 agent 根本不会执行）。
+    const shared = await peer.service.shareRequirement('成员提的需求');
+    assert.equal(shared.ok, true, shared.message);
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
   }
 });
 

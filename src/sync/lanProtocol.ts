@@ -44,6 +44,15 @@ export interface SyncPeer {
   platform: SyncPlatform;
   /** 参与协作的项目目录名（同一个 app 的两个版本各有一个）。 */
   project: string;
+  /**
+   * GitHub 登录名（拿得到时才有）。
+   *
+   * 用来判断「是不是同一个人在多台设备上协作」：不同账号的设备不该
+   * 直接往同一个项目里写，得先确认。
+   */
+  login?: string;
+  /** 本机工作区里的其它项目（对方缺这个项目时可以据此拉取）。 */
+  projects?: string[];
   /** 扩展版本，便于排查「两边行为不一致是不是版本不同」。 */
   version: string;
 }
@@ -59,6 +68,8 @@ export interface SyncRequirement {
   title: string;
   detail: string;
   createdAt: number;
+  /** 发起方当时选中的协作项目名：项目不一致时据此追问，而不是直接开跑。 */
+  project?: string;
 }
 
 /** 一条进度报告。 */
@@ -481,11 +492,17 @@ function normalizePeer(value: unknown): SyncPeer | undefined {  if (!value || ty
   const record = value as Record<string, unknown>;
   const id = clip(record.id, 64);
   if (!id) return undefined;
+  const login = clip(record.login, 60);
+  const projects = Array.isArray(record.projects)
+    ? record.projects.map((item) => clip(item, 80)).filter(Boolean).slice(0, 60)
+    : [];
   return {
     id,
     name: clip(record.name, 60) || id,
     platform: isSyncPlatform(record.platform) ? record.platform : 'linux',
     project: clip(record.project, 80),
+    ...(login ? { login } : {}),
+    ...(projects.length ? { projects } : {}),
     version: clip(record.version, 20),
   };
 }

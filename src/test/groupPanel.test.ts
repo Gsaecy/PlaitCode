@@ -63,25 +63,25 @@ test('顶部状态：局域网没连但中继通着，必须是「已连接」�
   // 完全没有中继配置时和以前一样
   assert.equal(groupHeader({ role: 'off' }).status, '未连接');
 
-  // 局域网连上时以局域网为准（更快的直连路径）
-  assert.equal(groupHeader({ role: 'hub', relay: { connected: true, peers: 1, url: 'x' } }).status, '主机（等待队友）');
-  assert.equal(groupHeader({ role: 'peer' }).status, '已连接');
+  // 局域网里以「群聊 + 台数」表达，不暴露主机/从机
+  assert.equal(groupHeader({ role: 'hub', peerCount: 0 }).status, '群聊已开 · 等对方加入');
+  assert.equal(groupHeader({ role: 'hub', peerCount: 1, relay: { connected: true, peers: 1, url: 'x' } }).status, '群聊中 · 2 台设备');
+  assert.equal(groupHeader({ role: 'peer' }).status, '群聊中');
 });
 
-test('顶部状态：从机一台设备都不认识时，不能说「已连接」', () => {
+test('顶部状态：一台设备都没看到时，不能说「群聊中」', () => {
   /*
-   * 真机踩过：主机早就重启了，从机界面还挂着「已连接」和上一份群记录，
-   * 两台看到的群完全不一样。除本机以外一个设备都没有，就不该说已连接。
+   * 真机踩过：对方早就重启了，本机界面还挂着「已连接」和上一份群记录，
+   * 两台看到的群完全不一样。除本机以外一个设备都没有，就不该说在群里。
    */
   const stale = groupHeader({ role: 'peer', peerCount: 0 });
-  assert.equal(stale.on, false, '没有主机时状态灯不能是绿的');
-  assert.equal(stale.status, '正在确认连接');
-  assert.match(stale.sub, /重新点「启动群聊」/);
+  assert.equal(stale.on, false, '没有对方时状态灯不能是绿的');
+  assert.equal(stale.status, '群聊已开 · 等对方加入');
+  assert.match(stale.sub, /邀请码/);
 
-  // 看到了主机才允许说已连接
-  assert.equal(groupHeader({ role: 'peer', peerCount: 1 }).status, '已连接');
-  // 主机端本来就是「等待队友」，不受影响
-  assert.equal(groupHeader({ role: 'hub', peerCount: 0 }).status, '主机（等待队友）');
+  // 看到了对方才算真的在群里
+  assert.equal(groupHeader({ role: 'peer', peerCount: 1 }).status, '群聊中 · 2 台设备');
+  assert.equal(groupHeader({ role: 'peer', peerCount: 2 }).status, '群聊中 · 3 台设备');
 });
 
 /**
