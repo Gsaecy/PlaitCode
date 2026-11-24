@@ -435,3 +435,39 @@ test('配对信息可以带设备令牌：新设备粘一次就够，旧格式�
   const bogus = parsePairingText(`plaitcode://join?u=https%3A%2F%2Fx.com&s=${secret}&t=not-a-token`)!;
   assert.equal(bogus.deviceToken, undefined);
 });
+test('PWA：manifest / sw.js / 图标都能取到，且 service worker 不动 /v1/', async () => {
+  const relay = await createRelayServer({ port: 0, rateLimit: 3 });
+  const base = `http://127.0.0.1:${relay.port}`;
+  try {
+    // 静态资源不占限流额度（否则刷几次页面就 429）
+    for (let index = 0; index < 6; index += 1) {
+      assert.equal((await fetch(`${base}/manifest.webmanifest`)).status, 200);
+    }
+
+    const manifest = await (await fetch(`${base}/manifest.webmanifest`)).json() as {
+      name: string; start_url: string; display: string; icons: Array<{ src: string }>;
+    };
+    assert.equal(manifest.start_url, '/m');
+    assert.equal(manifest.display, 'standalone', '必须全屏，不能带地址栏');
+    assert.ok(manifest.icons.length > 0);
+
+    const sw = await fetch(`${base}/sw.js`);
+    assert.equal(sw.status, 200);
+    assert.match(sw.headers.get('content-type') ?? '', /javascript/);
+    const code = await sw.text();
+    assert.match(code, /\/v1\//, 'service worker 必须显式绕开接口请求');
+    assert.match(code, /indexOf\('\/v1\/'\) === 0\) return/, '接口请求要直接 return，不能进缓存分支');
+
+    const icon = await fetch(`${base}/icon.svg`);
+    assert.equal(icon.status, 200);
+    assert.match(icon.headers.get('content-type') ?? '', /svg/);
+
+    const page = await (await fetch(`${base}/m`, { headers: { host: 'plaitcode.com' } })).text();
+    assert.match(page, /rel="manifest"/);
+    assert.match(page, /apple-mobile-web-app-capable/);
+    assert.match(page, /serviceWorker\.register/);
+    assert.match(page, /manifest-src/);
+  } finally {
+    await relay.close();
+  }
+});

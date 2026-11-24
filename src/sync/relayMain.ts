@@ -70,6 +70,7 @@ async function main(): Promise<void> {
     : undefined;
   if (sso) console.log('[relay] 飞书登录已启用');
   else if (feishuAppId) console.log('[relay] 警告：飞书登录需要 PLAITCODE_AUTH_SECRET 与身份库（PLAITCODE_IDENTITY）');
+  if (process.env.PLAITCODE_FEISHU_WEBHOOK?.trim()) console.log('[relay] 飞书机器人通知已启用');
 
   const handle = await createRelayServer({
     port: Number.isFinite(port) && port > 0 ? port : 8787,
@@ -80,6 +81,7 @@ async function main(): Promise<void> {
     ...(sso ? { auth: sso } : {}),
     ...(historyDir ? { historyDir } : {}),
     ...(process.env.PLAITCODE_SELF_ENROLL === '0' ? { selfEnroll: false } : {}),
+    ...(process.env.PLAITCODE_FEISHU_WEBHOOK?.trim() ? { notifyHook: process.env.PLAITCODE_FEISHU_WEBHOOK.trim() } : {}),
     audit: {
       ...(auditPath && auditPath !== '-' ? { path: auditPath } : {}),
       sink: ((line: string) => {

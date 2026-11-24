@@ -22,7 +22,14 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0f1115">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PlaitCode">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data: 'self'; manifest-src 'self'; worker-src 'self'">
 <title>PlaitCode · 团队群</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a; --text:#e5e7eb; --muted:#9aa3b2;
@@ -448,13 +455,55 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     });
   }
 
+  /**
+   * 未登录 → 跳飞书登录。
+   *
+   * 这一步是"扫码一次走完"的关键：密钥已经存在 localStorage 里，
+   * 登录回来落在 /m 会自己接着用，不需要用户再粘一遍配对信息。
+   * 用 sessionStorage 记账：万一 SSO 没配好（返回 404），不许无限跳。
+   */
+  var loginAttempted = false;
+  function redirectToLogin() {
+    if (loginAttempted) return false;
+    try {
+      if (sessionStorage.getItem('plaitcode.loginRedirect') === '1') {
+        loginAttempted = true;
+        return false;
+      }
+    } catch (error) {}
+    loginAttempted = true;
+    say('需要先用飞书登录，正在跳转…');
+    try { sessionStorage.setItem('plaitcode.loginRedirect', '1'); } catch (error) {}
+    setTimeout(function () { location.replace('/v1/auth/feishu/start'); }, 400);
+    return true;
+  }
+
+  /** 先确认登录态：没有就直接去登录，别等轮询 401 才发现。 */
+  function ensureSession() {
+    if (!SESSION_AUTH) return Promise.resolve(true);
+    return fetch('/v1/auth/me', { credentials: 'same-origin' })
+      .then(function (r) {
+        if (r.ok) {
+          try { sessionStorage.removeItem('plaitcode.loginRedirect'); } catch (error) {}
+          return true;
+        }
+        if (r.status === 401) return false;
+        // 404 = 服务端没开 SSO；这种情况下别跳，否则会跳到 404
+        return true;
+      })
+      .catch(function () { return true; });
+  }
+
   function poll() {
     if (busy) return;
     busy = true;
     var url = '/v1/poll?channel=' + encodeURIComponent(keys.channel) + '&since=' + since + '&wait=20';
     fetch(url, { credentials:'same-origin', headers: authHeaders() })
       .then(function (r) {
-        if (r.status === 401) throw new Error(SESSION_AUTH ? '登录已过期，请重新用飞书登录' : '需要登录才能看这个频道');
+        if (r.status === 401) {
+          if (redirectToLogin()) throw new Error('正在跳转登录');
+          throw new Error(SESSION_AUTH ? '登录已过期，请重新用飞书登录' : '需要登录才能看这个频道');
+        }
         if (r.status === 403) throw new Error(SESSION_AUTH ? '没有这个频道的权限（找管理员授权设备）' : '频道密钥不对');
         return r.json();
       })
@@ -553,22 +602,25 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     history.replaceState(null, '', location.pathname);
     say('正在连接…');
     deriveKeys().then(function (ready) {
-      keys = ready;
-      deviceId = localStorage.getItem('plaitcode.relay.device');
-      if (!deviceId) {
-        deviceId = 'web' + Math.random().toString(36).slice(2, 10);
-        localStorage.setItem('plaitcode.relay.device', deviceId);
-      }
-      footer.style.display = 'flex';
-      presence();
-      setInterval(presence, 30000);
-      poll();
-      setInterval(poll, 1500);
-      // 连上就问一次电脑的真实设置：否则界面上的权限/步数是空的
-      setTimeout(function () { sendControl({ action: 'state' }); }, 800);
-      renderControls();
-      document.addEventListener('visibilitychange', function () {
-        if (!document.hidden) { sendControl({ action: 'state' }); poll(); }
+      return ensureSession().then(function (loggedIn) {
+        if (!loggedIn) { redirectToLogin(); return; }
+        keys = ready;
+        deviceId = localStorage.getItem('plaitcode.relay.device');
+        if (!deviceId) {
+          deviceId = 'web' + Math.random().toString(36).slice(2, 10);
+          localStorage.setItem('plaitcode.relay.device', deviceId);
+        }
+        footer.style.display = 'flex';
+        presence();
+        setInterval(presence, 30000);
+        poll();
+        setInterval(poll, 1500);
+        // 连上就问一次电脑的真实设置：否则界面上的权限/步数是空的
+        setTimeout(function () { sendControl({ action: 'state' }); }, 800);
+        renderControls();
+        document.addEventListener('visibilitychange', function () {
+          if (!document.hidden) { sendControl({ action: 'state' }); poll(); }
+        });
       });
     }).catch(function () { say('浏览器不支持 WebCrypto，无法加密'); });
   }
@@ -585,6 +637,13 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     boot(stored);
   } else {
     joinForm('');
+  }
+
+  // 可安装：注册 service worker（它不经手 /v1/，只负责让页面能装到主屏幕）
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('/sw.js').catch(function () {});
+    });
   }
 })();
 </script>

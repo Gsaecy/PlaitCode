@@ -154,6 +154,30 @@ export async function enrollRelayDevice(
   }
 }
 
+/**
+ * 让中继帮我们发一条飞书机器人通知（webhook 配在服务器上，不在每台开发机上）。
+ *
+ * 失败绝不抛给调用方：通知是附加收益，不能因为它把主流程搞挂。
+ */
+export async function notifyRelay(
+  baseUrl: string,
+  deviceToken: string,
+  payload: { kind: 'approval' | 'done' | 'blocked'; title: string; summary: string; source?: string },
+): Promise<{ ok: boolean; message: string }> {
+  try {
+    const response = await relayRequest(
+      `${baseUrl.replace(/\/+$/, '')}/v1/notify`,
+      { method: 'POST', body: payload, timeoutMs: 8_000 },
+      { authorization: `Bearer ${deviceToken.trim()}` },
+    );
+    if (response.status === 200 && response.body?.ok === true) return { ok: true, message: '已推送' };
+    const reason = typeof response.body?.error === 'string' ? response.body.error : `HTTP ${response.status}`;
+    return { ok: false, message: reason };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export class RelayClient implements Disposable {
   private readonly keys: RelayKeys;
   private readonly base: string;

@@ -12,7 +12,9 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { AuditLog, type AuditOptions } from './relayAudit';
 import { createChannelHistory } from './relayHistory';
+import { sendFeishuNotify, type NotifyPayload } from './relayNotify';
 import { renderRelayMobilePage } from './relayPage';
+import { APP_ICON_SVG, SERVICE_WORKER_JS, renderManifest } from './relayPwa';
 import { parseCookies } from './mobileControl';
 import {
   addDevice,
@@ -73,6 +75,13 @@ export interface RelayOptions {
    * 不填就不落盘，行为与之前一致（内存态，重启丢消息）。
    */
   historyDir?: string;
+  /**
+   * 飞书自定义机器人 webhook：任务完成 / 需要批准时推送到飞书。
+   *
+   * 为什么用机器人而不是 Web Push：iPhone 上 Web Push 要求"加到主屏幕"且限制多，
+   * 而目标客户本来就在飞书里办公，通知落在飞书最容易被看到。
+   */
+  notifyHook?: string;
   /**
    * 允许已登记的设备给自己的另一台设备签发令牌（默认开）。
    *
@@ -303,9 +312,10 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       const route = rawUrl.split('?')[0] ?? '/';
       const query = new URLSearchParams(rawUrl.slice(rawUrl.indexOf('?') + 1));
 
-      // 健康检查与手机页面不限流：探活和首次打开都不该占用户额度。
+      // 健康检查、手机页面与 PWA 静态资源不限流：探活和首次打开都不该占用户额度。
       const isHealth = route === '/health' || route === '/';
-      const isStatic = isHealth || route === '/m';
+      const isPwa = route === '/manifest.webmanifest' || route === '/sw.js' || route === '/icon.svg';
+      const isStatic = isHealth || isPwa || route === '/m';
       if (!isStatic) {
         const ip = clientIp(request);
         if (!allowed(ip)) {
@@ -315,8 +325,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         }
       }
 
-      if (request.method === 'GET' && route === '/m') {
-        const html = renderRelayMobilePage({
+      if (request.method === 'GET' && route === '/m') {        const html = renderRelayMobilePage({
           relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com',
           // 身份模式下手机不再出示频道密钥，改用登录后的会话 Cookie
           sessionAuth: Boolean(identity),
@@ -330,6 +339,45 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           'referrer-policy': 'no-referrer',
         });
         response.end(html);
+        return;
+      }
+
+      /* ---------------- PWA 静态资源 ---------------- */
+
+      if (request.method === 'GET' && route === '/manifest.webmanifest') {
+        const manifest = renderManifest();
+        response.writeHead(200, {
+          'content-type': 'application/manifest+json; charset=utf-8',
+          'content-length': Buffer.byteLength(manifest),
+          'cache-control': 'public, max-age=3600',
+          'x-content-type-options': 'nosniff',
+        });
+        response.end(manifest);
+        return;
+      }
+
+      if (request.method === 'GET' && route === '/sw.js') {
+        response.writeHead(200, {
+          'content-type': 'application/javascript; charset=utf-8',
+          'content-length': Buffer.byteLength(SERVICE_WORKER_JS),
+          // service worker 必须能及时更新，否则改了逻辑用户永远拿到旧的
+          'cache-control': 'no-cache',
+          // 让它能接管根作用域
+          'service-worker-allowed': '/',
+          'x-content-type-options': 'nosniff',
+        });
+        response.end(SERVICE_WORKER_JS);
+        return;
+      }
+
+      if (request.method === 'GET' && route === '/icon.svg') {
+        response.writeHead(200, {
+          'content-type': 'image/svg+xml; charset=utf-8',
+          'content-length': Buffer.byteLength(APP_ICON_SVG),
+          'cache-control': 'public, max-age=86400',
+          'x-content-type-options': 'nosniff',
+        });
+        response.end(APP_ICON_SVG);
         return;
       }
 
@@ -521,6 +569,59 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           device: { id: created.device.id, name: created.device.name, grants: created.device.grants },
           token: created.token,
         });
+        return;
+      }
+
+      /* ---------------- 飞书机器人通知 ---------------- */
+
+      if (route === '/v1/notify' && request.method === 'POST') {
+        const hook = options.notifyHook?.trim();
+        if (!hook) {
+          json(response, 404, { ok: false, error: 'notify disabled' });
+          return;
+        }
+        const token = bearer(request);
+        const device = identity && token ? deviceByToken(identity.state, token) : undefined;
+        if (identity && (!device || device.revokedAt)) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: 'notify auth failed' });
+          json(response, 403, { ok: false, error: '需要用已登记的设备令牌调用' });
+          return;
+        }
+        const raw = await readBody(request);
+        if (raw === undefined) {
+          json(response, 413, { ok: false, error: 'body too large' });
+          return;
+        }
+        let body: { kind?: unknown; title?: unknown; summary?: unknown; source?: unknown } = {};
+        try {
+          body = raw ? JSON.parse(raw) as typeof body : {};
+        } catch {
+          json(response, 400, { ok: false, error: 'invalid json' });
+          return;
+        }
+        const kind: 'approval' | 'done' | 'blocked' | undefined = body.kind === 'approval' || body.kind === 'done' || body.kind === 'blocked'
+          ? body.kind
+          : undefined;
+        if (!kind) {
+          json(response, 400, { ok: false, error: 'kind must be approval/done/blocked' });
+          return;
+        }
+        const payload: NotifyPayload = {
+          kind,
+          title: String(body.title ?? '').slice(0, 120),
+          summary: String(body.summary ?? '').slice(0, 500),
+          ...(typeof body.source === 'string' ? { source: body.source.slice(0, 120) } : {}),
+        };
+        const publicUrl = options.auth?.config?.redirectUri
+          ? (() => { try { return new URL(options.auth!.config.redirectUri).origin; } catch { return ''; } })()
+          : '';
+        const result = await sendFeishuNotify(hook, payload, publicUrl ? `${publicUrl}/m` : '');
+        audit.record({
+          event: 'admin',
+          ip: clientIp(request),
+          detail: `notify ${kind} -> ${result.ok ? 'sent' : `failed: ${result.error}`}`,
+        });
+        json(response, result.ok ? 200 : 502, result.ok ? { ok: true } : { ok: false, error: result.error });
         return;
       }
 

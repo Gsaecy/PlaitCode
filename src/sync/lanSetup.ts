@@ -22,7 +22,7 @@ import { LanSyncService, defaultDeviceName, defaultPlatform, lanAddresses, peerI
 import { GroupPanel } from '../views/groupPanel';
 import { MobilePanel } from '../views/mobilePanel';
 import { RelayPhonePanel } from '../views/relayPhonePanel';
-import { RelayClient, enrollRelayDevice } from './relayClient';
+import { RelayClient, enrollRelayDevice, notifyRelay } from './relayClient';
 import { tt } from '../core/i18n';
 import { buildPairingText, deriveKeys, newPairingSecret, parsePairingText } from './relayCrypto';
 
@@ -195,6 +195,23 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       void relay.send(message).then((result) => {
         if (!result.ok) output.warn(`[relay] ${result.message}`);
       });
+      /*
+       * 需要批准时推一条飞书：人可能已经离开电脑，只有推送能把他叫回来。
+       * 只发标题与摘要（元数据），不发命令全文。
+       */
+      if (message.kind === 'approval' && message.phase === 'request' && relayDeviceToken) {
+        const url = relayUrl();
+        if (url) {
+          void notifyRelay(url, relayDeviceToken, {
+            kind: 'approval',
+            title: message.title,
+            summary: message.summary,
+            source: `${bridge.peer().name} · ${bridge.peer().project}`,
+          }).then((sent) => {
+            if (!sent.ok) output.warn(`[relay] 飞书通知没发出去：${sent.message}`);
+          });
+        }
+      }
     },
     /**
      * 手机发来的远程控制：改权限档位 / 改步数 / 中止当前任务。
@@ -252,6 +269,18 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       output.info(`[relay] 甲方需求${result.ok ? '已完成' : '未完成'}：${result.files.length} 个文件`);
       void service.postGroup({ author: 'agent', phase: result.ok ? 'result' : 'blocked', body })
         .catch((error: unknown) => output.warn(`[relay] 结果回传失败：${error instanceof Error ? error.message : String(error)}`));
+      /* 跑完了也推一条：用户不用一直盯着手机。 */
+      const notifyUrl = relayUrl();
+      if (notifyUrl && relayDeviceToken) {
+        void notifyRelay(notifyUrl, relayDeviceToken, {
+          kind: result.ok ? 'done' : 'blocked',
+          title: text.split('\n')[0]?.slice(0, 80) ?? '',
+          summary: result.summary ? result.summary.replace(/\s+/g, ' ').slice(0, 200) : '',
+          source: `${bridge.peer().name} · ${bridge.peer().project}`,
+        }).then((sent) => {
+          if (!sent.ok) output.warn(`[relay] 飞书通知没发出去：${sent.message}`);
+        });
+      }
     }),
   };
 
