@@ -12,8 +12,10 @@
 
 import { CHANNEL_PREFIX, ENC_PREFIX, RELAY_PREFIX } from './relayCrypto';
 
-export function renderRelayMobilePage(options: { relayHost: string }): string {
+export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?: boolean }): string {
   const host = options.relayHost.replace(/[<>&"]/g, '');
+  // 身份模式下手机凭登录 Cookie 鉴权（密钥只用于解密，不再当票据用）
+  const sessionAuth = options.sessionAuth === true;
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -84,6 +86,7 @@ export function renderRelayMobilePage(options: { relayHost: string }): string {
 <script>
 (function () {
   var KEY_STORE = 'plaitcode.relay.key';
+  var SESSION_AUTH = ${sessionAuth ? 'true' : 'false'};
   var PHASES = { requirement:'需求', analysis:'解析', question:'追问', answer:'回复', confirm:'确认', progress:'进度', result:'结果' };
   var main = document.getElementById('main');
   var footer = document.getElementById('footer');
@@ -133,10 +136,14 @@ export function renderRelayMobilePage(options: { relayHost: string }): string {
     ).then(function (buf) { return JSON.parse(new TextDecoder().decode(buf)); }).catch(function () { return null; });
   }
 
+  function authHeaders() {
+    return SESSION_AUTH ? {} : { authorization: 'Bearer ' + keys.relay };
+  }
+
   function post(path, body) {
     return fetch(path, {
       method:'POST', credentials:'same-origin',
-      headers:{ 'content-type':'application/json', authorization:'Bearer ' + keys.relay },
+      headers: Object.assign({ 'content-type':'application/json' }, authHeaders()),
       body: JSON.stringify(body)
     }).then(function (r) { return r.json().catch(function () { return {}; }); });
   }
@@ -198,9 +205,10 @@ export function renderRelayMobilePage(options: { relayHost: string }): string {
     if (busy) return;
     busy = true;
     var url = '/v1/poll?channel=' + encodeURIComponent(keys.channel) + '&since=' + since + '&wait=20';
-    fetch(url, { credentials:'same-origin', headers:{ authorization:'Bearer ' + keys.relay } })
+    fetch(url, { credentials:'same-origin', headers: authHeaders() })
       .then(function (r) {
-        if (r.status === 401 || r.status === 403) throw new Error('频道密钥不对');
+        if (r.status === 401) throw new Error(SESSION_AUTH ? '登录已过期，请重新用飞书登录' : '需要登录才能看这个频道');
+        if (r.status === 403) throw new Error(SESSION_AUTH ? '没有这个频道的权限（找管理员授权设备）' : '频道密钥不对');
         return r.json();
       })
       .then(function (result) {

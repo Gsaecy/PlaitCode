@@ -25,6 +25,12 @@ export interface RelayClientOptions {
   url: string;
   secret: string;
   device: SyncPeer;
+  /**
+   * 企业身份模式下的设备令牌。
+   *
+   * 有它就用它做 Bearer；没有就退回频道密钥（自建/内网场景没开身份层时照旧可用）。
+   */
+  deviceToken?: string;
   /** 收到一条能解开的对端消息。返回值忽略，异常只记日志。 */
   onMessage: (message: SyncMessage) => Promise<void> | void;
   onStatus?: (status: RelayStatus) => void;
@@ -140,6 +146,12 @@ export class RelayClient implements Disposable {
     return buildPairingText(this.base, this.options.secret);
   }
 
+  /** 身份模式下用设备令牌，否则用频道密钥。 */
+  private authHeaders(): Record<string, string> {
+    const token = this.options.deviceToken?.trim();
+    return { authorization: `Bearer ${token || this.keys.relay}` };
+  }
+
   status(): RelayStatus {
     return {
       connected: this.running && !this.lastError,
@@ -186,7 +198,7 @@ export class RelayClient implements Disposable {
         method: 'POST',
         body: { channel: this.keys.channel, id, from: this.options.device.id, envelope },
         timeoutMs: 15_000,
-      }, { authorization: `Bearer ${this.keys.relay}` });
+      }, this.authHeaders());
       if (response.status !== 200 || response.body?.ok !== true) {
         const reason = typeof response.body?.error === 'string' ? response.body.error : `HTTP ${response.status}`;
         return { ok: false, message: `中转拒绝：${reason}` };
@@ -216,11 +228,11 @@ export class RelayClient implements Disposable {
           },
         },
         timeoutMs: 8_000,
-      }, { authorization: `Bearer ${this.keys.relay}` });
+      }, this.authHeaders());
       const devices = Array.isArray(response.body?.devices) ? response.body.devices : [];
       this.peers = Math.max(0, devices.length - 1);
       if (response.status === 403) {
-        this.lastError = '频道密钥不匹配';
+        this.lastError = '频道未授权（身份模式下需先登记设备令牌）';
       } else if (response.status === 200) {
         this.lastError = undefined;
       }
@@ -254,11 +266,11 @@ export class RelayClient implements Disposable {
           method: 'GET',
           timeoutMs: (wait + 8) * 1000,
           onAbort: (abort) => { this.abortPoll = abort; },
-        }, { authorization: `Bearer ${this.keys.relay}` });
+        }, this.authHeaders());
         this.abortPoll = undefined;
         if (!this.running) break;
         if (response.status === 403) {
-          this.fail(new Error('频道密钥不匹配（检查两台设备的配对信息是否一致）'));
+          this.fail(new Error('中转拒绝了本机：身份模式下要先用「PlaitCode: 登记本机设备令牌」'));
           await sleep(MAX_BACKOFF_MS);
           continue;
         }

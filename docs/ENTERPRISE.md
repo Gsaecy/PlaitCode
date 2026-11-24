@@ -172,6 +172,36 @@ POST /v1/auth/logout           → 清 Cookie
 不需要重建账号。
 
 
+### 开启身份模式后，客户端怎么配
+
+`PLAITCODE_IDENTITY` 一开，中转的 `publish/poll/presence` 就**只认设备令牌**；频道密钥全部失效。
+顺序别搞反，否则会看到一片 403：
+
+1. **管理员发设备令牌**（每个开发者每台电脑一个）：
+
+   ```bash
+   curl -s -X POST https://<你的域名>/v1/admin/devices \
+     -H "x-plaitcode-admin: $ADMIN" -H 'content-type: application/json' \
+     -d '{"memberId":"mem_xxx","name":"小王-笔记本","platform":"win32",
+          "channels":[{"channelId":"<32 位频道 ID>","role":"member"}]}'
+   ```
+
+   响应里的 `token` **只显示这一次**（库里只存哈希），直接发给对应开发者。
+
+2. **开发者登记令牌**：命令面板 →「PlaitCode: 登记本机设备令牌」→ 粘贴。
+   令牌存进 SecretStorage（不进 `settings.json`），扩展激活时自动读取并重连；留空提交即清除。
+
+3. **频道 ID 从哪来**：「PlaitCode: 查看跨网中继状态」会显示完整的 32 位十六进制串，
+   管理员授权设备时用的就是它。
+
+4. **手机**：命令面板 →「PlaitCode: 手机加入团队群（二维码）」扫码；
+   身份模式下手机页用**登录 Cookie** 鉴权，频道密钥只用于解密，不再当票据。
+
+手机为什么会话鉴权能过：`authorizeSession` 按「成员 + 频道归属」判断——
+同组织里任意一台**未吊销**设备被授予过该频道，这个频道就算该组织的；
+组织内 `viewer` 只读、`member` 及以上可发；**跨组织一律拒绝**。
+设备被吊销后，同组织成员也随之失去该频道访问。
+
 ### 企业策略（`policy.json`）
 
 放在工作区 `.plaitcode/policy.json`，或用 MDM / 仓库模板统一下发：

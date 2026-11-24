@@ -23,7 +23,7 @@ import { GroupPanel } from '../views/groupPanel';
 import { MobilePanel } from '../views/mobilePanel';
 import { RelayPhonePanel } from '../views/relayPhonePanel';
 import { RelayClient } from './relayClient';
-import { buildPairingText, newPairingSecret, parsePairingText } from './relayCrypto';
+import { buildPairingText, deriveKeys, newPairingSecret, parsePairingText } from './relayCrypto';
 
 export interface LanSetupOptions {
   context: vscode.ExtensionContext;
@@ -79,6 +79,9 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   /** 频道密钥：SecretStorage 是异步的，这里缓存一份，供同步拼手机链接用。 */
   let relayKey = '';
   const relaySecretKey = 'plaitcode.relay.secret';
+  /** 企业身份模式下的设备令牌（SecretStorage，不进 settings.json）。 */
+  let relayDeviceToken = '';
+  const relayDeviceTokenKey = 'plaitcode.relay.deviceToken';
 
   const bridge: LanSyncBridge = {
     peer: () => {
@@ -231,6 +234,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       url,
       secret,
       device: bridge.peer(),
+      ...(relayDeviceToken ? { deviceToken: relayDeviceToken } : {}),
       onMessage: async (message) => {
         await service.ingestRelayMessage(message);
         await groupPanel.refresh().catch(() => undefined);
@@ -242,7 +246,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       },
     });
     relay.start();
-    output.info(`[relay] 已连接 ${url}（频道 ${relay.status().channel.slice(0, 8)}…）`);
+    output.info(`[relay] 已连接 ${url}（频道 ${relay.status().channel.slice(0, 8)}…，${relayDeviceToken ? '设备令牌' : '频道密钥'}鉴权）`);
   };
   // 设置里填了固定配对码就以设置为准（高级用法；正常流程根本不需要）。
   const configuredCode = setting('lanSync.pairingCode', '').trim();
@@ -424,8 +428,33 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       }
       void vscode.window.showInformationMessage(
         `跨网中继：${state.connected ? '已连接' : '未连接'}${state.lastError ? `（${state.lastError}）` : ''}\n`
-        + `${state.url}\n频道 ${state.channel.slice(0, 8)}… · 在线设备 ${state.peers + 1} 台 · 收到 ${state.received} 条 / 发出 ${state.sent} 条`,
+        + `${state.url}\n频道 ${state.channel}（授权设备时用这个 ID）\n`
+        + `在线设备 ${state.peers + 1} 台 · 收到 ${state.received} 条 / 发出 ${state.sent} 条 · ${relayDeviceToken ? '设备令牌鉴权' : '频道密钥鉴权'}`,
       );
+    }),
+    /**
+     * 登记设备令牌：开了身份模式的中转只认设备令牌（手机走登录 Cookie）。
+     * 令牌由管理员在服务器上生成、只显示一次，这里存进 SecretStorage。
+     */
+    vscode.commands.registerCommand('plaitcode.relay.device', async () => {
+      const secret = await context.secrets.get(relaySecretKey);
+      const channel = secret ? deriveKeys(secret).channel : '';
+      const token = await vscode.window.showInputBox({
+        title: '登记本机设备令牌',
+        prompt: channel ? `频道 ID：${channel}　（管理员给这台设备授权时要用它）` : '还没加入频道：先「新建跨网频道」或「加入跨网频道」',
+        placeHolder: '粘贴管理员生成的一次性设备令牌；留空表示清除',
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (token === undefined) return;
+      const trimmed = token.trim();
+      if (trimmed) await context.secrets.store(relayDeviceTokenKey, trimmed);
+      else await context.secrets.delete(relayDeviceTokenKey);
+      relayDeviceToken = trimmed;
+      const url = relayUrl();
+      if (url && secret) startRelay(url, secret);
+      refreshStatus();
+      void vscode.window.showInformationMessage(trimmed ? '设备令牌已保存，正用新令牌重连中继。' : '已清除设备令牌，改回频道密钥鉴权。');
     }),
     vscode.commands.registerCommand('plaitcode.relay.leave', async () => {
       relay?.stop();
@@ -541,6 +570,8 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   /*
    * 中继自动恢复：上次加入过频道就继续连着，打开窗口即可跨网络收发。
    */
+  const storedDeviceToken = await context.secrets.get(relayDeviceTokenKey);
+  if (storedDeviceToken) relayDeviceToken = storedDeviceToken;
   const storedRelaySecret = await context.secrets.get(relaySecretKey);
   if (storedRelaySecret && relayUrl()) startRelay(relayUrl(), storedRelaySecret);
   relayKey = storedRelaySecret ?? '';

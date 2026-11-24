@@ -8,6 +8,7 @@ import {
   addMember,
   addOrg,
   authorize,
+  authorizeSession,
   deviceByToken,
   emptyIdentity,
   findMemberByIdentity,
@@ -130,5 +131,39 @@ test('按 SSO 身份认人：邮箱优先，没邮箱就退到 open_id，再退�
   assert.equal(findMemberByIdentity(state, { openId: 'ou_other', unionId: 'on_xyz' })?.id, byUnionId.id, 'open_id 没命中再试 union_id');
   assert.equal(findMemberByIdentity(state, { email: 'nobody@honor-world.com' }), undefined);
   assert.equal(findMemberByIdentity(state, {}), undefined);
+});
+
+test('会话鉴权：手机没有设备令牌时按「成员 + 频道归属」放行，跨组织拒绝', () => {
+  const state = emptyIdentity();
+  const acme = addOrg(state, 'Acme');
+  const other = addOrg(state, 'Other');
+  const dev = addMember(state, { orgId: acme.id, name: '开发', role: 'member' })!;
+  const viewer = addMember(state, { orgId: acme.id, name: '访客', role: 'viewer' })!;
+  const outsider = addMember(state, { orgId: other.id, name: '外人', role: 'member' })!;
+  const channel = 'a'.repeat(32);
+
+  // 开发的笔记本被授予了这个频道，频道就算 Acme 组织的
+  const laptop = addDevice(state, { memberId: dev.id, name: '笔记本', channels: [{ channelId: channel, role: 'member' }] })!;
+  assert.ok(laptop.token);
+
+  assert.equal(authorizeSession(state, dev.id, channel, 'publish').ok, true, '自己的设备有授权就能发');
+  assert.equal(authorizeSession(state, viewer.id, channel, 'poll').ok, true, '同组织 viewer 能看');
+  assert.equal(authorizeSession(state, viewer.id, channel, 'publish').ok, false, 'viewer 不能发');
+  assert.equal(authorizeSession(state, outsider.id, channel, 'poll').ok, false, '别的组织不能进');
+  assert.equal(authorizeSession(state, 'mem_nobody', channel, 'poll').ok, false);
+  assert.equal(authorizeSession(state, dev.id, 'b'.repeat(32), 'poll').ok, false, '没归属的频道不放行');
+});
+
+test('会话鉴权：设备被吊销后，同组织成员也不该再进这个频道', () => {
+  const state = emptyIdentity();
+  const org = addOrg(state, 'Acme');
+  const dev = addMember(state, { orgId: org.id, name: '开发' })!;
+  const phone = addMember(state, { orgId: org.id, name: '手机用户' })!;
+  const channel = 'c'.repeat(32);
+  const laptop = addDevice(state, { memberId: dev.id, name: '笔记本', channels: [{ channelId: channel, role: 'member' }] })!;
+
+  assert.equal(authorizeSession(state, phone.id, channel, 'poll').ok, true);
+  revokeDevice(state, laptop.device.id);
+  assert.equal(authorizeSession(state, phone.id, channel, 'poll').ok, false);
 });
 

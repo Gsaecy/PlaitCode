@@ -18,6 +18,7 @@ import {
   addMember,
   addOrg,
   authorize,
+  authorizeSession,
   findMemberByIdentity,
   identitySnapshot,
   revokeDevice,
@@ -213,16 +214,30 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
     return created;
   };
 
-  /** 身份模式下按设备令牌鉴权；没有身份层时一律放行（走原来的频道密钥）。 */
-  const authDevice = (
-    token: string,
+  /**
+   * 身份模式下的鉴权：设备令牌优先；手机没有设备令牌时用飞书会话 Cookie
+   * （手机只拿到"我登录了"，票据在 Cookie 里，不落 localStorage）。
+   * 没有身份层时一律放行（走原来的频道密钥）。
+   */
+  const authorizeRequest = (
+    request: IncomingMessage,
     channelId: string,
     action: Action,
-  ): { ok: true; deviceId?: string; member?: string } | { ok: false; reason: string } => {
+  ): { ok: true; deviceId?: string; member?: string } | { ok: false; status: number; reason: string } => {
     if (!identity) return { ok: true };
-    const verdict = authorize(identity.state, token, channelId, action);
-    if (!verdict.ok) return { ok: false, reason: verdict.reason ?? '未授权' };
-    return { ok: true, deviceId: verdict.device?.id, member: verdict.member?.name };
+    const token = bearer(request);
+    if (token) {
+      const verdict = authorize(identity.state, token, channelId, action);
+      if (!verdict.ok) return { ok: false, status: 403, reason: verdict.reason ?? '未授权' };
+      return { ok: true, deviceId: verdict.device?.id, member: verdict.member?.name };
+    }
+    const sso = options.auth;
+    if (!sso) return { ok: false, status: 403, reason: '设备令牌无效' };
+    const session = verifySession(sso.secret, parseCookies(request.headers.cookie).plaitcode_session);
+    if (!session) return { ok: false, status: 401, reason: '未登录：请先用飞书登录' };
+    const verdict = authorizeSession(identity.state, session.memberId, channelId, action);
+    if (!verdict.ok) return { ok: false, status: 403, reason: verdict.reason ?? '未授权' };
+    return { ok: true, member: verdict.member?.name };
   };
 
   const persistIdentity = async (): Promise<void> => {
@@ -258,7 +273,11 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       }
 
       if (request.method === 'GET' && route === '/m') {
-        const html = renderRelayMobilePage({ relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com' });
+        const html = renderRelayMobilePage({
+          relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com',
+          // 身份模式下手机不再出示频道密钥，改用登录后的会话 Cookie
+          sessionAuth: Boolean(identity),
+        });
         response.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
           'content-length': Buffer.byteLength(html),
@@ -494,10 +513,10 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
 
       if (request.method === 'GET' && route === '/v1/poll') {
         const id = query.get('channel') ?? '';
-        const auth = authDevice(bearer(request), id, 'poll');
-        if (!auth.ok) {
-          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: auth.reason });
-          json(response, 403, { ok: false, error: auth.reason });
+        const verdict = authorizeRequest(request, id, 'poll');
+        if (!verdict.ok) {
+          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: verdict.reason });
+          json(response, verdict.status, { ok: false, error: verdict.reason });
           return;
         }
         const channel = identity ? ensureChannel(id) : channelFor(id, bearer(request));
@@ -559,10 +578,10 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 400, { ok: false, error: 'invalid message' });
           return;
         }
-        const auth = authDevice(bearer(request), id, 'publish');
-        if (!auth.ok) {
-          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: auth.reason });
-          json(response, 403, { ok: false, error: auth.reason });
+        const verdict = authorizeRequest(request, id, 'publish');
+        if (!verdict.ok) {
+          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: verdict.reason });
+          json(response, verdict.status, { ok: false, error: verdict.reason });
           return;
         }
         const channel = identity ? ensureChannel(id) : channelFor(id, bearer(request));
@@ -610,10 +629,10 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           id = typeof parsed.channel === 'string' ? parsed.channel : '';
           device = parsed.device;
         }
-        const auth = authDevice(key, id, 'presence');
-        if (!auth.ok) {
-          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: auth.reason });
-          json(response, 403, { ok: false, error: auth.reason });
+        const verdict = authorizeRequest(request, id, 'presence');
+        if (!verdict.ok) {
+          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: verdict.reason });
+          json(response, verdict.status, { ok: false, error: verdict.reason });
           return;
         }
         const channel = identity ? ensureChannel(id) : channelFor(id, key);
@@ -623,14 +642,14 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         }
         if (device) {
           // 身份模式下设备身份以令牌为准，客户端自报的 id 不可信
-          const deviceId = auth.deviceId ?? (typeof device.id === 'string' ? device.id.slice(0, 80) : '');
+          const deviceId = verdict.deviceId ?? (typeof device.id === 'string' ? device.id.slice(0, 80) : '');
           if (!deviceId) {
             json(response, 400, { ok: false, error: 'invalid device' });
             return;
           }
           channel.presence.set(deviceId, {
-            name: auth.member
-              ? `${auth.member} · ${typeof device.name === 'string' ? device.name.slice(0, 60) : '设备'}`
+            name: verdict.member
+              ? `${verdict.member} · ${typeof device.name === 'string' ? device.name.slice(0, 60) : '设备'}`
               : (typeof device.name === 'string' ? device.name.slice(0, 120) : deviceId),
             platform: typeof device.platform === 'string' ? device.platform : 'unknown',
             project: typeof device.project === 'string' ? device.project.slice(0, 120) : '',

@@ -12,7 +12,7 @@ import {
   type FeishuConfig,
 } from '../sync/relayAuth';
 import { createRelayServer } from '../sync/relayServer';
-import { addOrg, emptyIdentity } from '../sync/relayIdentity';
+import { addDevice, addMember, addOrg, emptyIdentity } from '../sync/relayIdentity';
 
 /** 飞书登录：state/session 签名、授权地址、换 token，以及整条回调链路。 */
 
@@ -214,5 +214,43 @@ test('端到端：飞书没返回邮箱时用 open_id 开户；配了白名单�
   } finally {
     strictRelay.close();
     mock.close();
+  }
+});
+
+test('身份模式：手机凭会话 Cookie 收发；没登录 401，跨组织 403', async () => {
+  const state = emptyIdentity();
+  const org = addOrg(state, 'Acme');
+  const member = addMember(state, { orgId: org.id, name: '小王', role: 'member' })!;
+  const channel = 'a'.repeat(32);
+  addDevice(state, { memberId: member.id, name: '笔记本', channels: [{ channelId: channel, role: 'member' }] });
+
+  const relay = await createRelayServer({
+    port: 0,
+    identity: { state },
+    auth: { config: baseConfig, secret: 'session-secret', emailDomains: [] },
+  });
+  const base = `http://127.0.0.1:${relay.port}`;
+  const publish = (headers: Record<string, string> = {}) => fetch(`${base}/v1/publish`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ channel, id: 'm1', from: 'phone', envelope: { iv: 'aXY=', ct: 'Y3Q=' } }),
+  });
+  try {
+    assert.equal((await publish()).status, 401, '既没设备令牌也没登录');
+    const cookie = `plaitcode_session=${signSession('session-secret', { memberId: member.id, name: member.name, exp: Date.now() + 60_000 })}`;
+    assert.equal((await publish({ cookie })).status, 200);
+
+    const poll = await fetch(`${base}/v1/poll?channel=${channel}&since=0&wait=1`, { headers: { cookie } });
+    assert.equal(poll.status, 200);
+    const body = await poll.json() as { messages: Array<{ id: string }> };
+    assert.equal(body.messages.length, 1);
+    assert.equal(body.messages[0]?.id, 'm1');
+
+    // 别的组织的成员：有会话但没有频道归属
+    const outsider = addMember(state, { orgId: addOrg(state, 'Other').id, name: '外人', role: 'member' })!;
+    const otherCookie = `plaitcode_session=${signSession('session-secret', { memberId: outsider.id, name: outsider.name, exp: Date.now() + 60_000 })}`;
+    assert.equal((await publish({ cookie: otherCookie })).status, 403);
+  } finally {
+    relay.close();
   }
 });

@@ -235,6 +235,30 @@ export function authorize(state: IdentityState, token: string, channelId: string
   return { ok: true, device, member };
 }
 
+/**
+ * 会话鉴权：手机用飞书登录后没有设备令牌，按「成员 + 频道归属」放行。
+ *
+ * 频道归属是推导出来的：同组织里任意一台设备被授予过该频道，这个频道就属于该组织。
+ * 这样管理员不用额外维护一张"频道属于谁"的表；跨组织的频道一律拒绝。
+ */
+export function authorizeSession(state: IdentityState, memberId: string, channelId: string, action: Action): Verdict {
+  const member = state.members.find((item) => item.id === memberId);
+  if (!member) return { ok: false, reason: '成员不存在' };
+  const active = state.devices.filter((device) => !device.revokedAt);
+  const ownGrant = active
+    .filter((device) => device.memberId === memberId)
+    .flatMap((device) => device.grants)
+    .find((grant) => grant.channelId === channelId);
+  const role = ownGrant?.role ?? member.role;
+  const inOrg = ownGrant
+    ? true
+    : active.some((device) => device.grants.some((grant) => grant.channelId === channelId)
+      && state.members.find((item) => item.id === device.memberId)?.orgId === member.orgId);
+  if (!inOrg) return { ok: false, member, reason: '这个频道不属于你所在的组织' };
+  if (!roleCan(role, action)) return { ok: false, member, reason: `角色 ${role} 不能执行 ${action}` };
+  return { ok: true, member };
+}
+
 /** 落盘（先写临时文件再原子替换，避免断电留下半个 JSON）。 */
 export async function saveIdentity(path: string, state: IdentityState): Promise<void> {
   await mkdir(dirname(path), { recursive: true }).catch(() => undefined);
