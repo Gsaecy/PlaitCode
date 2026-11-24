@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { compactGroupLine } from '../views/groupPanel';
+import { compactGroupLine, groupHeader } from '../views/groupPanel';
 import { makeGroupMessage, type SyncPeer } from '../sync/lanProtocol';
 
 /**
@@ -45,4 +45,24 @@ test('紧凑行：当天只显示时分，跨天带日期', () => {
   const otherDay = compactGroupLine(message, new Date(2026, 10, 25, 20, 0).getTime());
   assert.equal(sameDay.time, '09:05');
   assert.match(otherDay.time, /11\/23 09:05/);
+});
+
+test('顶部状态：局域网没连但中继通着，必须是「已连接」而不是「未连接」', () => {
+  // 真机踩过：只看局域网 role=off 就显示「未连接」，而状态栏明明写着「中继已连接 · 2台」
+  const viaRelay = groupHeader({ role: 'off', relay: { connected: true, peers: 1, url: 'https://plaitcode.com' } });
+  assert.equal(viaRelay.status, '中继已连接 · 2 台');
+  assert.equal(viaRelay.on, true);
+  assert.match(viaRelay.sub, /plaitcode\.com/);
+
+  // 中继也在重连中，才算真的没连上
+  const offline = groupHeader({ role: 'off', relay: { connected: false, peers: 0, url: 'https://plaitcode.com' } });
+  assert.equal(offline.status, '未连接');
+  assert.equal(offline.on, false);
+
+  // 完全没有中继配置时和以前一样
+  assert.equal(groupHeader({ role: 'off' }).status, '未连接');
+
+  // 局域网连上时以局域网为准（更快的直连路径）
+  assert.equal(groupHeader({ role: 'hub', relay: { connected: true, peers: 1, url: 'x' } }).status, '主机（等待队友）');
+  assert.equal(groupHeader({ role: 'peer' }).status, '已连接');
 });

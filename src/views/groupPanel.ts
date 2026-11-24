@@ -17,7 +17,7 @@
 
 import * as vscode from 'vscode';
 import type { LanSyncService } from '../sync/lanSync';
-import { groupSpeaker, platformLabel, type SyncGroupMessage } from '../sync/lanProtocol';
+import { groupSpeaker, platformLabel, type SyncGroupMessage, type SyncPeer } from '../sync/lanProtocol';
 import { TASK_STATUS_LABEL, buildTaskBoard, groupTasksByStatus } from '../sync/tasks';
 
 const PHASE_LABEL: Record<string, string> = {
@@ -54,6 +54,48 @@ export function compactGroupLine(message: SyncGroupMessage, now = Date.now()): {
   };
 }
 
+export interface GroupHeaderInput {
+  role: string;
+  relay?: { connected: boolean; peers: number; url: string };
+}
+
+/**
+ * 群窗口顶部那行状态。
+ *
+ * 跨网时局域网是断的（`role === 'off'`）但中继通着 —— 只看局域网会把
+ * 「已连 2 台」显示成「未连接」，用户以为没连上。
+ *
+ * @returns `tone`：`on` 表示连上了（状态点亮）
+ */
+export function groupHeader(state: GroupHeaderInput): {
+  status: string;
+  sub: string;
+  on: boolean;
+} {
+  const relay = state.relay;
+  const lanOn = state.role !== 'off';
+  const relayOn = !!(relay && relay.connected);
+  if (lanOn) {
+    return {
+      status: state.role === 'hub' ? '主机（等待队友）' : '已连接',
+      sub: '甲方提需求，乙方（两台设备上的 agent）先解析、必要时追问，达成一致后才动手。',
+      on: true,
+    };
+  }
+  if (relayOn) {
+    return {
+      status: `中继已连接 · ${relay.peers + 1} 台`,
+      sub: `经中继跨网协作（${relay.url}）。甲方提需求，指定设备的 agent 先解析、必要时追问，达成一致后才动手。`,
+      on: true,
+    };
+  }
+  return {
+    status: '未连接',
+    sub: '还没有连接另一台设备。先在状态栏点「连接另一台设备」，或「新建 / 加入跨网频道」走中继。',
+    on: false,
+  };
+}
+
 export class GroupPanel implements vscode.Disposable {
   private panel: vscode.WebviewPanel | undefined;
   private readonly disposables: vscode.Disposable[] = [];
@@ -65,6 +107,11 @@ export class GroupPanel implements vscode.Disposable {
       /** 在群里发一句话（需求或回答）—— 由面板决定走哪条路径。 */
       send: (text: string) => Promise<void>;
       log: (line: string) => void;
+      /**
+       * 中继状态。跨网协作时局域网根本没连上（`role === 'off'`），
+       * 但中继是通的 —— 只看局域网会把「已连 2 台」显示成「未连接」。
+       */
+      relay?: () => { connected: boolean; peers: number; url: string } | undefined;
     },
   ) {}
 
@@ -109,16 +156,32 @@ export class GroupPanel implements vscode.Disposable {
     if (!this.panel) return;
     const state = this.service.groupState();
     const now = Date.now();
+    const relay = this.callbacks.relay?.();
+    const relayState = relay ? { connected: relay.connected, peers: relay.peers, url: relay.url } : undefined;
     await this.panel.webview.postMessage({
       type: 'state',
       role: state.role,
-      peers: state.peers.map((peer) => ({
-        id: peer.id,
-        name: peer.name,
-        platform: platformLabel(peer.platform),
-        project: peer.project,
-        isLocal: peer.id === this.service.localPeer().id,
-      })),
+      relay: relayState,
+      header: groupHeader({ role: state.role, ...(relayState ? { relay: relayState } : {}) }),
+      peers: (() => {
+        const local = this.service.localPeer();
+        const seen = new Map<string, { id: string; name: string; platform: string; project: string; isLocal: boolean }>();
+        const add = (peer: { id: string; name: string; platform: SyncPeer['platform']; project: string }): void => {
+          if (seen.has(peer.id)) return;
+          seen.set(peer.id, {
+            id: peer.id,
+            name: peer.name,
+            platform: platformLabel(peer.platform),
+            project: peer.project,
+            isLocal: peer.id === local.id,
+          });
+        };
+        add(local);
+        for (const peer of state.peers) add(peer);
+        // 中继上的设备不在局域网 peer 列表里，但它们在群里发过言 —— 按消息补出来
+        for (const message of state.messages) add(message.from);
+        return [...seen.values()];
+      })(),
       openQuestion: state.openQuestion?.body ?? '',
       taskGroups: groupTasksByStatus(buildTaskBoard(state.messages)).map((group) => ({
         status: group.status,
@@ -320,11 +383,10 @@ function renderBoard(groups) {
 }
 
 function render(state) {
-  status.textContent = state.role === 'hub' ? '主机（等待队友）' : state.role === 'peer' ? '已连接' : '未连接';
-  status.classList.toggle('on', state.role !== 'off');
-  sub.textContent = state.role === 'off'
-    ? '还没有连接另一台设备。先在状态栏点「连接另一台设备」，两台都点了就会在这里汇合。'
-    : '甲方提需求，乙方（两台设备上的 agent）先解析、必要时追问，达成一致后才动手。';
+  const head = state.header || { status: '未连接', sub: '', on: false };
+  status.textContent = head.status;
+  status.classList.toggle('on', head.on);
+  sub.textContent = head.sub;
 
   members.textContent = '';
   for (const peer of state.peers) {

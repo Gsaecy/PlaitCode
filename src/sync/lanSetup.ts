@@ -214,6 +214,10 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   const groupPanel = new GroupPanel(context.extensionUri, service, {
     send: (text) => chat.sendGroupMessage(text),
     log: (line) => output.info(line),
+    relay: () => {
+      const state = relay?.status();
+      return state ? { connected: state.connected, peers: state.peers, url: state.url } : undefined;
+    },
   });
   /*
    * 「手机遥控」窗口：电脑上显示二维码 + 6 位码。
