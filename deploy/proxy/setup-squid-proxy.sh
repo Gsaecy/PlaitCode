@@ -44,7 +44,13 @@ fi
 step "1/6 安装 squid 与 htpasswd 工具"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq squid apache2-utils >/dev/null
+# Ubuntu 24.04 起 squid 被拆包，某些镜像里只有 squid-openssl；两个都试一遍
+if ! apt-get install -y -qq squid apache2-utils >/dev/null 2>&1; then
+  warn "装 squid 失败，尝试 squid-openssl"
+  apt-get install -y -qq squid-openssl apache2-utils >/dev/null 2>&1 \
+    || die "squid 安装失败，请手动执行：apt-get install -y squid apache2-utils"
+fi
+command -v squid >/dev/null 2>&1 || die "squid 可执行文件不存在，安装似乎没成功"
 ok "已安装 squid"
 
 step "2/6 写认证文件"
