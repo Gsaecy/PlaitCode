@@ -342,7 +342,7 @@ ${options.authed ? '<main id="main"><div class="empty">正在连接…</div></ma
       wrap.appendChild(bubble);
       main.appendChild(wrap);
     });
-    if (!main.childNodes.length) main.appendChild(el('div', 'empty', '还没有发言。说一句话，两台设备的乙方都会收到。'));
+    if (!main.childNodes.length) main.appendChild(el('div', 'empty', '还没有发言。说一句话，频道里的乙方都会收到。'));
     if (scroll) main.scrollTop = main.scrollHeight;
   }
 

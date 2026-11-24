@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   MAX_DETAIL_CHARS,
+  answersOpenQuestion,
   buildLedger,
   clip,
   groupAgreement,
@@ -63,7 +64,7 @@ test('协作消息：解析、正文截断、replyTo 保留', () => {
   assert.ok(makeNote(mac, { body: '   ' }) === undefined, '空消息不该产生记录');
 });
 
-test('账本：同一平台多条报告只留最新一条', () => {
+test('账本：同一设备多条报告只留最新一条，不同设备各自独立', () => {
   const requirement = makeRequirement(win, '加托盘图标', 1, 'r')!;
   const rows = buildLedger([requirement], [
     makeReport(win, { requirementId: requirement.id, status: 'planned', summary: '计划中' }, 10),
@@ -71,8 +72,20 @@ test('账本：同一平台多条报告只留最新一条', () => {
     makeReport(mac, { requirementId: requirement.id, status: 'done', summary: '已实现', files: ['src/tray.swift'] }, 30),
   ]);
   assert.equal(rows.length, 1);
-  assert.equal(rows[0]!.reports.win32?.status, 'done', '要最终状态不是流水账');
-  assert.equal(rows[0]!.reports.darwin?.files[0], 'src/tray.swift');
+  assert.equal(rows[0]!.reports['p-win']?.status, 'done', '要最终状态不是流水账');
+  assert.equal(rows[0]!.reports['p-mac']?.files[0], 'src/tray.swift');
+});
+
+test('账本按设备存，不按平台：两台 Windows 不能被压成一格', () => {
+  const requirement = makeRequirement(win, '加托盘图标', 1, 'r')!;
+  const win2: SyncPeer = { ...win, id: 'p-win2', name: 'PC2 · Windows' };
+  const rows = buildLedger([requirement], [
+    makeReport(win, { requirementId: requirement.id, status: 'done', summary: '做了' }, 20),
+    makeReport(win2, { requirementId: requirement.id, status: 'skipped', note: '这台没有系统托盘' }, 30),
+  ]);
+  assert.equal(Object.keys(rows[0]!.reports).length, 2, '两台 Windows 是两条独立进度');
+  assert.equal(rows[0]!.reports['p-win']?.status, 'done');
+  assert.equal(rows[0]!.reports['p-win2']?.status, 'skipped');
 });
 
 test('分歧：一边做完、另一边跳过 → 必须被点名', () => {
@@ -83,8 +96,8 @@ test('分歧：一边做完、另一边跳过 → 必须被点名', () => {
   ]);
   const divergences = findDivergences(rows);
   assert.equal(divergences.length, 1);
-  assert.deepEqual(divergences[0]!.doneOn, ['win32']);
-  assert.deepEqual(divergences[0]!.skippedOn, ['darwin']);
+  assert.deepEqual(divergences[0]!.doneOn.map((party) => party.id), ['p-win']);
+  assert.deepEqual(divergences[0]!.skippedOn.map((party) => party.id), ['p-mac']);
   assert.match(divergences[0]!.skippedNotes.join(''), /没有系统托盘/);
 });
 
@@ -124,7 +137,7 @@ test('账本渲染：表格 + 差异小节，竖线不会把表格拆坏', () =>
 
 test('空账本也给出可读文件，而不是空字符串', () => {
   const markdown = renderLedger([], 100);
-  assert.match(markdown, /还没有跨平台需求/);
+  assert.match(markdown, /还没有需求/);
 });
 
 test('收到需求时的本地指令：按甲方的话解析、不确定先追问、达成一致才动手', () => {
@@ -232,4 +245,60 @@ test('群消息：指派设备与项目能来回传，没填就不出现字段�
   assert.ok(plain);
   assert.equal('assignee' in plain!, false, '没指派就完全不带这个字段，旧客户端不受影响');
   assert.equal('project' in plain!, false);
+});
+test('分歧：设备数量不固定——三台里一台没报告时，只有给了名册才点名它', () => {
+  const requirement = makeRequirement(win, '加托盘图标', 1, 'r')!;
+  const third: SyncPeer = { id: 'p-linux', name: 'Server · Linux', platform: 'linux', project: 'app', version: 't' };
+  const rows = buildLedger([requirement], [
+    makeReport(win, { requirementId: requirement.id, status: 'done', summary: '做了' }, 10),
+    makeReport(mac, { requirementId: requirement.id, status: 'skipped', note: 'macOS 没有系统托盘' }, 20),
+  ]);
+
+  const withoutRoster = findDivergences(rows);
+  assert.equal(withoutRoster.length, 1);
+  assert.deepEqual(withoutRoster[0]!.missingOn, [], '不知道有谁时不许瞎猜"缺失"');
+
+  const withRoster = findDivergences(rows, [win, mac, third]);
+  assert.deepEqual(withRoster[0]!.missingOn.map((party) => party.id), ['p-linux']);
+  assert.equal(withRoster[0]!.missingOn[0]!.label, 'Server · Linux');
+});
+
+test('账本 Markdown：一行一台设备，不是固定三列平台', () => {
+  const requirement = makeRequirement(win, '加托盘图标', 1, 'r')!;
+  const win2: SyncPeer = { ...win, id: 'p-win2', name: 'PC2 · Windows' };
+  const markdown = renderLedger(buildLedger([requirement], [
+    makeReport(win, { requirementId: requirement.id, status: 'done', summary: '做了' }, 10),
+    makeReport(win2, { requirementId: requirement.id, status: 'done', summary: '也做了' }, 20),
+  ]));
+  assert.match(markdown, /\| 需求 \| 发起 \| 执行设备 \| 状态 \| 说明 \| 更新 \|/);
+  assert.equal((markdown.match(/\| 已完成 \|/g) ?? []).length, 2, '两台 Windows 各占一行');
+  assert.match(markdown, /PC2 · Windows/);
+});
+test('群状态 N 台设备：A 追问后 B 发解析，不能把 A 的追问盖掉', () => {
+  const id = 'req-n';
+  const msg = (from: SyncPeer, input: Parameters<typeof makeGroupMessage>[1], at: number, seed: string) =>
+    makeGroupMessage(from, input, at, seed)!;
+  const third: SyncPeer = { id: 'p-3', name: 'Server', platform: 'linux', project: 'app', version: 't' };
+
+  const messages = [
+    msg(win, { author: 'user', phase: 'requirement', body: '加托盘', requirementId: id }, 1_000, 'a'),
+    msg(mac, { author: 'agent', phase: 'question', body: '托盘点一下做什么？', requirementId: id }, 2_000, 'b'),
+    msg(third, { author: 'agent', phase: 'analysis', body: '我这边先拆一下', requirementId: id }, 3_000, 'c'),
+  ];
+  assert.equal(groupAgreement(messages, id), 'awaiting-user', '有人在等甲方回答');
+  assert.equal(answersOpenQuestion(messages, id), true);
+
+  const answered = [
+    ...messages,
+    msg(win, { author: 'user', phase: 'answer', body: '打开主窗口', requirementId: id }, 4_000, 'd'),
+  ];
+  assert.equal(groupAgreement(answered, id), 'awaiting-analysis', '甲方回答后轮到乙方');
+
+  // 一台报了结果，另一台还在等甲方回答 —— 仍然是「等甲方」，不能显示已完成
+  const mixed = [
+    msg(win, { author: 'user', phase: 'requirement', body: '加托盘', requirementId: id }, 1_000, 'a'),
+    msg(mac, { author: 'agent', phase: 'question', body: '托盘点一下做什么？', requirementId: id }, 2_000, 'b'),
+    msg(third, { author: 'agent', phase: 'result', body: '我这边做完了', requirementId: id }, 3_000, 'c'),
+  ];
+  assert.equal(groupAgreement(mixed, id), 'awaiting-user');
 });

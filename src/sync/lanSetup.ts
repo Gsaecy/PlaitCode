@@ -314,7 +314,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         return;
       }
       status.text = '$(broadcast) 连接另一台设备';
-      status.tooltip = '两台电脑在同一 WiFi 下各点一次，就能共享功能需求、一起执行（点了才启用）。';
+      status.tooltip = '在同一 WiFi 的每台设备上各点一次，就能共享需求、一起执行（点了才启用）。';
       status.command = 'plaitcode.lanSync.connect';
       status.show();
       return;
@@ -333,8 +333,8 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       return;
     }
     const hint = role === 'hub'
-      ? '这台已就绪。请在同一 WiFi 的另一台电脑上点状态栏的「连接另一台设备」。'
-      : '已连上。现在两台电脑都会收到同一条需求，并各自更新 docs/PLATFORM-ALIGNMENT.md。';
+      ? '这台已就绪。请在同一 WiFi 的其它设备上点状态栏的「连接另一台设备」。'
+      : '已连上。频道里的设备都会收到同一条需求，并各自更新 docs/PLATFORM-ALIGNMENT.md。';
     void vscode.window.showInformationMessage(`${message}\n${hint}`, '知道了');
   };
 
@@ -554,7 +554,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         const code = await vscode.window.showInputBox({ title: '固定配对码', value: service.pairingCode(), ignoreFocusOut: true });
         if (!code) return;
         await service.setPairingCode(code);
-        void vscode.window.showInformationMessage('已设置。两台设备填同一个值即可自动互通。');
+        void vscode.window.showInformationMessage('已设置。所有设备填同一个值即可自动互通。');
         return;
       }
       const started = await service.startHub(setting('lanSync.port', 47821));
@@ -587,7 +587,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     void context.globalState.update(hintedKey, true);
     void vscode.window
       .showInformationMessage(
-        'PlaitCode 新功能：两台电脑在同一 WiFi 下可以一起开发同一个 app 的两个平台版本。要现在连一台试试吗？',
+        'PlaitCode 新功能：同一 WiFi 下的多台设备可以一起开发同一个项目（各管一个平台也行）。要现在连一台试试吗？',
         '连接另一台设备',
         '以后再说',
       )

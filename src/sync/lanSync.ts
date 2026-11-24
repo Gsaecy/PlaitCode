@@ -261,7 +261,7 @@ export class LanSyncService implements Disposable {
    *  - 同一个 WiFi 里已经有主机 → 直接加入（对端弹一次「允许吗」，点允许即可）；
    *  - 没有主机 → 自己成为主机待命，并提示另一台设备也点同一个按钮。
    *
-   * 两台设备都点同一个按钮，谁先谁后都能连上 —— 这就是「傻瓜式」的核心。
+   * 每台设备都点同一个按钮，谁先谁后都能连上 —— 这就是「傻瓜式」的核心。
    */
   async autoConnect(port?: number): Promise<{ ok: boolean; message: string; role: LanSyncRole }> {
     const targetPort = port && port > 0 ? port : (this.lastPort || this.port);
@@ -505,7 +505,7 @@ export class LanSyncService implements Disposable {
   /**
    * 设置配对码。
    *
-   * 两台设备必须填**同一个**值才能互通：这是唯一的凭据，也是「同一个 WiFi 上
+   * 所有设备必须填**同一个**值才能互通：这是唯一的凭据，也是「同一个 WiFi 上
    * 有陌生设备」时唯一的防线。由用户在设置里填，或加入时按主机显示的那串填。
    */
   async setPairingCode(code: string): Promise<void> {
@@ -1107,7 +1107,9 @@ export class LanSyncService implements Disposable {
     const rows = buildLedger(this.requirements, this.reports);
     if (!rows.length) return;
     try {
-      await this.bridge.writeLedger(renderLedger(rows));
+      // 带名册进去，「哪台设备没有报告」才有依据（设备数不固定，不能靠平台枚举猜）
+      const roster = [this.bridge.peer(), ...this.peerList().map((entry) => entry.peer)];
+      await this.bridge.writeLedger(renderLedger(rows, Date.now(), roster));
     } catch (error) {
       this.bridge.log(`[sync] 写账本失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
     }
@@ -1163,7 +1165,7 @@ export class LanSyncService implements Disposable {
   }
 
   /**
-   * 两台 agent 之间的**协作消息**（用户说的「像同事一样沟通、互通有无」）。
+   * 多台 agent 之间的**协作消息**（用户说的「像同事一样沟通、互通有无」）。
    *
    * 与 `shareRequirement` 的区别：需求一定会开跑一轮；协作消息只是把一段话送给
    * 对端 agent，由它判断要不要动手、要不要回。这也是「不要为了回应而改代码」的落点。

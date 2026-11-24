@@ -7,7 +7,7 @@
  *    项目的不同系统版本的时候，能交流对齐」
  *   「我只需要在一个设备上发起更新功能需求，两边能一起执行更新任务」
  *
- * 这个模块解决的是**一个需求在两个平台上各做一遍、并且能核对做没做齐**：
+ * 这个模块解决的是**一个需求在多台设备上各做一遍、并且能核对做没做齐**：
  *  - 需求（requirement）：在一台设备上写下要做什么，广播给对端；
  *  - 报告（report）：每台设备做完 / 跳过时回一条，带文件清单与理由；
  *  - 账本（ledger）：把两者渲染成一张「需求 × 平台」的对照表，写进仓库；
@@ -129,7 +129,7 @@ export interface SyncGroupMessage {
   /**
    * 这条需求指派给哪台设备执行（设备 id）。
    *
-   * 一台机器多台设备接力时，**必须**说清谁来干：不说就是两台都跑一遍，
+   * 一台机器多台设备接力时，**必须**说清谁来干：不说就是每台都跑一遍，
    * 同一个改动做两遍，还可能互相覆盖。留空表示"谁都可以接"（旧行为）。
    */
   assignee?: string;
@@ -221,6 +221,21 @@ export type GroupAgreementState = 'awaiting-analysis' | 'awaiting-user' | 'agree
 
 export function groupAgreement(messages: readonly SyncGroupMessage[], requirementId: string): GroupAgreementState {
   const related = messages.filter((message) => message.requirementId === requirementId);
+  /*
+   * N 台设备时不能只看「最后一条」：A 追问之后 B 发了一条解析 / 进度 / 结果，
+   * 只看最后一条就会把那句追问盖掉 —— 甲方回答了也没人接着做，或者任务显示
+   * 已完成但 A 还在等回答。
+   *
+   * 所以先单独判定「有没有人还在等甲方」：某台设备提的追问之后，甲方还没发过言。
+   */
+  let lastUserAt = -1;
+  for (let index = related.length - 1; index >= 0; index -= 1) {
+    const message = related[index]!;
+    if (message.author === 'user') { lastUserAt = index; break; }
+  }
+  for (let index = related.length - 1; index > lastUserAt; index -= 1) {
+    if (related[index]!.phase === 'question') return 'awaiting-user';
+  }
   for (let index = related.length - 1; index >= 0; index -= 1) {
     const phase = related[index]!.phase;
     if (phase === 'result') return 'done';
@@ -247,13 +262,13 @@ export function renderGroupTranscript(messages: readonly SyncGroupMessage[], now
   const lines = [
     '# 团队群记录',
     '',
-    '> 甲方（用户）提需求，乙方（两台设备上的 agent，各负责一个平台）做解析、追问与执行。',
+    '> 甲方（用户）提需求，乙方（频道里各台设备上的 agent）做解析、追问与执行。',
     '> 群里只有需求、需求解析、追问、确认、进度和结果；命令与代码在执行记录里。',
     `> 上次更新：${new Date(now).toISOString().slice(0, 16).replace('T', ' ')}`,
     '',
   ];
   if (!messages.length) {
-    lines.push('（还没有发言。在任意一台设备上发一条需求，群里就会出现它和两边的解析。）');
+    lines.push('（还没有发言。在任意一台设备上发一条需求，群里就会出现它和各台的解析。）');
     return `${lines.join('\n')}\n`;
   }
   let lastRequirement = '';
@@ -306,7 +321,7 @@ export function platformLabel(platform: SyncPlatform): string {
 /**
  * 需求 id。
  *
- * 用「时间 + 种子哈希」而不是自增序号：两台设备可能同时发起，序号会撞车，
+ * 用「时间 + 种子哈希」而不是自增序号：多台设备可能同时发起，序号会撞车，
  * 而撞车意味着两边的报告被算到同一条需求上。
  */
 export function makeRequirementId(now: number, seed: string): string {
@@ -553,14 +568,36 @@ export function requirementPromptForLocal(
 
 export interface LedgerRow {
   requirement: SyncRequirement;
-  /** 平台 → 该平台最新一条报告。 */
-  reports: Partial<Record<SyncPlatform, SyncReport>>;
+  /**
+   * 设备 id → 该设备最新一条报告。
+   *
+   * **按设备而不是按平台**：两个人各有一台 Windows 是两条独立进度，
+   * 以前按平台存会把它们合成一格、后报的覆盖先报的。平台只用于显示标签。
+   */
+  reports: Record<string, SyncReport>;
+}
+
+/** 账本里一处「谁」——设备 id + 给人看的名字。 */
+export interface LedgerParty {
+  id: string;
+  /** `MacBook · macOS` 这种可读标签。 */
+  label: string;
+}
+
+function partyOf(report: SyncReport): LedgerParty {
+  // 设备名本身就是给人看的（`MagicBookV14 · win32`），再拼平台标签会变成 `… · win32 · Windows`
+  return { id: report.from.id, label: report.from.name };
+}
+
+/** 一台设备的名字；没有名字时才退回平台。 */
+function peerLabel(peer: SyncPeer): string {
+  return peer.name || platformLabel(peer.platform);
 }
 
 /**
- * 把需求与报告合并成「需求 × 平台」的行。
+ * 把需求与报告合并成「需求 × 设备」的行。
  *
- * 同一需求、同一平台的多条报告只留**最新一条**：模型一轮里可能先报 planned
+ * 同一需求、同一设备的多条报告只留**最新一条**：模型一轮里可能先报 planned
  * 再报 done，账本要的是最终状态，不是流水账。
  */
 export function buildLedger(requirements: readonly SyncRequirement[], reports: readonly SyncReport[]): LedgerRow[] {
@@ -570,25 +607,26 @@ export function buildLedger(requirements: readonly SyncRequirement[], reports: r
   }
   const latest = new Map<string, SyncReport>();
   for (const report of reports) {
-    const key = `${report.requirementId}\u0000${report.from.platform}`;
+    const key = `${report.requirementId}\u0000${report.from.id}`;
     const previous = latest.get(key);
     if (!previous || report.at >= previous.at) latest.set(key, report);
   }
   for (const report of latest.values()) {
     const row = byId.get(report.requirementId);
-    if (row) row.reports[report.from.platform] = report;
+    if (row) row.reports[report.from.id] = report;
   }
   return [...byId.values()]
     .sort((left, right) => right.requirement.createdAt - left.requirement.createdAt)
     .slice(0, MAX_RECORDS);
 }
 
-/** 一个需求里「做完了却没对齐」的平台组合。 */
+/** 一个需求里「做完了却没对齐」的情况。 */
 export interface Divergence {
   requirement: SyncRequirement;
-  doneOn: SyncPlatform[];
-  missingOn: SyncPlatform[];
-  skippedOn: SyncPlatform[];
+  doneOn: LedgerParty[];
+  /** 在频道里、但这个需求上没有报告的设备。 */
+  missingOn: LedgerParty[];
+  skippedOn: LedgerParty[];
   /** 跳过原因（来自报告 note），用来解释「为什么这边没有」。 */
   skippedNotes: string[];
 }
@@ -596,28 +634,33 @@ export interface Divergence {
 /**
  * 找出没对齐的需求。
  *
- * 判定只看**确凿的事实**：至少一个平台 `done`，同时有另一个平台 `skipped`。
+ * 判定只看**确凿的事实**：至少一台设备 `done`，同时另一台 `skipped`。
  *
- * 为什么不把「另一端没有报告」也算成分歧：没报告的成因太多（对端还没加入、
- * 刚连上还没跑、用户根本没启动那台机器），把它算进去会让账本天天报警，
- * 用户很快就会忽略这个提示。没有报告在表格里显示为「—」，同样看得见；
+ * 为什么不把「没有报告」也算成分歧：没报告的成因太多（那台机器还没开机、
+ * 刚连上还没跑）。没有报告在表格里显示为「—」，同样看得见；
  * 而 `skipped` 是对方**明确写下理由**的结论 —— 那才是真正的「两边不一样」。
+ *
+ * @param roster 频道里已知的设备。给了才计算 `missingOn`；不给就留空
+ *   （不知道有哪些设备时，任何"缺失"都是瞎猜）。
  */
-export function findDivergences(rows: readonly LedgerRow[]): Divergence[] {
-  const platforms: SyncPlatform[] = ['win32', 'darwin', 'linux'];
+export function findDivergences(rows: readonly LedgerRow[], roster: readonly SyncPeer[] = []): Divergence[] {
   const result: Divergence[] = [];
   for (const row of rows) {
-    const doneOn = platforms.filter((platform) => row.reports[platform]?.status === 'done');
-    const skippedOn = platforms.filter((platform) => row.reports[platform]?.status === 'skipped');
-    if (!doneOn.length || !skippedOn.length) continue;
-    const missingOn = platforms.filter((platform) => !row.reports[platform]);
+    const reports = Object.values(row.reports).filter((report): report is SyncReport => Boolean(report));
+    const done = reports.filter((report) => report.status === 'done').map(partyOf);
+    const skipped = reports.filter((report) => report.status === 'skipped').map(partyOf);
+    if (!done.length || !skipped.length) continue;
+    const reported = new Set(reports.map((report) => report.from.id));
     result.push({
       requirement: row.requirement,
-      doneOn,
-      missingOn,
-      skippedOn,
-      skippedNotes: skippedOn
-        .map((platform) => row.reports[platform]?.note ?? '')
+      doneOn: done,
+      missingOn: roster
+        .filter((peer) => !reported.has(peer.id))
+        .map((peer) => ({ id: peer.id, label: peerLabel(peer) })),
+      skippedOn: skipped,
+      skippedNotes: reports
+        .filter((report) => report.status === 'skipped')
+        .map((report) => report.note ?? '')
         .filter(Boolean),
     });
   }
@@ -636,44 +679,46 @@ function escapeCell(value: string): string {
 }
 
 /** 渲染账本（写进仓库的那份 Markdown）。 */
-export function renderLedger(rows: readonly LedgerRow[], now = Date.now()): string {
-  const divergences = findDivergences(rows);
+export function renderLedger(rows: readonly LedgerRow[], now = Date.now(), roster: readonly SyncPeer[] = []): string {
+  const divergences = findDivergences(rows, roster);
   const lines = [
     '# 跨平台对齐账本',
     '',
-    '> 由 PlaitCode 局域网同步自动维护。**每个平台只补自己那一行/那一列**，不要重写整张表。',
+    '> 由 PlaitCode 同步自动维护。**每台设备只补自己那一行**，不要重写整张表。',
     `> 上次更新：${new Date(now).toISOString().slice(0, 16).replace('T', ' ')}`,
     '',
   ];
   if (!rows.length) {
-    lines.push('（还没有跨平台需求。在一台设备上发起需求后，这里会出现记录。）');
+    lines.push('（还没有需求。在任意一台设备上发起需求后，这里会出现记录。）');
     return `${lines.join('\n')}\n`;
   }
-  lines.push('## 需求对照', '', '| 需求 | 发起 | Windows | macOS | Linux | 最近更新 |', '|---|---|---|---|---|---|');
+  // 一行一台设备，而不是"一列一个平台"：设备数量本来就不固定，
+  // 固定三列（Windows/macOS/Linux）在"两个人都是 Windows"时会把两条进度压成一格。
+  lines.push('## 需求对照', '', '| 需求 | 发起 | 执行设备 | 状态 | 说明 | 更新 |', '|---|---|---|---|---|---|');
   for (const row of rows) {
-    const cell = (platform: SyncPlatform): string => {
-      const report = row.reports[platform];
-      if (!report) return '—';
-      const detail = report.summary || report.note;
-      return detail ? `${STATUS_LABEL[report.status]}：${detail}` : STATUS_LABEL[report.status];
-    };
-    const updated = Math.max(
-      row.requirement.createdAt,
-      ...Object.values(row.reports).map((report) => report?.at ?? 0),
-    );
-    lines.push(
-      `| ${escapeCell(row.requirement.title)} | ${platformLabel(row.requirement.from.platform)} `
-      + `| ${escapeCell(cell('win32'))} | ${escapeCell(cell('darwin'))} | ${escapeCell(cell('linux'))} `
-      + `| ${new Date(updated).toISOString().slice(5, 16).replace('T', ' ')} |`,
-    );
+    const reports = Object.values(row.reports).filter((report): report is SyncReport => Boolean(report));
+    const requester = peerLabel(row.requirement.from);
+    if (!reports.length) {
+      lines.push(`| ${escapeCell(row.requirement.title)} | ${escapeCell(requester)} | — | 没有报告 | — | — |`);
+      continue;
+    }
+    for (const report of reports.sort((left, right) => left.at - right.at)) {
+      const detail = report.summary || report.note || '';
+      const files = report.files.length ? `（${report.files.length} 个文件）` : '';
+      lines.push(
+        `| ${escapeCell(row.requirement.title)} | ${escapeCell(requester)} `
+        + `| ${escapeCell(partyOf(report).label)} | ${STATUS_LABEL[report.status]} `
+        + `| ${escapeCell(`${detail}${files}`)} | ${new Date(report.at).toISOString().slice(5, 16).replace('T', ' ')} |`,
+      );
+    }
   }
   if (divergences.length) {
     lines.push('', '## 需要对齐的差异', '');
     for (const divergence of divergences) {
-      const done = divergence.doneOn.map(platformLabel).join('、');
+      const done = divergence.doneOn.map((party) => party.label).join('、');
       const problem = [
-        divergence.skippedOn.length ? `${divergence.skippedOn.map(platformLabel).join('、')} 已跳过` : '',
-        divergence.missingOn.length ? `${divergence.missingOn.map(platformLabel).join('、')} 没有报告` : '',
+        divergence.skippedOn.length ? `${divergence.skippedOn.map((party) => party.label).join('、')} 已跳过` : '',
+        divergence.missingOn.length ? `${divergence.missingOn.map((party) => party.label).join('、')} 没有报告` : '',
       ].filter(Boolean).join('；');
       const reason = divergence.skippedNotes.length ? ` 原因：${divergence.skippedNotes.join('；')}` : '';
       lines.push(`- **${divergence.requirement.title}**：${done} 已完成，但 ${problem}。${reason}`);

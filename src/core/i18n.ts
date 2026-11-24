@@ -633,8 +633,8 @@ const DICTIONARY: Record<string, Entry> = {
   'settings.nav.collab': { zh: '协作', en: 'Collab' },
   'settings.collab.title': { zh: '局域网协作（多端对齐）', en: 'LAN collaboration (multi-platform alignment)' },
   'settings.collab.body': {
-    zh: '两台电脑在同一个 WiFi 下各点一次「连接另一台设备」，以后在一台发需求，另一台会一起做，并自动维护同一份对齐账本。默认关闭，点了才启用。',
-    en: 'Click "connect another device" once on each machine on the same WiFi. After that, a request made on one machine is executed on both, and one shared alignment ledger is kept up to date. Off by default — it only starts when you click.',
+    zh: '在每台设备上各点一次「连接另一台设备」（同一 WiFi 会自动发现），或「新建 / 加入跨网频道」走中继。之后在一台发需求，频道里的设备都会收到，并共同维护一份对齐账本。默认关闭，点了才启用。',
+    en: 'Click "connect another device" once on each machine (same WiFi is auto-discovered), or use "create / join a cross-network channel" through the relay. After that, a request made on one machine reaches every device in the channel, and they keep one shared alignment ledger. Off by default — it only starts when you click.',
   },
   'settings.collab.connect': { zh: '连接另一台设备', en: 'Connect another device' },
   'settings.collab.group': { zh: '打开团队群', en: 'Open team group' },
@@ -644,8 +644,8 @@ const DICTIONARY: Record<string, Entry> = {
   'settings.collab.state': { zh: '当前状态：{state}', en: 'State: {state}' },
   'settings.collab.stateOff': { zh: '未连接', en: 'Not connected' },
   'sync.localOnlyNotice': {
-    zh: '这条只发给了本机 agent（主对话是「你和一个 agent」的频道）。需要两台设备一起做，请在「团队群」窗口里发。',
-    en: 'This went to the local agent only — the main chat is a one-agent channel. To have both devices do it, send it in the team group window.',
+    zh: '这条只发给了本机 agent（主对话是「你和一个 agent」的频道）。需要频道里的其它设备一起做，请在「团队群」窗口里发。',
+    en: 'This went to the local agent only — the main chat is a one-agent channel. To have other devices in the channel do it too, send it in the team group window.',
   },
   'settings.nav.privacy': { zh: '权限与隐私', en: 'Permissions & privacy' },
   'settings.nav.storage': { zh: '存储', en: 'Storage' },

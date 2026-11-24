@@ -171,9 +171,9 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     }).then(function (result) {
       if (Array.isArray(result.devices)) {
         meta.textContent = (result.devices.length || 1) + ' 台设备在线';
-        // 手机只是"甲方"，真正的执行者是那些电脑：把它们列出来供指派
+        // 手机只是"甲方"，真正的执行者是那些电脑：列出除自己以外的设备供指派
         devices = result.devices.filter(function (item) {
-          return item && item.id && item.platform !== 'android';
+          return item && item.id && item.id !== deviceId;
         });
         if (chosen && !devices.some(function (item) { return item.id === chosen; })) chosen = '';
         renderAssign();
@@ -288,7 +288,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       wrap.appendChild(bubble);
       main.appendChild(wrap);
     });
-    if (!main.childNodes.length) main.appendChild(el('div', 'empty', '还没有发言。说一句需求，两台电脑上的乙方都会收到。'));
+    if (!main.childNodes.length) main.appendChild(el('div', 'empty', '还没有发言。说一句需求，频道里的乙方都会收到。'));
     if (atBottom) main.scrollTop = main.scrollHeight;
   }
 
@@ -349,7 +349,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       kind: 'group', id: id, author: 'user', phase: 'requirement', body: text, requirementId: id, at: Date.now(),
       from: { id: deviceId, name: '手机 · 浏览器', platform: 'android', project: 'mobile', version: 'web' }
     };
-    // 指派：说清让哪台电脑做，避免两台都跑一遍、改动互相覆盖
+    // 指派：说清让哪台电脑做，避免每台都跑一遍、改动互相覆盖
     if (chosen) {
       message.assignee = chosen;
       var targetProject = projectOf(chosen);

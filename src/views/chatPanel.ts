@@ -1999,12 +1999,12 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       /*
        * 频道规则（用户 2026-11-23 追问「是哪个对话框的用户消息起作用」）：
        *
-       *  - **团队群窗口**（origin=group）= 双方共享频道：广播给对端，两台一起做；
+       *  - **团队群窗口**（origin=group）= 频道共享：广播给频道内所有设备，一起做；
        *  - **主对话**（origin 缺省）= 只给你本机这个 agent，**不广播**；
        *  - 对端发来的（origin=sync）不再转发，否则两台机器会无限互相转发。
        *
        * 一个功能需要两边都做时，请在群窗口说 —— 这是唯一广播的入口。
-       * 在主对话说「两个平台都加上」只会让**本机**做，另一台收不到；所以下面还加了
+       * 在主对话说「所有平台都加上」只会让**本机**做，其它设备收不到；所以下面还加了
        * 一次提示，避免用户以为已经同步了。
        */
       if (this.lanSync && !options?.resumedTodos && content) {

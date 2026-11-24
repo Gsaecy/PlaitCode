@@ -8,6 +8,22 @@ It ships a compact chat surface and settings page, native streaming tool calling
 
 ![PlaitCode chat panel: conversation sidebar and a new conversation](https://raw.githubusercontent.com/Gsaecy/PlaitCode/main/docs/screenshots/chat-panel.png)
 
+## What's new in 0.9.0 (collaboration scales past two devices)
+
+The whole collaboration layer was originally written for one Windows + one macOS machine.
+With more devices it failed **silently**:
+
+- Reports were keyed by **platform**, so two Windows machines overwrote each other and a
+  five-person team kept only the last progress line. Now keyed by **device id**.
+- The alignment ledger had three fixed platform columns. It is now **one row per device**.
+- "Which machine has no report" was guessed from a platform list. It now compares against the
+  actual channel roster, and does not guess when the roster is unknown.
+- Group state only looked at the last message, so a question from one device was masked by an
+  analysis or result from another — the answer then resumed nothing, or a task looked done while
+  someone was still waiting. Any unanswered question now keeps the task in "waiting for you".
+
+Behavior for two devices is unchanged.
+
 ## What's new in 0.8.0 (multi-device hand-off + task board)
 
 One person, several machines (office PC + home PC). Two things were missing before:

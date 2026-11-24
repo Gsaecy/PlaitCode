@@ -154,9 +154,9 @@
     }).then(function (result) {
       if (Array.isArray(result.devices)) {
         meta.textContent = (result.devices.length || 1) + ' \u53F0\u8BBE\u5907\u5728\u7EBF';
-        // \u624B\u673A\u53EA\u662F"\u7532\u65B9"\uFF0C\u771F\u6B63\u7684\u6267\u884C\u8005\u662F\u90A3\u4E9B\u7535\u8111\uFF1A\u628A\u5B83\u4EEC\u5217\u51FA\u6765\u4F9B\u6307\u6D3E
+        // \u624B\u673A\u53EA\u662F"\u7532\u65B9"\uFF0C\u771F\u6B63\u7684\u6267\u884C\u8005\u662F\u90A3\u4E9B\u7535\u8111\uFF1A\u5217\u51FA\u9664\u81EA\u5DF1\u4EE5\u5916\u7684\u8BBE\u5907\u4F9B\u6307\u6D3E
         devices = result.devices.filter(function (item) {
-          return item && item.id && item.platform !== 'android';
+          return item && item.id && item.id !== deviceId;
         });
         if (chosen && !devices.some(function (item) { return item.id === chosen; })) chosen = '';
         renderAssign();
@@ -271,7 +271,7 @@
       wrap.appendChild(bubble);
       main.appendChild(wrap);
     });
-    if (!main.childNodes.length) main.appendChild(el('div', 'empty', '\u8FD8\u6CA1\u6709\u53D1\u8A00\u3002\u8BF4\u4E00\u53E5\u9700\u6C42\uFF0C\u4E24\u53F0\u7535\u8111\u4E0A\u7684\u4E59\u65B9\u90FD\u4F1A\u6536\u5230\u3002'));
+    if (!main.childNodes.length) main.appendChild(el('div', 'empty', '\u8FD8\u6CA1\u6709\u53D1\u8A00\u3002\u8BF4\u4E00\u53E5\u9700\u6C42\uFF0C\u9891\u9053\u91CC\u7684\u4E59\u65B9\u90FD\u4F1A\u6536\u5230\u3002'));
     if (atBottom) main.scrollTop = main.scrollHeight;
   }
 
@@ -332,7 +332,7 @@
       kind: 'group', id: id, author: 'user', phase: 'requirement', body: text, requirementId: id, at: Date.now(),
       from: { id: deviceId, name: '\u624B\u673A \xB7 \u6D4F\u89C8\u5668', platform: 'android', project: 'mobile', version: 'web' }
     };
-    // \u6307\u6D3E\uFF1A\u8BF4\u6E05\u8BA9\u54EA\u53F0\u7535\u8111\u505A\uFF0C\u907F\u514D\u4E24\u53F0\u90FD\u8DD1\u4E00\u904D\u3001\u6539\u52A8\u4E92\u76F8\u8986\u76D6
+    // \u6307\u6D3E\uFF1A\u8BF4\u6E05\u8BA9\u54EA\u53F0\u7535\u8111\u505A\uFF0C\u907F\u514D\u6BCF\u53F0\u90FD\u8DD1\u4E00\u904D\u3001\u6539\u52A8\u4E92\u76F8\u8986\u76D6
     if (chosen) {
       message.assignee = chosen;
       var targetProject = projectOf(chosen);

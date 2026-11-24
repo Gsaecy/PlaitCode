@@ -4,7 +4,7 @@
  * 为什么不塞进主对话（用户 2026-11-23）：
  *   「群的对话窗口你准备放在哪里？……那就需要将显示的输出简化缩小，避免信息繁杂」
  *
- * 主对话是「你和一个 agent 干活」的地方，塞进另外两台设备的发言、追问、确认，
+ * 主对话是「你和一个 agent 干活」的地方，塞进其他设备的发言、追问、确认，
  * 一条长任务下来几十条消息，真正的工作过程就被淹了。
  *
  * 所以分工是：
@@ -78,7 +78,7 @@ export function groupHeader(state: GroupHeaderInput): {
   if (lanOn) {
     return {
       status: state.role === 'hub' ? '主机（等待队友）' : '已连接',
-      sub: '甲方提需求，乙方（两台设备上的 agent）先解析、必要时追问，达成一致后才动手。',
+      sub: '甲方提需求，乙方（频道里各台设备上的 agent）先解析、必要时追问，达成一致后才动手。',
       on: true,
     };
   }
@@ -298,7 +298,7 @@ export class GroupPanel implements vscode.Disposable {
     <h1>团队群</h1>
     <span class="pill" id="status">未连接</span>
   </div>
-  <div class="sub" id="sub">甲方提需求，乙方（两台设备上的 agent）先解析、必要时追问，达成一致后才动手。</div>
+  <div class="sub" id="sub">甲方提需求，乙方（频道里各台设备上的 agent）先解析、必要时追问，达成一致后才动手。</div>
   <div class="members" id="members"></div>
   <div class="toolbar">
     <button data-command="plaitcode.lanSync.openLedger">对齐账本</button>
@@ -317,7 +317,7 @@ export class GroupPanel implements vscode.Disposable {
     <textarea id="text" rows="2" placeholder="说需求，或回答乙方的追问…"></textarea>
     <button class="send" id="send">发送</button>
   </div>
-  <div class="hint">Enter 发送 · Shift+Enter 换行 · 你的话会同时发给两台设备上的乙方</div>
+  <div class="hint">Enter 发送 · Shift+Enter 换行 · 你的话会发到频道里所有设备</div>
 </footer>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
@@ -442,7 +442,7 @@ function render(state) {
   if (!state.lines.length) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.innerHTML = '<b>群里还没有发言</b><br>在下面发一条需求，两台设备上的乙方会各自给出解析；<br>有不清楚的地方它们会追问，你回答后才会开始动手。';
+    empty.innerHTML = '<b>群里还没有发言</b><br>在下面发一条需求，频道里的乙方会各自给出解析；<br>有不清楚的地方它们会追问，你回答后才会开始动手。';
     feed.appendChild(empty);
   }
   feed.scrollTop = feed.scrollHeight;
