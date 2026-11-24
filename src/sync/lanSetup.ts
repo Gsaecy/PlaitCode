@@ -548,6 +548,41 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         '知道了',
       );
     }),
+    /**
+     * 切换中继地址，**频道密钥不变**。
+     *
+     * 从香港换到内地节点时不需要重新建频道：频道 ID 由密钥派生，
+     * 密钥不变就还是同一个频道；把服务器的 channels 目录一起搬过去，
+     * 历史消息也就接上了。
+     */
+    vscode.commands.registerCommand('plaitcode.relay.move', async () => {
+      const secret = await context.secrets.get(relaySecretKey);
+      if (!secret) {
+        void vscode.window.showWarningMessage('还没有加入频道。先「新建跨网频道」或「加入跨网频道」。');
+        return;
+      }
+      const url = (await vscode.window.showInputBox({
+        title: '切换中继地址（频道密钥不变）',
+        prompt: '新的中继地址，例如 https://pc.honor-world.com（不带路径）',
+        value: relayUrl(),
+        ignoreFocusOut: true,
+        validateInput: (value) => (/^https?:\/\/[^\s]+$/.test(value.trim()) ? undefined : '要写成 https://域名 的形式'),
+      }))?.trim();
+      if (!url) return;
+      const current = relayUrl();
+      if (url === current) {
+        void vscode.window.showInformationMessage('地址没变。');
+        return;
+      }
+      await saveRelayUrl(url);
+      startRelay(url, secret);
+      refreshStatus();
+      void vscode.window.showInformationMessage(
+        `已切换到 ${url}。\n频道 ${deriveKeys(secret).channel} 保持不变。\n`
+        + '其它设备需要执行同一个命令切到新地址（或重新粘一次配对信息）。',
+        '知道了',
+      );
+    }),
     vscode.commands.registerCommand('plaitcode.relay.join', async () => {
       const text = await vscode.window.showInputBox({
         title: '加入跨网频道',
