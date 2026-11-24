@@ -1001,6 +1001,18 @@ export class LanSyncService implements Disposable {
       this.inviteCode = '';
       return { ok: false, message: started.message };
     }
+    /*
+     * 开新群 = 全新的一段对话。
+     *
+     * 以前旧群的需求、发言、进度、队友全留着，新群一打开就是上一轮的记录，
+     * 用户根本分不清这是新群还是旧群。现在开群就清干净。
+     */
+    this.requirements = [];
+    this.reports = [];
+    this.notes = [];
+    this.group = [];
+    // 新群不该带着上一轮的队友和设备。
+    this.peers.clear();
     this.inviteCode = code;
     // 记下**实际**监听端口：重启后按它恢复，端口对不上等于没恢复。
     this.lastPort = this.port;
@@ -1221,6 +1233,15 @@ export class LanSyncService implements Disposable {
       return { ok: false, message: `加入失败：这台电脑连不上 ${target}（${reason || '没有响应'}）。请确认两台在同一个 WiFi。` };
     }
     const response = answer.data ?? {};
+    /*
+     * 加入一个新群 = 全新的一段对话：先把上一个群的记录清掉。
+     * 否则新群里一打开就是旧需求、旧发言，用户分不清在看哪个群。
+     */
+    this.requirements = [];
+    this.reports = [];
+    this.notes = [];
+    this.group = [];
+    this.peers.clear();
     if (Array.isArray(response.peers)) this.absorbPeers(response.peers);
     /*
      * 加入了谁的群，就信任谁。
@@ -1231,6 +1252,22 @@ export class LanSyncService implements Disposable {
     const hostPeerId = (response.hub as { peer?: { id?: unknown } } | undefined)?.peer?.id;
     if (typeof hostPeerId === 'string' && hostPeerId) {
       this.approved.add(hostPeerId);
+      /*
+       * 把主机也记进**成员列表**。
+       *
+       * 以前只加了「可信名单」，成员列表里没有主机 ——
+       * 于是加入方永远显示「等对方加入」（成员数 0），
+       * 两台各自看各自的人，像根本没连上。
+       */
+      const hostPeer = parseSyncMessage({
+        kind: 'report',
+        requirementId: 'pair',
+        from: (response.hub as { peer?: unknown } | undefined)?.peer,
+        status: 'planned',
+      });
+      if (hostPeer) {
+        this.peers.set(hostPeer.from.id, { peer: hostPeer.from, address: target });
+      }
       await this.persist();
     }
     this.role = 'peer';
@@ -1239,8 +1276,7 @@ export class LanSyncService implements Disposable {
     // 记住加入时用的码：后面每条消息都要带它，否则主机会 403。
     this.joinedCode = normalizeInviteCode(code);
     this.hostMisses = 0;
-    this.startPeerHeartbeat();
-    this.bridge.log(`[sync] 已加入群聊 ${target}（邀请码 ${code}）`);
+    this.startPeerHeartbeat();    this.bridge.log(`[sync] 已加入群聊 ${target}（邀请码 ${code}）`);
     this.bridge.onState?.();
     if (response.already === true) {
       return { ok: true, message: '这台已经在群里了。' };

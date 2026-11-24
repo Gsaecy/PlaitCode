@@ -934,6 +934,64 @@ test('群消息分类：报数/算数/问句只回一句，改代码才算任务
   assert.equal(fallbackGroupIntent('报数之后把结果写进 README'), 'task');
 });
 
+test('开新群就是新群：上一轮的发言、需求、队友都不能留着', async () => {
+  const PORT = 49_411;
+  const peerPort = 49_412;
+  const hub = await makeService(winPeer);
+  const peer = await makeService({ ...macPeer, project: 'app-win' });
+
+  try {
+    const first = await hub.service.startGroup(PORT);
+    assert.equal(first.ok, true, first.message);
+    await peer.service.joinGroup(`127.0.0.1:${PORT}#${first.code}`, peerPort);
+    assert.equal(hub.service.remotePeers().length, 1, '第一轮应当有 1 台队友');
+
+    // 上一轮留下点东西
+    await hub.service.postGroup({ author: 'user', phase: 'requirement', body: '上一轮的需求' });
+    await hub.service.shareRequirement('上一轮的需求');
+    assert.ok(hub.service.recentGroup().length > 0);
+
+    // 再开一次群：必须是干净的新群
+    const second = await hub.service.startGroup(PORT);
+    assert.equal(second.ok, true, second.message);
+    assert.deepEqual(hub.service.recentGroup(), [], '新群不该带着上一轮的发言');
+    assert.equal(hub.service.remotePeers().length, 0, '新群不该带着上一轮的队友');
+    assert.notEqual(second.code, first.code, '新群要有新的邀请码');
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
+test('加入方必须能在成员列表里看到主机（否则会显示「等对方加入」）', async () => {
+  const PORT = 49_421;
+  const peerPort = 49_422;
+  const hub = await makeService(winPeer);
+  const peer = await makeService({ ...macPeer, project: 'app-win' });
+
+  try {
+    const started = await hub.service.startGroup(PORT);
+    const joined = await peer.service.joinGroup(`127.0.0.1:${PORT}#${started.code}`, peerPort);
+    assert.equal(joined.ok, true, joined.message);
+
+    /*
+     * 真机踩过：加入方只把主机记进「可信名单」，成员列表里没有主机，
+     * 于是页面显示「群聊已开 · 等对方加入」—— 两台各看各的，像没连上。
+     */
+    const seen = peer.service.remotePeers();
+    assert.equal(seen.length, 1, '加入方的成员列表里必须有主机');
+    assert.equal(seen[0]?.name, winPeer.name);
+    assert.match(seen[0]?.address ?? '', new RegExp(`:${PORT}$`), '记录的应当是主机的端口');
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {
   assert.equal(normalizeHubAddress('192.168.0.3', 47821), 'http://192.168.0.3:47821');
   assert.equal(normalizeHubAddress('192.168.0.3:5000', 47821), 'http://192.168.0.3:5000', '显式端口不能被覆盖');

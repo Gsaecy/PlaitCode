@@ -818,8 +818,10 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 这是唯一的开群入口 —— 不自动找设备、不互相比谁让位，谁开群谁当主机。
      */
     vscode.commands.registerCommand('hwchat.lanSync.startGroup', async () => {
-      // 新项目还没仓库：先提醒建仓库，否则两台没有共同的项目身份。
-      if (!await remindRepoIfMissing()) return;
+      /*
+       * 启动群聊**不再要求先选项目**（用户 2026-11-24 反馈：那一步太不方便）。
+       * 默认用当前打开的项目；进群后在群窗口里能看到并切换。
+       */
       const result = await service.startGroup(setting('lanSync.port', 47821));
       refreshStatus();
       if (!result.ok) {
@@ -855,8 +857,6 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 地址、端口、配对全部自动 —— 用户不需要知道对方的 IP。
      */
     vscode.commands.registerCommand('hwchat.lanSync.joinGroup', async () => {
-      // 本机项目没仓库时也提醒：否则对不齐项目。
-      await remindRepoIfMissing();
       const typed = await vscode.window.showInputBox({
         title: '加入群聊',
         prompt: '粘贴对方「复制邀请码」复制的那一整串（形如 192.168.0.3:47821#K7M2QX）——也可以只填 6 位邀请码',

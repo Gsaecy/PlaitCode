@@ -214,6 +214,9 @@ export class GroupPanel implements vscode.Disposable {
       type: 'state',
       role: state.role,
       relay: relayState,
+      /* 当前协作项目：进群后用这里显示与切换，不必事先选好。 */
+      projectName: this.service.currentProject() || this.service.localProjects()[0] || '',
+      projectRepo: this.service.currentRepo(),
       /* 邀请码（只有主机有）：一直显示在窗口顶部，并带可复制的整串。 */
       invite: this.service.currentInviteCode(),
       inviteText: this.service.currentInviteText(),
@@ -400,7 +403,15 @@ export class GroupPanel implements vscode.Disposable {
   <div class="toolbar">
     <button data-command="hwchat.lanSync.openLedger">对齐账本</button>
     <button data-command="hwchat.lanSync.status">连接状态</button>
+    <button data-command="hwchat.lanSync.pickProject">换项目</button>
     <button data-command="hwchat.lanSync.advanced">高级设置</button>
+  </div>
+  <div class="invite" id="projectBox">
+    <div class="k">这个群在做的项目</div>
+    <div class="v">
+      <span class="code" id="projectName" style="font-size:15px;letter-spacing:0"></span>
+      <span class="how" id="projectRepo"></span>
+    </div>
   </div>
   <div class="invite" id="invite">
     <div class="k">把这台电脑的邀请码给对方，另一台点「加入群聊」填进来</div>
@@ -503,6 +514,16 @@ function render(state) {
    * 用户之前只能在「右下角一闪而过」的通知里看到它，错过就得重开群（码会变）。
    * 这里同时给出可复制的整串（带地址），对方粘贴即可，不依赖广播。
    */
+  if (state.projectName) {
+    el('projectName').textContent = state.projectName;
+    el('projectRepo').textContent = state.projectRepo
+      ? '项目 ID：' + state.projectRepo
+      : '未绑定 GitHub 仓库（两台靠文件夹名对齐）';
+    el('projectBox').style.display = 'block';
+  } else {
+    el('projectBox').style.display = 'none';
+  }
+
   const inviteBox = el('invite');
   const inviteText = state.inviteText || '';
   if (inviteText) {
