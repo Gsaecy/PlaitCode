@@ -477,11 +477,14 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    */
   chat.setLanSync(service);
   /*
-   * 上次是群主就自动恢复监听。
-   * VS Code 重启会丢掉监听器，而用户手上的邀请串可能还在 ——
-   * 不恢复的话，另一台拿着那个码只会得到 ECONNREFUSED。
+   * 启动时**不自动恢复开群**。
+   *
+   * 以前会把上次的邀请码恢复成群主，结果两台各自开机后都成了群主、
+   * 谁也加入不了谁 —— 表现就是「群聊已开 · 等对方加入」一直不变。
+   * 现在每次协作都从一次明确操作开始：一台「启动群聊」，另一台「加入群聊」。
+   * 旧的邀请码作废（另一台连过来会明确报「对方没在等」）。
    */
-  if (service.currentInviteCode()) void service.resumeHosting();
+  void service.clearStaleInvite();
   /*
    * 团队群窗口：独立面板，不进主对话。
    *
@@ -884,24 +887,20 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         );
         let result = await attempt(false);
         /*
-         * 自己也在当群主时，先问一句再决定。
+         * 自己也在当群主时：**直接切过去，不弹模态确认**。
          *
-         * 两台都点「启动群聊」是最常见的操作；默默离开自己的群会让对方
-         * 拿着旧码空等，硬拦又会让人以为坏了 —— 所以给一次明确选择。
+         * 用户点了「加入群聊」并填了对方的码 —— 这本身就是明确意图。
+         * 之前这里弹了一个模态框，一旦没注意到（或按了 Esc），就什么都不发生，
+         * 表现正好是「两台都在等对方加入」。用一句普通提示告知即可。
          */
         if (!result.ok && result.needsSwitch) {
-          const choice = await vscode.window.showWarningMessage(
-            `${result.message}\n要放弃自己的群、改为加入对方的群吗？`,
-            { modal: true },
-            '放弃并加入',
-          );
-          if (choice !== '放弃并加入') {
-            output.info('[sync] 加入群聊：用户选择保留自己的群');
-            return;
-          }
+          output.info('[sync] 加入群聊：本机也在开群，按用户意图切到对方的群');
           service.stop();
           refreshStatus();
           result = await attempt(true);
+          if (result.ok) {
+            void vscode.window.showInformationMessage('已退出自己开的群，加入对方的群。');
+          }
         }
         output.info(`[sync] 加入群聊：${result.ok ? '成功' : '失败'} — ${result.message}`);
         refreshStatus();

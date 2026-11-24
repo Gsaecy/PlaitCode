@@ -1297,6 +1297,23 @@ export class LanSyncService implements Disposable {
   }
 
   /**
+   * 清掉重启后已经失效的邀请码。
+   *
+   * 监听器随进程消失，旧的码已经对不上任何人；留着只会让界面显示
+   * 「群聊 XXXXXX · 等加入」，而对方连过来必然失败。
+   */
+  async clearStaleInvite(): Promise<void> {
+    if (!this.inviteCode || this.role === 'hub') return;
+    this.bridge.log(`[sync] 旧的邀请码 ${this.inviteCode} 已随重启失效，清除`);
+    this.inviteCode = '';
+    this.joinedCode = '';
+    this.lastRole = 'hub';
+    this.lastHub = '';
+    await this.persist();
+    this.bridge.onState?.();
+  }
+
+  /**
    * 开机自愈：上次是群主就重新当群主。
    *
    * 用户手上的邀请串可能在剪贴板/聊天记录里放了一整天。VS Code 一重启监听器就没了，
