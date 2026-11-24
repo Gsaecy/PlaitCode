@@ -68,6 +68,22 @@ test('顶部状态：局域网没连但中继通着，必须是「已连接」�
   assert.equal(groupHeader({ role: 'peer' }).status, '已连接');
 });
 
+test('顶部状态：从机一台设备都不认识时，不能说「已连接」', () => {
+  /*
+   * 真机踩过：主机早就重启了，从机界面还挂着「已连接」和上一份群记录，
+   * 两台看到的群完全不一样。除本机以外一个设备都没有，就不该说已连接。
+   */
+  const stale = groupHeader({ role: 'peer', peerCount: 0 });
+  assert.equal(stale.on, false, '没有主机时状态灯不能是绿的');
+  assert.equal(stale.status, '正在确认连接');
+  assert.match(stale.sub, /重新点「启动群聊」/);
+
+  // 看到了主机才允许说已连接
+  assert.equal(groupHeader({ role: 'peer', peerCount: 1 }).status, '已连接');
+  // 主机端本来就是「等待队友」，不受影响
+  assert.equal(groupHeader({ role: 'hub', peerCount: 0 }).status, '主机（等待队友）');
+});
+
 /**
  * 电脑端补齐（与手机能力一致）：指派、停止、看结果。
  *

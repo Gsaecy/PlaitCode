@@ -57,6 +57,8 @@ export function compactGroupLine(message: SyncGroupMessage, now = Date.now()): {
 export interface GroupHeaderInput {
   role: string;
   relay?: { connected: boolean; peers: number; url: string };
+  /** 除本机以外的设备数：从机要确认「主机真的在」才敢说已连接。 */
+  peerCount?: number;
 }
 
 /**
@@ -75,9 +77,28 @@ export function groupHeader(state: GroupHeaderInput): {
   const relay = state.relay;
   const lanOn = state.role !== 'off';
   const relayOn = !!(relay && relay.connected);
-  if (lanOn) {
+  if (state.role === 'hub') {
     return {
-      status: state.role === 'hub' ? '主机（等待队友）' : '已连接',
+      status: '主机（等待队友）',
+      sub: '甲方提需求，乙方（频道里各台设备上的 agent）先解析、必要时追问，达成一致后才动手。',
+      on: true,
+    };
+  }
+  if (lanOn) {
+    /*
+     * 从机说「已连接」必须真有主机在。
+     * `peerCount` 是**除本机以外**的设备数；主机也算一台，所以至少要 1。
+     * 这里不做网络探测（那是心跳的事），只挡住「一台都不认识还宣称已连接」。
+     */
+    if (typeof state.peerCount === 'number' && state.peerCount < 1) {
+      return {
+        status: '正在确认连接',
+        sub: '还没看到主机。如果一直停在这里，说明对方已经不在群里了 —— 请让对方重新点「启动群聊」。',
+        on: false,
+      };
+    }
+    return {
+      status: '已连接',
       sub: '甲方提需求，乙方（频道里各台设备上的 agent）先解析、必要时追问，达成一致后才动手。',
       on: true,
     };
@@ -124,6 +145,13 @@ export class GroupPanel implements vscode.Disposable {
 
   /** 打开（或聚焦）群窗口。 */
   async open(): Promise<void> {
+    /*
+     * 开窗口先自检主机在不在。
+     *
+     * 否则用户会看到一个「已连接」的旧状态：主机早就重启/改 IP 了，
+     * 而界面还挂着上一份群记录 —— 两台看到的群完全不一样。
+     */
+    if (this.service.state().role === 'peer') void this.service.checkHostOnce();
     if (this.panel) {
       this.panel.reveal(undefined, true);
       await this.refresh();
@@ -195,7 +223,11 @@ export class GroupPanel implements vscode.Disposable {
       invite: this.service.currentInviteCode(),
       inviteText: this.service.currentInviteText(),
       inviteWaiting: this.service.currentInviteCode() !== '' && this.service.remotePeers().length === 0,
-      header: groupHeader({ role: state.role, ...(relayState ? { relay: relayState } : {}) }),
+      header: groupHeader({
+        role: state.role,
+        peerCount: this.service.remotePeers().length,
+        ...(relayState ? { relay: relayState } : {}),
+      }),
       peers: (() => {
         const local = this.service.localPeer();
         const seen = new Map<string, { id: string; name: string; platform: string; project: string; isLocal: boolean }>();
@@ -355,7 +387,12 @@ export class GroupPanel implements vscode.Disposable {
     letter-spacing: 3px; color: var(--accent); user-select: all; }
   .invite .how { font-size: 11px; color: var(--muted); }
   .invite button { font-size: 11px; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--accent);
-    background: transparent; color: var(--accent); cursor: pointer; }
+    background: transparent; color: var(--accent); cursor: pointer;
+    transition: background-color .14s ease-out, color .14s ease-out, transform .1s ease-out; }
+  .invite button:hover { background: var(--accent); color: #fff; }
+  /* 按下立刻有回应：以前点「复制邀请码」完全没反馈，用户以为没生效 */
+  .invite button:active { transform: translateY(1px) scale(.97); filter: brightness(.9); }
+  .invite button.copied { background: var(--ok, #34d399); border-color: var(--ok, #34d399); color: #06231a; }
 </style></head>
 <body>
 <header>
@@ -599,7 +636,15 @@ for (const button of document.querySelectorAll('.toolbar button')) {
   button.addEventListener('click', () => vscode.postMessage({ type: 'command', command: button.dataset.command }));
 }
 el('copyInvite').addEventListener('click', () => {
+  const button = el('copyInvite');
+  // 立刻给出可见结果：以前点了完全没反应，用户不知道复制成没成。
+  button.classList.add('copied');
+  button.textContent = '已复制';
   vscode.postMessage({ type: 'copyInvite', text: el('invite').dataset.text || el('inviteCode').textContent || '' });
+  setTimeout(() => {
+    button.classList.remove('copied');
+    button.textContent = '复制邀请码';
+  }, 1400);
 });
 window.addEventListener('message', (event) => { if (event.data?.type === 'state') render(event.data); });
 vscode.postMessage({ type: 'ready' });
