@@ -234,6 +234,32 @@ export function yieldDecision(selfId: string, otherPeerId: unknown): 'stay' | 'y
   return selfId > otherPeerId ? 'yield' : 'stay';
 }
 
+/** 邀请码字符集：去掉了 0/O、1/I 这类抄写时容易看错的字符。 */
+const INVITE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const INVITE_LENGTH = 6;
+
+/**
+ * 发现端口：双方约定的**固定会合点**。
+ *
+ * 不能跟着 HTTP 端口走 —— HTTP 端口被占用时会自动换成系统分配的值，
+ * 一旦发现端口也跟着漂，两台设备就再也找不到彼此了。
+ */
+const DISCOVERY_PORT = 47_821;
+
+/** 生成邀请码（6 位，人可抄写）。传 `random` 便于测试固定输出。 */
+export function makeInviteCode(random: () => number = Math.random): string {
+  let code = '';
+  for (let index = 0; index < INVITE_LENGTH; index += 1) {
+    code += INVITE_ALPHABET[Math.floor(random() * INVITE_ALPHABET.length)] ?? 'A';
+  }
+  return code;
+}
+
+/** 用户手抄常带小写和空格，统一成大写再去比对。 */
+export function normalizeInviteCode(input: string): string {
+  return input.replace(/[\s-]/g, '').toUpperCase();
+}
+
 export class LanSyncService implements Disposable {
   private server?: Server;
   private udp?: UdpSocket;
@@ -262,6 +288,13 @@ export class LanSyncService implements Disposable {
   private lastPort = 0;
   /** 正在让位给另一台主机：避免重复触发。 */
   private yielding = false;
+  /** 本机群聊的邀请码（主机才有值）。空串表示这不是一个「等邀请码的群聊」。 */
+  private inviteCode = '';
+  /**
+   * UDP 发现端口（固定，不随 HTTP 端口变化）。
+   * 可注入只是为了让测试在同一台机器上跑；生产永远用 `DISCOVERY_PORT`。
+   */
+  readonly discoveryPort: number = DISCOVERY_PORT;
   private readonly peers = new Map<string, { peer: SyncPeer; address: string }>();
   private disposed = false;
   private announceTimer?: NodeJS.Timeout;
@@ -769,6 +802,135 @@ export class LanSyncService implements Disposable {
     }
   }
 
+  /** 本机群聊的邀请码；不是主机时为空串。 */
+  currentInviteCode(): string {
+    return this.inviteCode;
+  }
+
+  /**
+   * 启动群聊：生成邀请码并成为主机，等别人填码进来。
+   *
+   * 这是新的、也是唯一的开群入口 —— 不做「自动找设备然后互相比谁让位」那一套。
+   * 谁开群谁当主机，谁想进来谁填码，角色永远清楚。
+   */
+  async startGroup(port?: number): Promise<{ ok: boolean; message: string; code?: string }> {
+    const code = makeInviteCode();
+    const started = await this.startHub(port);
+    if (!started.ok) {
+      this.inviteCode = '';
+      return { ok: false, message: started.message };
+    }
+    this.inviteCode = code;
+    // 立刻用新码广播一次，别让从机等下一个周期。
+    this.announceNow();
+    this.bridge.log(`[sync] 群聊已开，邀请码 ${code}`);
+    this.bridge.onState?.();
+    return { ok: true, code, message: `群聊已开。让另一台设备「加入群聊」并填邀请码 ${code}。` };
+  }
+
+  /**
+   * 填邀请码加入群聊。
+   *
+   * 邀请码既用来**找到**群（广播里带码），也用来**通过**主机的校验 ——
+   * 用户只需要抄一个 6 位码，不需要知道 IP、端口、配对码。
+   *
+   * `address` 只在广播被拦时兜底（高级用法 / 测试），正常路径不要传。
+   */
+  async joinGroup(code: string, port?: number, address?: string): Promise<{ ok: boolean; message: string }> {
+    const wanted = normalizeInviteCode(code);
+    if (!wanted) return { ok: false, message: '请填写邀请码。' };
+    this.usePort(port ?? this.configuredPort);
+    this.stopListener();
+    try {
+      await this.startListener();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, message: `本机监听失败：${message}` };
+    }
+    const typed = address?.trim();
+    const target = typed ? normalizeHubAddress(typed, this.port) : await this.discover(wanted);
+    if (!target) {
+      this.role = 'off';
+      this.stopListener();
+      return {
+        ok: false,
+        message: `没找到邀请码 ${wanted} 的群聊。请确认另一台电脑已经点了「启动群聊」，并且两台在同一个 WiFi。`,
+      };
+    }
+    return this.finishJoin(target, wanted);
+  }
+
+  /**
+   * 主机那边记着自己是哪个群，所以重复加入要被认出来。
+   *
+   * 「一个设备只能进一次」：同一台设备再填一次码，不能变成两台。
+   * 设备身份用本机稳定 id（`localPeer`），换机器才会变。
+   */
+  /**
+   * 配对请求：**保留服务端给的原因**。
+   *
+   * `postJson` 会把 4xx 统一吞成 undefined，于是「邀请码不对」和「主机没响应」
+   * 在界面上变成同一句话 —— 前者要用户重新抄码，后者要检查网络，不能混。
+   */
+  private async pairRequest(
+    target: string,
+    body: Record<string, unknown>,
+  ): Promise<{ ok: boolean; error?: string; data?: Record<string, unknown> }> {
+    try {
+      const text = await postRaw(target, '/hwchat-sync/v1/pair', JSON.stringify(body));
+      const data = JSON.parse(text) as Record<string, unknown>;
+      return { ok: true, data };
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      const match = raw.match(/\{"ok":false,"error":"([^"]*)"\}/);
+      return { ok: false, error: match?.[1] || raw.slice(0, 160) };
+    }
+  }
+
+  private async finishJoin(target: string, code: string): Promise<{ ok: boolean; message: string }> {
+    const answer = await this.pairRequest(target, {
+      protocol: SYNC_PROTOCOL_VERSION,
+      code,
+      peer: this.bridge.peer(),
+      port: this.port,
+    });
+    if (!answer.ok) {
+      this.role = 'off';
+      this.stopListener();
+      const reason = answer.error ?? '';
+      // 邀请码错与连不上，用户要做的事完全不同，分开说。
+      if (/邀请码/.test(reason)) {
+        return { ok: false, message: `加入失败：${reason}。请核对另一台电脑上显示的邀请码。` };
+      }
+      return { ok: false, message: `加入失败：这台电脑连不上 ${target}（${reason || '没有响应'}）。请确认两台在同一个 WiFi。` };
+    }
+    const response = answer.data ?? {};
+    if (Array.isArray(response.peers)) this.absorbPeers(response.peers);
+    this.role = 'peer';
+    this.hubAddress = target;
+    this.inviteCode = '';
+    this.bridge.log(`[sync] 已加入群聊 ${target}（邀请码 ${code}）`);
+    this.bridge.onState?.();
+    if (response.already === true) {
+      return { ok: true, message: '这台已经在群里了。' };
+    }
+    return { ok: true, message: '已加入群聊。两台设备会一起执行群里的需求。' };
+  }
+
+  /** 立刻广播一次（邀请码变了、刚开群时用）。 */
+  private announceNow(): void {
+    const payload = Buffer.from(JSON.stringify({
+      magic: HUB_MAGIC,
+      peer: this.bridge.peer().id,
+      code: this.inviteCode,
+      port: this.port,
+      addresses: lanAddresses(),
+    }));
+    for (const target of broadcastTargets()) {
+      this.udp?.send(payload, this.discoveryPort, target, () => { /* 广播失败无所谓，周期广播还会再发 */ });
+    }
+  }
+
   /** 加入某台主机。地址留空时用 UDP 广播自动寻找。 */
   async joinHub(address?: string, port = this.configuredPort): Promise<{ ok: boolean; message: string }> {
     this.usePort(port);
@@ -883,7 +1045,7 @@ export class LanSyncService implements Disposable {
     const udp = createSocket({ type: 'udp4', reuseAddr: true });
     await new Promise<void>((resolve, reject) => {
       udp.once('error', reject);
-      udp.bind(this.configuredPort, () => {
+      udp.bind(this.discoveryPort, () => {
         udp.off('error', reject);
         resolve();
       });
@@ -891,60 +1053,42 @@ export class LanSyncService implements Disposable {
     udp.on('error', (error) => this.bridge.log(`[sync] UDP 错误：${error.message}`, 'warn'));
     udp.on('message', (buffer, remote) => {
       const text = buffer.toString('utf8');
+      const selfId = this.bridge.peer().id;
+
+      /* ---------- 1. 有人在找主机：回一句「我在这儿」 ---------- */
+      let isAsk = false;
       if (text === DISCOVER_MAGIC) {
-        /*
-         * 有人在找主机：把自己的地址回过去。
-         *
-         * 但**自己发的那一条不回**：UDP 广播会回环到本机，回了就成了
-         * 「本机回复本机」，加入方拿到的会是自己的地址 —— 那正是
-         * 「已加入主机 192.168.0.3」却两台都没连上的原因。
-         */
+        isAsk = true;
+        // 旧版询问拿不到设备 id，只能按 IP 挡掉自己发的那一条（广播会回环）。
         if (isOwnAddress(remote.address)) return;
-        const payload = JSON.stringify({ magic: HUB_MAGIC, peer: this.bridge.peer().id, port: this.port, addresses: lanAddresses() });
-        udp.send(payload, remote.port, remote.address);
+      } else {
+        let parsed: { magic?: unknown; peer?: unknown; addresses?: unknown; port?: unknown } | undefined;
+        try {
+          parsed = JSON.parse(text) as typeof parsed;
+        } catch {
+          return;
+        }
+        if (parsed?.magic === DISCOVER_MAGIC) {
+          isAsk = true;
+          /*
+           * 按**设备 id** 挡自己，不按 IP。
+           *
+           * 按 IP 会把「同一台电脑上开的另一个窗口」也挡掉 —— 一个窗口做 Windows 版、
+           * 一个窗口做 macOS 版是很正常的用法，那样就永远连不上了。
+           */
+          if (typeof parsed.peer === 'string' && parsed.peer === selfId) return;
+        } else if (parsed?.magic === HUB_MAGIC) {
+          this.considerYielding(parsed, udp);
+          return;
+        } else {
+          return;
+        }
+      }
+      if (isAsk) {
+        const reply = JSON.stringify({ magic: HUB_MAGIC, peer: selfId, port: this.port, addresses: lanAddresses() });
+        udp.send(reply, remote.port, remote.address);
         return;
       }
-      /*
-       * 两台都点了按钮 → 两边都成了主机 → 谁也不连谁。
-       * 这是最容易踩的坑（用户就是这么操作的）。
-       *
-       * 所以听到别的主机广播时按设备 id 谦让：id 大的主动降为从机去加入对方。
-       * 只让一边让位，不会两边同时让步。
-       */
-      /*
-       * 两台都点了按钮 → 两边都成了主机 → 谁也不连谁。
-       * 这是最容易踩的坑（用户就是这么操作的）。
-       *
-       * 所以听到别的主机广播时按设备 id 谦让：id 大的主动降为从机去加入对方。
-       * 只让一边让位，不会两边同时让步。
-       *
-       * **旧版没有 `peer` 字段，也不会让位**：这时本机无条件让，否则两边会永远对着待命。
-       * 旧版的配对接口是同一套，让位之后照样能连上。
-       */
-      if (this.role !== 'hub' || this.yielding) return;
-      let other: { magic?: unknown; peer?: unknown; addresses?: unknown; port?: unknown } | undefined;
-      try {
-        other = JSON.parse(text) as typeof other;
-      } catch {
-        return;
-      }
-      if (other?.magic !== HUB_MAGIC) return;
-      if (yieldDecision(this.bridge.peer().id, other.peer) === 'stay') return;
-      const address = Array.isArray(other.addresses)
-        ? other.addresses.find((item): item is string => typeof item === 'string' && Boolean(item) && !isOwnAddress(item))
-        : undefined;
-      if (!address) return;
-      const target = `http://${address}:${typeof other.port === 'number' ? other.port : this.configuredPort}`;
-      this.yielding = true;
-      this.bridge.log(`[sync] 发现另一台已经是主机（${address}），本机让位并加入`);
-      // 延后一拍：joinHub 会关掉当前这个发现 socket，不能在它自己的回调里直接关。
-      setTimeout(() => {
-        void this.joinHub(target, this.configuredPort).then((result) => {
-          this.yielding = false;
-          if (result.ok) this.bridge.onState?.();
-          else this.bridge.log(`[sync] 让位失败：${result.message}`, 'warn');
-        });
-      }, 0);
     });
     this.udp = udp;
     /*
@@ -957,10 +1101,15 @@ export class LanSyncService implements Disposable {
       const payload = Buffer.from(JSON.stringify({
         magic: HUB_MAGIC,
         peer: this.bridge.peer().id,
+        /*
+         * 邀请码必须出现在广播里：从机就是靠它找到「我要进的那个群」。
+         * 没有码时（旧模式 / 高级手动连接）发空串，从机按码找时就找不到它。
+         */
+        code: this.inviteCode,
         port: this.port,
         addresses: lanAddresses(),
       }));
-      for (const target of broadcastTargets()) udp.send(payload, this.configuredPort, target, () => { /* 广播失败无所谓 */ });
+      for (const target of broadcastTargets()) udp.send(payload, this.discoveryPort, target, () => { /* 广播失败无所谓 */ });
     };
     // 先立刻喊一声：否则两台同时点按钮时要干等 15 秒才知道对方也是主机。
     announce();
@@ -968,7 +1117,59 @@ export class LanSyncService implements Disposable {
     this.announceTimer.unref?.();
   }
 
-  private async discover(): Promise<string> {
+  /**
+   * 听到别的主机广播：两台都点了按钮时，谁让位。
+   *
+   * 两边各自成为主机、谁也不连谁是用户最容易踩的坑（他就是这么操作的）。
+   * 规则按设备 id：id 大的降为从机去加入对方，只让一边让，不会两边同时让步。
+   * **旧版广播没有 `peer` 字段，而且它自己不会让位** —— 这时本机无条件让，
+   * 否则两边会永远对着待命；旧版配对接口是同一套，让位后照样能连上。
+   */
+  private considerYielding(
+    other: { peer?: unknown; code?: unknown; addresses?: unknown; port?: unknown },
+    udp: UdpSocket,
+  ): void {
+    if (this.role !== 'hub' || this.yielding) return;
+    if (yieldDecision(this.bridge.peer().id, other.peer) === 'stay') return;
+    const addresses = Array.isArray(other.addresses)
+      ? other.addresses.filter((item): item is string => typeof item === 'string' && Boolean(item))
+      : [];
+    // 优先连非本机地址；同一台机器上的另一个窗口则直接用它的地址。
+    const address = addresses.find((item) => !isOwnAddress(item)) ?? (other.peer ? addresses[0] : undefined);
+    if (!address) return;
+    const otherCode = typeof other.code === 'string' ? other.code : '';
+    const target = `http://${address}:${typeof other.port === 'number' ? other.port : this.port}`;
+    this.yielding = true;
+    this.bridge.log(`[sync] 发现另一台也开了群聊（${address}），本机让位并加入`);
+    // 延后一拍：join 会关掉当前这个发现 socket，不能在它自己的回调里直接关。
+    setTimeout(() => {
+      /*
+       * 对方开着群聊时**用它给的邀请码进群** —— 走的就是「填码进群」同一条路径，
+       * 两台都点了「启动群聊」也能自动收敛成「一台主机 + 一台成员」。
+       * 对方没有码（旧版 / 高级手动模式）才退回旧的配对方式。
+       */
+      const attempt = otherCode
+        ? this.joinGroup(otherCode, this.configuredPort, target)
+        : this.joinHub(target, this.configuredPort);
+      void attempt
+        .then((result) => {
+          this.yielding = false;
+          if (result.ok) this.bridge.onState?.();
+          else this.bridge.log(`[sync] 让位失败：${result.message}`, 'warn');
+        })
+        .catch(() => { this.yielding = false; });
+    }, 0);
+    void udp;
+  }
+
+  /**
+   * 找主机。
+   *
+   * 传了邀请码就只认**码对得上**的群聊 —— 这是「填码进群」能成立的关键：
+   * 用户不需要知道对方 IP，广播里带着码自己就对上了。
+   * 不传码时保持旧行为（自动找任意一台主机），供「高级 → 手动连接」使用。
+   */
+  private async discover(expectedCode?: string): Promise<string> {
     const udp = createSocket({ type: 'udp4', reuseAddr: true });
     return new Promise((resolve) => {
       let settled = false;
@@ -980,28 +1181,45 @@ export class LanSyncService implements Disposable {
         try { udp.close(); } catch { /* 已关闭 */ }
         resolve(value);
       };
-      timers.push(setTimeout(() => finish(''), 2_000));
+      // 按码找可以多等一会儿：用户抄码需要时间，主机广播也要有时间轮到。
+      timers.push(setTimeout(() => finish(''), expectedCode ? 4_000 : 2_000));
       udp.on('error', () => finish(''));
       udp.on('message', (buffer) => {
         try {
-          const parsed = JSON.parse(buffer.toString('utf8')) as { magic?: string; addresses?: unknown; port?: unknown };
+          const parsed = JSON.parse(buffer.toString('utf8')) as {
+            magic?: string;
+            peer?: unknown;
+            code?: unknown;
+            addresses?: unknown;
+            port?: unknown;
+          };
           if (parsed.magic !== HUB_MAGIC || !Array.isArray(parsed.addresses)) return;
+          // 码对不上就不是我要找的群。
+          if (expectedCode && parsed.code !== expectedCode) return;
           /*
-           * 只认**别人的**地址。
+           * 是不是自己，按**设备 id** 判断，不按 IP 判断。
            *
-           * 本机如果同时也是主机，它的广播会绕回自己这里；不过滤的话就会
-           * 「自己加入自己」，界面显示连上了，实际一台都没连。
+           * 本机如果同时也是主机，它的广播会绕回自己这里，必须排除；
+           * 但同一台电脑上开的另一个窗口 IP 也一样 —— 按 IP 判断会把对方一起排掉，
+           * 那种用法（一个窗口做 Windows 版、一个做 macOS 版）就永远连不上。
            */
-          const address = parsed.addresses.find(
-            (item): item is string => typeof item === 'string' && Boolean(item) && !isOwnAddress(item),
+          if (typeof parsed.peer === 'string' && parsed.peer === this.bridge.peer().id) return;
+          const usable = parsed.addresses.filter(
+            (item): item is string => typeof item === 'string' && Boolean(item),
           );
-          if (address) finish(`http://${address}:${typeof parsed.port === 'number' ? parsed.port : this.configuredPort}`);
+          // 优先选非本机地址；全都是本机地址时说明是同一台机器上的另一个窗口，也应当能连。
+          const address = usable.find((item) => !isOwnAddress(item)) ?? (parsed.peer ? usable[0] : undefined);
+          if (address) finish(`http://${address}:${typeof parsed.port === 'number' ? parsed.port : this.port}`);
         } catch {
           // 不是我们的包。
         }
       });
       udp.bind(() => {
-        const payload = Buffer.from(DISCOVER_MAGIC);
+        /*
+         * 询问包带上设备 id：主机靠它区分「本机回环」与「同一台机器上的另一个窗口」。
+         * 旧版收到 JSON 会当垃圾丢弃，所以新版同时再发一条旧格式，保证能连上旧设备。
+         */
+        const payload = Buffer.from(JSON.stringify({ magic: DISCOVER_MAGIC, peer: this.bridge.peer().id }));
         udp.setBroadcast(true);
         /*
          * UDP 广播不可靠：丢一个包就是「找不到设备」。
@@ -1010,7 +1228,7 @@ export class LanSyncService implements Disposable {
          * 从错误的网卡送出去，路由器也经常直接丢弃；定向到本网段才走得通。
          */
         const ask = (): void => {
-          for (const target of broadcastTargets()) udp.send(payload, this.configuredPort, target, () => { /* 忽略 */ });
+          for (const target of broadcastTargets()) udp.send(payload, this.discoveryPort, target, () => { /* 忽略 */ });
         };
         ask();
         timers.push(setTimeout(ask, 350), setTimeout(ask, 800), setTimeout(ask, 1_300));
@@ -1060,7 +1278,7 @@ export class LanSyncService implements Disposable {
 
   /** 本机实际监听端口与发现端口（核对端口是否被换过）。 */
   ports(): { listen: number; discovery: number } {
-    return { listen: this.port, discovery: this.configuredPort };
+    return { listen: this.port, discovery: this.discoveryPort };
   }
 
   private async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -1115,6 +1333,7 @@ export class LanSyncService implements Disposable {
       }
       if (route === '/hwchat-sync/v1/pair') {
         const message = parseSyncMessage({ kind: 'report', requirementId: 'pair', from: parsed.peer, status: 'planned' });
+        let already = false;
         if (message) {
           /*
            * 加入方自己的地址必须算准，否则主机会把需求「转发」到自己身上。
@@ -1130,32 +1349,39 @@ export class LanSyncService implements Disposable {
             ? parsed.address
             : (remoteIp ? `http://${remoteIp}:${declaredPort}` : '');
           /*
-           * 放行判断，**傻瓜式**优先：
-           *  1. 这台设备以前被允许过 → 直接放行（重连不再打扰）；
-           *  2. 配对码对得上（老用户/固定码场景）→ 放行并记住；
-           *  3. 否则问用户一次「允许吗」——用户点一次，以后就自动记住。
-           * 没有 `approvePeer` 实现时退回「配对码必须对」（测试环境 / 无人值守）。
+           * 放行判断，**填码进群**优先：
+           *  1. 邀请码对得上 → 直接放行（这就是正常路径）；
+           *  2. 这台设备以前进过这个群 → 放行（重连不再打扰）；
+           *  3. 都没有时问用户一次「允许吗」——保留给「高级 → 手动连接」那种没有码的场景。
+           * 没有 `approvePeer` 实现时退回「码必须对」（测试环境 / 无人值守）。
            */
           const known = this.approved.has(message.from.id);
-          const codeOk = pairingMatches(parsed.code, this.code);
-          let allowed = known || codeOk;
+          const supplied = normalizeInviteCode(typeof parsed.code === 'string' ? parsed.code : '');
+          const codeOk = this.inviteCode
+            ? supplied === normalizeInviteCode(this.inviteCode)
+            : pairingMatches(parsed.code, this.code);
+          let allowed = codeOk || known;
           if (!allowed && this.bridge.approvePeer) {
             allowed = await this.bridge.approvePeer(message.from).catch(() => false);
           }
           if (!allowed) {
-            this.bridge.log(`[sync] 拒绝未授权的设备：${message.from.name}`);
-            json(403, { ok: false, error: '未允许连接' });
+            this.bridge.log(`[sync] 邀请码不对，拒绝：${message.from.name}`);
+            json(403, { ok: false, error: '邀请码不对' });
             return;
           }
           if (!known) {
             this.approved.add(message.from.id);
             await this.persist();
           }
+          const alreadyIn = this.peers.has(message.from.id);
+          already = alreadyIn;
           this.peers.set(message.from.id, { peer: message.from, address });
-          this.bridge.log(`[sync] 设备加入：${message.from.name}（${message.from.project}）${address ? ` → ${address}` : ''}`);
+          if (alreadyIn) this.bridge.log(`[sync] ${message.from.name} 已在群里，重复加入不重复计数`);
+          else this.bridge.log(`[sync] 设备加入：${message.from.name}（${message.from.project}）${address ? ` → ${address}` : ''}`);
         }
         json(200, {
           ok: true,
+          already,
           peers: this.peerList(),
           hub: { peer: this.bridge.peer(), address: this.selfAddress(request.socket.remoteAddress) },
         });

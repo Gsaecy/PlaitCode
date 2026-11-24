@@ -91,7 +91,7 @@ export function groupHeader(state: GroupHeaderInput): {
   }
   return {
     status: '未连接',
-    sub: '还没有连接另一台设备。点状态栏或设置页的「连接另一台设备」，两台在同一 WiFi 时各点一次就能连上。',
+    sub: '还没有进群。点状态栏的「启动群聊」生成邀请码，或在另一台点「加入群聊」填对方的邀请码。',
     on: false,
   };
 }

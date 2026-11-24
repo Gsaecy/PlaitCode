@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { LanSyncService, normalizeHubAddress, yieldDecision } from '../sync/lanSync';
+import { LanSyncService, makeInviteCode, normalizeHubAddress, normalizeInviteCode, yieldDecision } from '../sync/lanSync';
 import type { SyncNote, SyncPeer, SyncRequirement } from '../sync/lanProtocol';
 
 /**
@@ -22,6 +22,7 @@ const macPeer: SyncPeer = { id: 'p-mac', name: 'Mac · macOS', platform: 'darwin
 async function makeService(peer: SyncPeer, options: {
   onRequirement?: (requirement: SyncRequirement) => Promise<boolean>;
   onNote?: (note: SyncNote) => Promise<boolean>;
+  onGroupMessage?: (message: any) => Promise<void>;
 } = {}): Promise<{ service: LanSyncService; dir: string; ledgers: string[] }> {
   const dir = await mkdtemp(join(tmpdir(), 'hwchat-sync-'));
   const ledgers: string[] = [];
@@ -29,6 +30,7 @@ async function makeService(peer: SyncPeer, options: {
     peer: () => peer,
     runRequirement: options.onRequirement ?? (async () => true),
     runNote: options.onNote ?? (async () => true),
+    ...(options.onGroupMessage ? { onGroupMessage: options.onGroupMessage } : {}),
     writeLedger: async (markdown) => { ledgers.push(markdown); },
     writeTranscript: async () => undefined,
     log: () => undefined,
@@ -36,6 +38,71 @@ async function makeService(peer: SyncPeer, options: {
   await service.load();
   return { service, dir, ledgers };
 }
+
+/**
+ * 用户反复卡住的那一步：**群里发的话，另一台到底收没收到**。
+ *
+ * 以前 `chatPanel.setLanSync()` 从没被调用，群消息整个分支被跳过 ——
+ * 群窗口一片空白，只有本机主对话在跑。这条测的就是那条链真的通不通。
+ */
+test('端到端：群里发的发言，另一台真的收到（双向）', async () => {
+  const HUB_PORT = 48_341;
+  const PEER_PORT = 48_342;
+
+  const hubGot: string[] = [];
+  const peerGot: string[] = [];
+
+  const hub = await makeService(winPeer, {
+    onGroupMessage: async (message) => { hubGot.push(String(message.body)); },
+  });
+  const peer = await makeService(macPeer, {
+    onGroupMessage: async (message) => { peerGot.push(String(message.body)); },
+  });
+
+  await hub.service.setPairingCode('TEST-CODE');
+  await peer.service.setPairingCode('TEST-CODE');
+
+  try {
+    const started = await hub.service.startHub(HUB_PORT);
+    assert.equal(started.ok, true, started.message);
+
+    const joined = await peer.service.joinHub(`http://127.0.0.1:${HUB_PORT}`, PEER_PORT);
+    assert.equal(joined.ok, true, joined.message);
+
+    // 主机 → 从机
+    const fromHub = await hub.service.postGroup({
+      author: 'user',
+      phase: 'requirement',
+      body: '主机发的一条需求',
+    });
+    assert.equal(fromHub.ok, true, fromHub.message);
+    assert.ok(peerGot.includes('主机发的一条需求'), '从机必须收到主机在群里说的话');
+
+    // 从机 → 主机（转发经由主机）
+    const fromPeer = await peer.service.postGroup({
+      author: 'user',
+      phase: 'requirement',
+      body: '从机发的一条需求',
+    });
+    assert.equal(fromPeer.ok, true, fromPeer.message);
+    assert.ok(hubGot.includes('从机发的一条需求'), '主机必须收到从机在群里说的话');
+
+    // 本机自己也要留下记录（群窗口不能空白）
+    assert.deepEqual(
+      hub.service.recentGroup().map((item) => item.body),
+      ['主机发的一条需求', '从机发的一条需求'],
+    );
+    assert.deepEqual(
+      peer.service.recentGroup().map((item) => item.body),
+      ['主机发的一条需求', '从机发的一条需求'],
+    );
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
 
 test('端到端：配对后主机发需求，对端真的收到并执行；对端回报后主机账本更新', async () => {
   const hub = await makeService(winPeer);
@@ -323,6 +390,61 @@ test('两台都成主机时，只有 id 大的让位（不会两边同时让步�
   assert.equal(yieldDecision('p-a', undefined), 'yield');
   assert.equal(yieldDecision('p-a', ''), 'yield');
   assert.equal(yieldDecision('p-a', 42), 'yield');
+});
+
+test('邀请码：6 位、只含易辨认字符、可规范化', () => {
+  const code = makeInviteCode();
+  assert.equal(code.length, 6);
+  assert.match(code, /^[A-HJ-NP-Z2-9]{6}$/, `不能出现易混字符（0/O/1/I），实际：${code}`);
+
+  // 每个位置都落在字符集内（不是恰好好看）。
+  for (const ch of code) assert.ok('ABCDEFGHJKLMNPQRSTUVWXYZ23456789'.includes(ch));
+
+  // 用户抄写常带小写、空格、连字符。
+  assert.equal(normalizeInviteCode(' k7m2qx '), 'K7M2QX');
+  assert.equal(normalizeInviteCode('K7M-2QX'), 'K7M2QX');
+  assert.equal(normalizeInviteCode('  '), '');
+
+  // 同一随机源必须给出同一码（可测、可复现）。
+  const fixed = () => 0.5;
+  assert.equal(makeInviteCode(fixed), makeInviteCode(fixed));
+});
+
+test('填码进群：码对才进得来，同一设备重复加入不会变成两台', async () => {
+  const HUB_PORT = 48_351;
+  const PEER_PORT = 48_352;
+
+  const hub = await makeService(winPeer);
+  const peer = await makeService(macPeer);
+
+  try {
+    const started = await hub.service.startGroup(HUB_PORT);
+    assert.equal(started.ok, true, started.message);
+    const code = started.code ?? '';
+    assert.match(code, /^[A-HJ-NP-Z2-9]{6}$/);
+
+    // 错的码：必须明确说「没找到」/「邀请码不对」，不能假装连上。
+    const wrong = await peer.service.joinGroup('ZZZZZZ', PEER_PORT, `http://127.0.0.1:${HUB_PORT}`);
+    assert.equal(wrong.ok, false);
+    assert.match(wrong.message, /邀请码不对|没找到邀请码/);
+
+    // 对的码：小写 + 空格也要认。
+    const joined = await peer.service.joinGroup(` ${code.toLowerCase()} `, PEER_PORT, `http://127.0.0.1:${HUB_PORT}`);
+    assert.equal(joined.ok, true, joined.message);
+    assert.equal(peer.service.state().role, 'peer');
+    assert.equal(hub.service.remotePeers().length, 1, '主机应当看到 1 台设备');
+
+    // 同一台设备再进一次：仍然只有 1 台，并明确告诉它「已经在群里」。
+    const again = await peer.service.joinGroup(code, PEER_PORT, `http://127.0.0.1:${HUB_PORT}`);
+    assert.equal(again.ok, true, again.message);
+    assert.match(again.message, /已经在群里/);
+    assert.equal(hub.service.remotePeers().length, 1, '重复加入不能变成两台');
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
 });
 
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {

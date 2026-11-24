@@ -39,6 +39,7 @@ type IncomingMessage =
   | { type: 'restoreTrash' }
   | { type: 'openNativeSettings' }
   | { type: 'lanSyncConnect' }
+  | { type: 'lanSyncJoin' }
   | { type: 'lanSyncGroup' }
   | { type: 'mobileOpen' }
   | { type: 'lanSyncDisconnect' }
@@ -166,7 +167,10 @@ export class SettingsPanel implements vscode.Disposable {
           await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:honor-world.hwchat');
           break;
         case 'lanSyncConnect':
-          await vscode.commands.executeCommand('hwchat.lanSync.connect');
+          await vscode.commands.executeCommand('hwchat.lanSync.startGroup');
+          break;
+        case 'lanSyncJoin':
+          await vscode.commands.executeCommand('hwchat.lanSync.joinGroup');
           break;
         case 'lanSyncGroup':
           await vscode.commands.executeCommand('hwchat.lanSync.openGroup');
@@ -545,7 +549,8 @@ export class SettingsPanel implements vscode.Disposable {
           <div class="section-heading"><h2>${t(lang, 'settings.collab.title')}</h2></div>
           <div class="privacy-summary"><p>${t(lang, 'settings.collab.body')}</p></div>
           <div class="storage-actions">
-            <button id="lanSyncConnectButton" type="button" class="primary">${t(lang, 'settings.collab.connect')}</button>
+            <button id="lanSyncConnectButton" type="button" class="primary">${t(lang, 'settings.collab.startGroup')}</button>
+            <button id="lanSyncJoinButton" type="button">${t(lang, 'settings.collab.joinGroup')}</button>
           </div>
           <div class="storage-actions">
             <button id="lanSyncGroupButton" type="button">${t(lang, 'settings.collab.group')}</button>

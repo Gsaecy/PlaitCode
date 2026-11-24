@@ -2,7 +2,7 @@
   "name": "hwchat",
   "displayName": "HWChat",
   "description": "A secure coding agent for VS Code with DeepSeek: approval-controlled workspace tools, plan-tracking task lists, copyable local/server commands and durable local history.",
-  "version": "0.4.32",
+  "version": "0.5.0",
   "publisher": "honor-world",
   "license": "MIT",
   "icon": "resources/logo.png",
@@ -184,9 +184,13 @@
         "title": "HWChat: 打开跨平台对齐账本"
       },
       {
-        "command": "hwchat.lanSync.connect",
-        "title": "HWChat: 连接另一台设备（同一 WiFi，一键）",
+        "command": "hwchat.lanSync.startGroup",
+        "title": "HWChat: 启动群聊（生成邀请码）",
         "icon": "$(broadcast)"
+      },
+      {
+        "command": "hwchat.lanSync.joinGroup",
+        "title": "HWChat: 加入群聊（填邀请码）"
       },
       {
         "command": "hwchat.lanSync.disconnect",
@@ -322,9 +326,14 @@
       ],
       "view/title": [
         {
-          "command": "hwchat.lanSync.connect",
+          "command": "hwchat.lanSync.startGroup",
           "when": "view == hwchat.chatView",
           "group": "navigation@0"
+        },
+        {
+          "command": "hwchat.lanSync.joinGroup",
+          "when": "view == hwchat.chatView",
+          "group": "navigation@1"
         },
         {
           "command": "hwchat.lanSync.openGroup",

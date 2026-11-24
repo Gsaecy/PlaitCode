@@ -452,23 +452,37 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
        * 用户以为成功了 —— 而实际上两台各自都是主机，谁也没连谁。
        */
       const others = service.remotePeers().length;
+      const invite = service.currentInviteCode();
       /*
        * 从机端 `peers` 清单天然为空（主机把它自己那条过滤掉了），
        * 所以「连上了没有」要看角色，不能只看清单。
        */
       if (state.role === 'peer') {
-        status.text = `$(broadcast) 已连主机 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
+        status.text = `$(broadcast) 已进群 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
       } else if (others > 0) {
-        status.text = `$(broadcast) 已连 ${others} 台 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
+        status.text = `$(broadcast) 群聊 ${invite} · 已连 ${others} 台`;
+      } else if (invite) {
+        // 开了群还没人进来：把邀请码直接摆在状态栏，用户不用再翻通知。
+        status.text = `$(broadcast) 群聊 ${invite} · 等加入`;
       } else {
-        status.text = '$(broadcast) 等待另一台加入';
+        status.text = '$(broadcast) 启动群聊';
       }
       const relayLine = relayState
         ? `\n\n中继：${relayState.connected ? '已连接' : `连不上${relayState.lastError ? `（${relayState.lastError}）` : ''}`}`
         : '';
-      status.tooltip = state.role === 'peer' || others > 0
-        ? `${state.text}\n点击查看详情 / 打开对齐账本。${relayLine}`
-        : `这台已就绪（${lanAddresses().join(' / ') || '未发现局域网地址'}），还没有另一台连过来。\n请到另一台设备上点一次「连接另一台设备」。\n\n${state.text}${relayLine}`;
+      if (state.role === 'peer' || others > 0) {
+        status.tooltip = `${state.text}\n点击查看详情 / 打开对齐账本。${relayLine}`;
+      } else if (invite) {
+        status.tooltip = [
+          `邀请码：${invite}`,
+          `本机地址：${lanAddresses().join(' / ') || '未发现局域网地址'}`,
+          '',
+          '在另一台电脑上打开 HWChat →「加入群聊」，填这个邀请码。',
+          state.text,
+        ].join('\n');
+      } else {
+        status.tooltip = '点这里开一个群聊，会生成 6 位邀请码；另一台填码就能进来。';
+      }
       status.command = 'hwchat.lanSync.status';
       status.show();
       return;
@@ -504,9 +518,9 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         status.show();
         return;
       }
-      status.text = '$(broadcast) 连接另一台设备';
-      status.tooltip = '同一 WiFi 下，两台设备各点一次就能连上。要不要跨网走中继？命令面板执行「开始协作」。';
-      status.command = 'hwchat.lanSync.connect';
+      status.text = '$(broadcast) 启动群聊';
+      status.tooltip = '点这里开一个群聊，会生成 6 位邀请码；另一台点「加入群聊」填这个码就能进来。';
+      status.command = 'hwchat.lanSync.startGroup';
       status.show();
     }
   };
@@ -538,6 +552,8 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     else if (state.role === 'hub') lines.push('状态：主机，正在等另一台加入');
     else lines.push(`状态：已加入 ${state.address || '（未知主机）'}`);
     lines.push(`监听端口：${ports.listen}（发现端口 ${ports.discovery}）`);
+    const invite = service.currentInviteCode();
+    if (invite) lines.push(`邀请码：${invite}（等另一台填码加入）`);
     lines.push(`对端设备：${peers.length} 台`);
     for (const item of peers) lines.push(`  - ${item.name} · ${item.platform}${item.address ? ` · ${item.address}` : ''}`);
     lines.push('', '[中继]（跨网才需要）');
@@ -582,13 +598,58 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     // 面板不能继续持有已经 dispose 的服务，否则关掉协作后发消息还会去碰死掉的 socket。
     { dispose: () => chat.setLanSync(undefined) },
     { dispose: () => { if (handoffTimer) clearInterval(handoffTimer); } },
-    vscode.commands.registerCommand('hwchat.lanSync.connect', async () => {
-      const result = await service.autoConnect(setting('lanSync.port', 47821));
-      if (result.role === 'hub') {
-        await announce('hub', `已让这台电脑等待连接（地址：${lanAddresses().join(' / ') || '未发现局域网地址'}）。`);
-      } else {
-        await announce(result.role, result.message);
+    /*
+     * 启动群聊：生成邀请码，把码显示出来给用户抄。
+     *
+     * 这是唯一的开群入口 —— 不自动找设备、不互相比谁让位，谁开群谁当主机。
+     */
+    vscode.commands.registerCommand('hwchat.lanSync.startGroup', async () => {
+      const result = await service.startGroup(setting('lanSync.port', 47821));
+      refreshStatus();
+      if (!result.ok) {
+        void vscode.window.showWarningMessage(result.message);
+        return;
       }
+      await groupPanel.open();
+      const choice = await vscode.window.showInformationMessage(
+        `群聊已开。邀请码：${result.code}\n\n在另一台电脑上打开 HWChat →「加入群聊」，填这个码。`,
+        '复制邀请码',
+        '打开团队群',
+      );
+      if (choice === '复制邀请码') {
+        await vscode.env.clipboard.writeText(result.code ?? '');
+      } else if (choice === '打开团队群') {
+        await groupPanel.open();
+      }
+    }),
+    /*
+     * 加入群聊：只让用户填一个 6 位码。
+     * 地址、端口、配对全部自动 —— 用户不需要知道对方的 IP。
+     */
+    vscode.commands.registerCommand('hwchat.lanSync.joinGroup', async () => {
+      const typed = await vscode.window.showInputBox({
+        title: '加入群聊',
+        prompt: '填另一台电脑上显示的邀请码（6 位字母数字）',
+        placeHolder: '例如 K7M2QX',
+        ignoreFocusOut: true,
+        validateInput: (value) => (value.trim() ? undefined : '请填写邀请码'),
+      });
+      if (!typed) return;
+      const result = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'HWChat 正在找这个群聊…' },
+        async () => service.joinGroup(typed, setting('lanSync.port', 47821)),
+      );
+      refreshStatus();
+      if (!result.ok) {
+        void vscode.window.showWarningMessage(result.message);
+        return;
+      }
+      await groupPanel.open();
+      void vscode.window.showInformationMessage(result.message);
+    }),
+    vscode.commands.registerCommand('hwchat.lanSync.connect', async () => {
+      // 兼容旧入口：等同于「启动群聊」。
+      await vscode.commands.executeCommand('hwchat.lanSync.startGroup');
     }),
     vscode.commands.registerCommand('hwchat.lanSync.disconnect', async () => {
       service.stop();

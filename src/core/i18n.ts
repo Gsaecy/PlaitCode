@@ -636,9 +636,11 @@ const DICTIONARY: Record<string, Entry> = {
   'settings.nav.collab': { zh: '协作', en: 'Collab' },
   'settings.collab.title': { zh: '协作', en: 'Collab' },
   'settings.collab.body': {
-    zh: '两台电脑连在同一个 WiFi 时：一台点「连接另一台设备」等着的，另一台点同一个按钮就会连上。连上之后，在「团队群」里发的话，两台电脑的 agent 会一起做。',
-    en: 'When both computers are on the same WiFi: one clicks "Connect another device" and waits; the other clicks the same button and they pair. After that, anything you say in the team group is done by the agents on both machines.',
+    zh: '在需要“当主机”的那台电脑上点「启动群聊」，会得到一个 6 位邀请码；另一台点「加入群聊」填这个码就进来了。之后在「团队群」里说的话，两台电脑的 agent 会一起做。',
+    en: 'On the computer that hosts the group, click "Start group" — you get a 6-character invite code. On the other, click "Join group" and type that code. Anything said in the team group is then done by the agents on both machines.',
   },
+  'settings.collab.startGroup': { zh: '启动群聊', en: 'Start group' },
+  'settings.collab.joinGroup': { zh: '加入群聊', en: 'Join group' },
   'settings.collab.connect': { zh: '连接另一台设备', en: 'Connect another device' },
   'settings.collab.group': { zh: '打开团队群', en: 'Open team group' },
   'settings.collab.mobile': { zh: '手机遥控（扫码）', en: 'Phone control (QR)' },
