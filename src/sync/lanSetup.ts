@@ -322,6 +322,12 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    */
   chat.setLanSync(service);
   /*
+   * 上次是群主就自动恢复监听。
+   * VS Code 重启会丢掉监听器，而用户手上的邀请串可能还在 ——
+   * 不恢复的话，另一台拿着那个码只会得到 ECONNREFUSED。
+   */
+  if (service.currentInviteCode()) void service.resumeHosting();
+  /*
    * 团队群窗口：独立面板，不进主对话。
    *
    * 发消息复用 `chat.send()` —— 它已经知道「这是回答追问还是新需求」，

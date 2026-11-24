@@ -161,6 +161,13 @@ interface PersistedState {
   role?: 'hub' | 'peer';
   hub?: string;
   port?: number;
+  /**
+   * 本机群的邀请码。
+   *
+   * 必须持久化：VS Code 重启后监听器没了，但用户手上/剪贴板里的邀请串还在。
+   * 不恢复的话，另一台拿着这个码永远连不上（表现为 ECONNREFUSED）。
+   */
+  inviteCode?: string;
 }
 
 const STATE_LIMIT = 300;
@@ -383,6 +390,7 @@ export class LanSyncService implements Disposable {
       this.lastRole = parsed.role === 'peer' ? 'peer' : 'hub';
       this.lastHub = typeof parsed.hub === 'string' ? parsed.hub : '';
       this.lastPort = typeof parsed.port === 'number' && parsed.port > 0 ? parsed.port : 0;
+    this.inviteCode = typeof parsed.inviteCode === 'string' ? parsed.inviteCode : '';
     } catch {
       // 第一次运行没有文件，正常。
     }
@@ -403,6 +411,7 @@ export class LanSyncService implements Disposable {
       role: this.lastRole,
       hub: this.lastHub,
       port: this.lastPort,
+      ...(this.inviteCode ? { inviteCode: this.inviteCode } : {}),
     };
     try {
       await mkdir(dirname(this.storagePath), { recursive: true });
@@ -873,6 +882,10 @@ export class LanSyncService implements Disposable {
       return { ok: false, message: started.message };
     }
     this.inviteCode = code;
+    // 记下**实际**监听端口：重启后按它恢复，端口对不上等于没恢复。
+    this.lastPort = this.port;
+    // 立刻落盘：不然 VS Code 一重启，这个码就再也对不上了。
+    await this.persist();
     // 立刻用新码广播一次，别让从机等下一个周期。
     this.announceNow();
     const text = makeInviteText(code, this.port);
@@ -894,7 +907,27 @@ export class LanSyncService implements Disposable {
    *
    * `address` 只在广播被拦时兜底（高级用法 / 测试），正常路径不要传。
    */
-  async joinGroup(code: string, port?: number, address?: string): Promise<{ ok: boolean; message: string }> {
+  async joinGroup(
+    code: string,
+    port?: number,
+    address?: string,
+    options: { allowWhileHosting?: boolean } = {},
+  ): Promise<{ ok: boolean; message: string }> {
+    /*
+     * 正在当群主的机器不该去加入别人。
+     *
+     * 加入前会先关掉本机监听 —— 一台正在等别人加入的主机点了「加入群聊」，
+     * 就等于把自己的群关了，结果两台谁都不在监听（用户看到的就是「连不上」）。
+     * 这里直接拦住并说清该怎么做。
+     */
+    if (this.role === 'hub' && this.inviteCode && !options.allowWhileHosting) {
+      return {
+        ok: false,
+        message:
+          `这台电脑正在当群主（邀请码 ${this.inviteCode}），不需要加入别人的群。` +
+          '请让另一台点「加入群聊」填这个码；如果你确实想加入别人的群，先点「断开」。',
+      };
+    }
     /*
      * 输入可以是纯邀请码，也可以是完整邀请串（`192.168.0.3:47821#K7M2QX`）。
      * 后者不需要广播 —— 在广播被拦的环境里这是**唯一**能走通的路。
@@ -987,6 +1020,27 @@ export class LanSyncService implements Disposable {
       if (/邀请码/.test(reason)) {
         return { ok: false, message: `加入失败：${reason}。请核对另一台电脑上显示的邀请码。` };
       }
+      /*
+       * ECONNREFUSED = 对方机器网络上到了，但**那个端口没有程序在监听**。
+       * 唯一原因：对方这会儿没在等（没点「启动群聊」，或重启过 VS Code）。
+       * 这和「网络不通」是两件事，不能混成一句话。
+       */
+      if (/ECONNREFUSED/i.test(reason)) {
+        return {
+          ok: false,
+          message:
+            `对方（${target}）没有在等：那台电脑的群聊没开着。` +
+            '请在对方点「启动群聊」，然后把新的邀请串复制给你（重启过 VS Code 后旧邀请码会失效）。',
+        };
+      }
+      if (/EHOSTUNREACH|ETIMEDOUT|ENETUNREACH/i.test(reason)) {
+        return {
+          ok: false,
+          message:
+            `网络到不了 ${target}。请先在对方电脑上 \`ping ${target.split(':')[2]?.replace('//', '') || '对方IP'}\` 试一下；` +
+            '如果 ping 都不通，通常是代理开了 TUN 模式、或两台没接在同一个路由器/同一个 WiFi。',
+        };
+      }
       return { ok: false, message: `加入失败：这台电脑连不上 ${target}（${reason || '没有响应'}）。请确认两台在同一个 WiFi。` };
     }
     const response = answer.data ?? {};
@@ -1061,10 +1115,36 @@ export class LanSyncService implements Disposable {
     return { ok: true, message: `已加入主机 ${target}。现在两边的设备会在同一个需求下一起执行。` };
   }
 
+  /**
+   * 开机自愈：上次是群主就重新当群主。
+   *
+   * 用户手上的邀请串可能在剪贴板/聊天记录里放了一整天。VS Code 一重启监听器就没了，
+   * 另一台拿着那个码只会得到 ECONNREFUSED。所以只要还记得邀请码，就把监听重新支起来。
+   */
+  async resumeHosting(): Promise<boolean> {
+    if (!this.inviteCode || this.role === 'hub') return false;
+    const started = await this.startHub(this.lastPort || this.configuredPort);
+    if (started.ok) {
+      this.bridge.log(`[sync] 已恢复群主监听，邀请码 ${this.inviteCode} 仍然有效`);
+      this.bridge.onState?.();
+      return true;
+    }
+    this.bridge.log(`[sync] 恢复群主监听失败：${started.message}`, 'warn');
+    return false;
+  }
+
   stop(): void {
     this.stopDiscovery();
     this.role = 'off';
     this.hubAddress = '';
+    /*
+     * 主动断开就作废邀请码。
+     *
+     * 否则界面还挂着「群聊 XXXXXX · 等加入」，而监听早就关了 ——
+     * 另一台按这个码连过来只会得到 ECONNREFUSED。
+     */
+    this.inviteCode = '';
+    void this.persist();
     // 手机遥控开着的时候监听要留着：否则「断开双机同步」会顺手把手机也踢下线。
     if (!this.mobileEnabled) this.stopListener();
     this.bridge.onState?.();
@@ -1248,7 +1328,7 @@ export class LanSyncService implements Disposable {
        * 对方没有码（旧版 / 高级手动模式）才退回旧的配对方式。
        */
       const attempt = otherCode
-        ? this.joinGroup(otherCode, this.configuredPort, target)
+        ? this.joinGroup(otherCode, this.configuredPort, target, { allowWhileHosting: true })
         : this.joinHub(target, this.configuredPort);
       void attempt
         .then((result) => {

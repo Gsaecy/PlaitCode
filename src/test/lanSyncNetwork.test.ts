@@ -535,6 +535,57 @@ test('传整串邀请文本就能进群：完全不走广播', async () => {
   }
 });
 
+test('重启后邀请码仍然有效：群主自动恢复监听', async () => {
+  const HUB_PORT = 49_341;
+  const PEER_PORT = 49_342;
+  const hubDir = await mkdtemp(join(tmpdir(), 'hwchat-sync-'));
+
+  // 第一次：开群，记下邀请码，然后模拟 VS Code 重启（dispose 掉）。
+  const first = new LanSyncService(join(hubDir, 'state.json'), {
+    peer: () => winPeer,
+    runRequirement: async () => true,
+    runNote: async () => true,
+    writeLedger: async () => undefined,
+    writeTranscript: async () => undefined,
+    log: () => undefined,
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
+  await first.load();
+  const started = await first.startGroup(HUB_PORT);
+  assert.equal(started.ok, true, started.message);
+  const code = started.code ?? '';
+  first.dispose();
+
+  // 重启后：同一个存储目录，邀请码必须还在，并且监听被重新支起来。
+  const again = new LanSyncService(join(hubDir, 'state.json'), {
+    peer: () => winPeer,
+    runRequirement: async () => true,
+    runNote: async () => true,
+    writeLedger: async () => undefined,
+    writeTranscript: async () => undefined,
+    log: () => undefined,
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
+  await again.load();
+  assert.equal(again.currentInviteCode(), code, '邀请码必须持久化');
+
+  const member = await makeService(macPeer);
+  try {
+    // 恢复前：另一台拿着旧码连过来必然被拒（这正是用户遇到的 ECONNREFUSED）。
+    const beforeResume = await member.service.joinGroup(`127.0.0.1:${HUB_PORT}#${code}`, PEER_PORT);
+    assert.equal(beforeResume.ok, false, '恢复监听之前不应该连得上');
+
+    // 恢复监听后：同一个邀请码应当重新可用。
+    const resumed = await again.resumeHosting();
+    assert.equal(resumed, true, '应当能恢复群主监听');
+    const afterResume = await member.service.joinGroup(`127.0.0.1:${HUB_PORT}#${code}`, PEER_PORT);
+    assert.equal(afterResume.ok, true, `重启后旧邀请码应当仍然有效：${afterResume.message}`);
+  } finally {
+    again.dispose();
+    member.service.dispose();
+    await rm(hubDir, { recursive: true, force: true });
+    await rm(member.dir, { recursive: true, force: true });
+  }
+});
+
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {
   assert.equal(normalizeHubAddress('192.168.0.3', 47821), 'http://192.168.0.3:47821');
   assert.equal(normalizeHubAddress('192.168.0.3:5000', 47821), 'http://192.168.0.3:5000', '显式端口不能被覆盖');
