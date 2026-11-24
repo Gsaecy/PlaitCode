@@ -97,6 +97,9 @@ Environment=NODE_ENV=production
 # 审计日志：一行一条 JSON，默认落数据目录；设成 - 就只走 journald
 Environment=PLAITCODE_AUDIT=${DATA_DIR}/audit.jsonl
 Environment=PLAITCODE_AUDIT_STDOUT=1
+# 企业身份模式（可选，默认关闭）。打开后 publish/poll 只认设备令牌，不再接受频道密钥：
+#   Environment=PLAITCODE_IDENTITY=${DATA_DIR}/identity.json
+#   Environment=PLAITCODE_ADMIN_TOKEN=<32 位随机串>
 ExecStart=${NODE_DIR}/bin/node ${APP_DIR}/server.cjs
 Restart=always
 RestartSec=2

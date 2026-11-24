@@ -8,10 +8,21 @@
  * 对我们这种「人类说话」的频率（每秒几次都算多）足够。
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { AuditLog, type AuditOptions } from './relayAudit';
 import { renderRelayMobilePage } from './relayPage';
+import {
+  addDevice,
+  addMember,
+  addOrg,
+  authorize,
+  identitySnapshot,
+  revokeDevice,
+  saveIdentity,
+  type Action,
+  type IdentityState,
+} from './relayIdentity';
 
 export interface RelayOptions {
   port?: number;
@@ -24,6 +35,13 @@ export interface RelayOptions {
   rateLimit?: number;
   /** 审计日志（企业客户要的「谁在什么时候发了什么」）。 */
   audit?: AuditOptions;
+  /**
+   * 企业身份层。**有它时 publish/poll/presence 只认设备令牌**，
+   * 不再接受频道密钥；没有它时完全是原来的行为。
+   */
+  identity?: { state: IdentityState; path?: string };
+  /** 管理接口令牌（请求头 `x-plaitcode-admin`）。不填就关闭管理接口。 */
+  adminToken?: string;
   log?: (line: string) => void;
 }
 
@@ -151,6 +169,56 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
     return entry.count <= rateLimit;
   };
 
+  /* ---------------- 企业身份层 ---------------- */
+
+  const identity = options.identity;
+  const adminToken = options.adminToken ?? '';
+
+  /** 身份模式下的频道：鉴权已经由身份层做完，这里只负责取或建。 */
+  const ensureChannel = (id: string): Channel | undefined => {
+    if (!/^[0-9a-f]{16,64}$/.test(id)) return undefined;
+    const existing = channels.get(id);
+    if (existing) return existing;
+    const created: Channel = {
+      keyHash: '',
+      createdAt: Date.now(),
+      seq: 0,
+      messages: [],
+      waiters: [],
+      seen: new Set(),
+      presence: new Map(),
+    };
+    channels.set(id, created);
+    log(`[relay] 新频道 ${id.slice(0, 8)}…（身份模式）`);
+    return created;
+  };
+
+  /** 身份模式下按设备令牌鉴权；没有身份层时一律放行（走原来的频道密钥）。 */
+  const authDevice = (
+    token: string,
+    channelId: string,
+    action: Action,
+  ): { ok: true; deviceId?: string; member?: string } | { ok: false; reason: string } => {
+    if (!identity) return { ok: true };
+    const verdict = authorize(identity.state, token, channelId, action);
+    if (!verdict.ok) return { ok: false, reason: verdict.reason ?? '未授权' };
+    return { ok: true, deviceId: verdict.device?.id, member: verdict.member?.name };
+  };
+
+  const persistIdentity = async (): Promise<void> => {
+    if (!identity?.path) return;
+    await saveIdentity(identity.path, identity.state).catch((error: unknown) => {
+      log(`[relay] 身份库写入失败：${error instanceof Error ? error.message : String(error)}`);
+    });
+  };
+
+  const adminMatches = (value: unknown): boolean => {
+    if (!adminToken || typeof value !== 'string') return false;
+    const provided = createHash('sha256').update(value).digest();
+    const expected = createHash('sha256').update(adminToken).digest();
+    return provided.length === expected.length && timingSafeEqual(provided, expected);
+  };
+
   const server: Server = createServer((request, response) => {
     void (async () => {
       const rawUrl = request.url ?? '/';
@@ -183,6 +251,87 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         return;
       }
 
+      if (route.startsWith('/v1/admin/')) {
+        if (!identity || !adminToken) {
+          json(response, 404, { ok: false, error: 'admin api disabled' });
+          return;
+        }
+        if (!adminMatches(request.headers['x-plaitcode-admin'])) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: 'admin auth failed' });
+          json(response, 403, { ok: false, error: 'admin denied' });
+          return;
+        }
+        const rawBody = request.method === 'POST' ? await readBody(request) : '';
+        if (rawBody === undefined) {
+          json(response, 413, { ok: false, error: 'body too large' });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        if (rawBody) {
+          try {
+            body = JSON.parse(rawBody) as Record<string, unknown>;
+          } catch {
+            json(response, 400, { ok: false, error: 'invalid json' });
+            return;
+          }
+        }
+        if (route === '/v1/admin/state' && request.method === 'GET') {
+          json(response, 200, { ok: true, identity: identitySnapshot(identity.state) });
+          return;
+        }
+        if (route === '/v1/admin/orgs' && request.method === 'POST') {
+          const org = addOrg(identity.state, String(body.name ?? ''));
+          await persistIdentity();
+          audit.record({ event: 'admin', ip: clientIp(request), detail: `org ${org.name}` });
+          json(response, 200, { ok: true, org });
+          return;
+        }
+        if (route === '/v1/admin/members' && request.method === 'POST') {
+          const member = addMember(identity.state, {
+            orgId: String(body.orgId ?? ''),
+            name: String(body.name ?? ''),
+            role: body.role as never,
+          });
+          if (!member) {
+            json(response, 404, { ok: false, error: 'org not found' });
+            return;
+          }
+          await persistIdentity();
+          audit.record({ event: 'admin', ip: clientIp(request), detail: `member ${member.name} (${member.role})` });
+          json(response, 200, { ok: true, member });
+          return;
+        }
+        if (route === '/v1/admin/devices' && request.method === 'POST') {
+          const channelsInput = Array.isArray(body.channels) ? body.channels : [];
+          const created = addDevice(identity.state, {
+            memberId: String(body.memberId ?? ''),
+            name: String(body.name ?? ''),
+            platform: typeof body.platform === 'string' ? body.platform : undefined,
+            channels: channelsInput
+              .filter((item): item is { channelId?: unknown; role?: unknown } => Boolean(item) && typeof item === 'object')
+              .map((item) => ({ channelId: String(item.channelId ?? ''), role: item.role as never })),
+          });
+          if (!created) {
+            json(response, 404, { ok: false, error: 'member not found' });
+            return;
+          }
+          await persistIdentity();
+          audit.record({ event: 'admin', ip: clientIp(request), detail: `device ${created.device.name} for ${created.device.memberId}` });
+          // 明文令牌只在这里出现一次：库里只有哈希，丢了只能重新发一台
+          json(response, 200, { ok: true, device: { id: created.device.id, memberId: created.device.memberId, name: created.device.name, grants: created.device.grants }, token: created.token });
+          return;
+        }
+        if (route === '/v1/admin/devices/revoke' && request.method === 'POST') {
+          const revoked = revokeDevice(identity.state, String(body.deviceId ?? ''));
+          await persistIdentity();
+          audit.record({ event: 'admin', ip: clientIp(request), detail: `revoke ${String(body.deviceId ?? '')} -> ${revoked}` });
+          json(response, revoked ? 200 : 404, { ok: revoked });
+          return;
+        }
+        json(response, 404, { ok: false, error: 'not found' });
+        return;
+      }
+
       if (request.method === 'GET' && isHealth) {
         json(response, 200, {
           ok: true,
@@ -201,8 +350,13 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
 
       if (request.method === 'GET' && route === '/v1/poll') {
         const id = query.get('channel') ?? '';
-        const key = bearer(request);
-        const channel = channelFor(id, key);
+        const auth = authDevice(bearer(request), id, 'poll');
+        if (!auth.ok) {
+          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: auth.reason });
+          json(response, 403, { ok: false, error: auth.reason });
+          return;
+        }
+        const channel = identity ? ensureChannel(id) : channelFor(id, bearer(request));
         if (!channel) {
           json(response, 403, { ok: false, error: 'channel denied' });
           return;
@@ -261,7 +415,13 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 400, { ok: false, error: 'invalid message' });
           return;
         }
-        const channel = channelFor(id, bearer(request));
+        const auth = authDevice(bearer(request), id, 'publish');
+        if (!auth.ok) {
+          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: auth.reason });
+          json(response, 403, { ok: false, error: auth.reason });
+          return;
+        }
+        const channel = identity ? ensureChannel(id) : channelFor(id, bearer(request));
         if (!channel) {
           audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: 'channel denied' });
           json(response, 403, { ok: false, error: 'channel denied' });
@@ -306,19 +466,28 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           id = typeof parsed.channel === 'string' ? parsed.channel : '';
           device = parsed.device;
         }
-        const channel = channelFor(id, key);
+        const auth = authDevice(key, id, 'presence');
+        if (!auth.ok) {
+          audit.record({ event: 'denied', channel: id.slice(0, 32), ip: clientIp(request), detail: auth.reason });
+          json(response, 403, { ok: false, error: auth.reason });
+          return;
+        }
+        const channel = identity ? ensureChannel(id) : channelFor(id, key);
         if (!channel) {
           json(response, 403, { ok: false, error: 'channel denied' });
           return;
         }
         if (device) {
-          const deviceId = typeof device.id === 'string' ? device.id.slice(0, 80) : '';
+          // 身份模式下设备身份以令牌为准，客户端自报的 id 不可信
+          const deviceId = auth.deviceId ?? (typeof device.id === 'string' ? device.id.slice(0, 80) : '');
           if (!deviceId) {
             json(response, 400, { ok: false, error: 'invalid device' });
             return;
           }
           channel.presence.set(deviceId, {
-            name: typeof device.name === 'string' ? device.name.slice(0, 120) : deviceId,
+            name: auth.member
+              ? `${auth.member} · ${typeof device.name === 'string' ? device.name.slice(0, 60) : '设备'}`
+              : (typeof device.name === 'string' ? device.name.slice(0, 120) : deviceId),
             platform: typeof device.platform === 'string' ? device.platform : 'unknown',
             project: typeof device.project === 'string' ? device.project.slice(0, 120) : '',
             at: Date.now(),

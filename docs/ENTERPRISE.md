@@ -18,6 +18,67 @@ PlaitCode 只负责让多个 agent 像团队一样协作、让甲方能指挥和
 | 权限收紧 | ✅ | 权限预设四档 + 敏感文件策略 + 危险命令分档 |
 | 审计 | ✅ | 中继侧 JSONL 审计（谁 / 哪台设备 / 什么时间 / 多大密文），不记正文 |
 | 组织管控 | ✅ 基础 | `.plaitcode/policy.json`：强制权限上限、命令黑名单、模型白名单、禁联网参考 |
+| **组织 / 成员 / 设备 / 角色** | ✅ 数据模型 + 设备令牌作用域 | 见下节；**默认关闭**，打开后只认设备令牌 |
+
+### 组织 / 成员 / 设备 / 角色
+
+**一人多设备、一设备多频道**。角色有四级：
+
+| 角色 | 能发消息 | 能读 | 能管理 |
+|---|---|---|---|
+| `viewer` | ❌ | ✅ | ❌ |
+| `member` | ✅ | ✅ | ❌ |
+| `admin` | ✅ | ✅ | ✅ |
+| `owner` | ✅ | ✅ | ✅ |
+
+**默认关闭**，因为打开后 `publish/poll` 只认设备令牌（频道密钥不再被接受）。启用方式：
+
+```bash
+# 1) 生成管理令牌（只给管理员，别放仓库）
+openssl rand -hex 24
+
+# 2) 改 systemd 单元
+systemctl edit plaitcode-relay
+# 写入：
+#   [Service]
+#   Environment=PLAITCODE_IDENTITY=/var/lib/plaitcode-relay/identity.json
+#   Environment=PLAITCODE_ADMIN_TOKEN=<上一步的值>
+systemctl restart plaitcode-relay
+```
+
+**管理接口（curl 即可，暂不做界面）**
+
+```bash
+ADMIN=<管理令牌>
+BASE=https://plaitcode.com
+
+# 建组织
+curl -s $BASE/v1/admin/orgs -H "x-plaitcode-admin: $ADMIN" \
+  -H 'content-type: application/json' -d '{"name":"Acme"}'
+
+# 加成员（角色：owner/admin/member/viewer）
+curl -s $BASE/v1/admin/members -H "x-plaitcode-admin: $ADMIN" \
+  -H 'content-type: application/json' -d '{"orgId":"org_xxx","name":"小王","role":"member"}'
+
+# 给成员登记设备，并按频道授权（token 只在这里出现一次，库里只有哈希）
+curl -s $BASE/v1/admin/devices -H "x-plaitcode-admin: $ADMIN" \
+  -H 'content-type: application/json' \
+  -d '{"memberId":"mem_xxx","name":"公司的台式机","platform":"win32",
+       "channels":[{"channelId":"<32 位十六进制>","role":"member"}]}'
+
+# 吊销（离职 / 丢电脑）：立刻失效
+curl -s $BASE/v1/admin/devices/revoke -H "x-plaitcode-admin: $ADMIN" \
+  -H 'content-type: application/json' -d '{"deviceId":"dev_xxx"}'
+
+# 看全量（不含令牌哈希）
+curl -s $BASE/v1/admin/state -H "x-plaitcode-admin: $ADMIN"
+```
+
+排障文案是可读的，不是裸 403：
+
+```
+设备令牌无效 / 设备已被吊销 / 这台设备没有该频道的授权 / 角色 viewer 不能执行 publish
+```
 
 ### 审计日志
 
@@ -66,7 +127,7 @@ PlaitCode 只负责让多个 agent 像团队一样协作、让甲方能指挥和
 |---|---|---|
 | 审计流水（JSONL） | ✅ 已完成 | 见上 |
 | 策略下发 | ✅ 已完成 | 见上 |
-| **组织 / 团队 / 成员 / 设备 / 角色** | ⬜ 未开始 | **最大的一块**，需要把「频道密钥」升级成「人的身份」 |
+| **组织 / 团队 / 成员 / 设备 / 角色** | ✅ 已完成 | 一人多设备、一设备多频道；设备令牌只存哈希；可吊销 |
 | **SSO（OIDC / SAML）** | ⬜ 未开始 | 需要客户提供 IdP（Azure AD / Okta / 飞书 / 企业微信） |
 | SCIM 自动开户销户 | ⬜ 未开始 | 依赖 SSO |
 | 审计导出到 SIEM | 🟡 半成品 | JSONL 已经是标准的可采集格式，接 OTLP/Syslog 是一层薄封装 |
@@ -82,7 +143,8 @@ PlaitCode 只负责让多个 agent 像团队一样协作、让甲方能指挥和
 - A 项目成员只能看 A 项目，怎么隔离？
 - 谁有权批准「执行 shell」？本人还是管理员？
 
-这决定数据模型，**越晚改成本越高**（现在只有一个频道，是最便宜的时刻）。
+这决定数据模型，**越晚改成本越高**。0.6.0 已经把这层数据模型和令牌作用域做完（见上），
+剩下的只有「怎么登录」——那是 SSO 的事，不改变数据模型。
 
 ---
 

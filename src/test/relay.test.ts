@@ -4,6 +4,7 @@ import { makeRequirement, type SyncPeer } from '../sync/lanProtocol';
 import { RelayClient } from '../sync/relayClient';
 import { CHANNEL_PREFIX, ENC_PREFIX, RELAY_PREFIX, buildPairingText, deriveKeys, newPairingSecret, open, parsePairingText, seal } from '../sync/relayCrypto';
 import { createRelayServer } from '../sync/relayServer';
+import { emptyIdentity } from '../sync/relayIdentity';
 import { webcrypto } from 'node:crypto';
 
 /**
@@ -242,6 +243,71 @@ test('浏览器端（WebCrypto）与 Node 端密钥派生一致、密文可互�
     Buffer.from(sealedByNode.ct, 'base64'),
   );
   assert.equal(new TextDecoder().decode(decrypted), plaintext);
+});
+
+test('企业身份模式：管理接口发令牌，设备令牌按频道授权，吊销后立刻失效', async () => {
+  const state = emptyIdentity();
+  const relay = await createRelayServer({ port: 0, identity: { state }, adminToken: 'admin-secret', rateLimit: 500 });
+  const base = `http://127.0.0.1:${relay.port}`;
+  const admin = async (path: string, body: unknown): Promise<Record<string, any>> => {
+    const response = await fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-plaitcode-admin': 'admin-secret' },
+      body: JSON.stringify(body),
+    });
+    return response.json() as Promise<Record<string, any>>;
+  };
+  const channelA = 'a'.repeat(32);
+  const channelB = 'b'.repeat(32);
+  try {
+    // 1) 管理令牌不对 → 403
+    const denied = await fetch(`${base}/v1/admin/state`, { headers: { 'x-plaitcode-admin': 'wrong' } });
+    assert.equal(denied.status, 403);
+
+    // 2) 建组织 → 成员 → 设备（只授权 A 频道）
+    const org = await admin('/v1/admin/orgs', { name: 'Acme' });
+    const member = await admin('/v1/admin/members', { orgId: org.org.id, name: '小王' });
+    const device = await admin('/v1/admin/devices', {
+      memberId: member.member.id,
+      name: '公司的台式机',
+      channels: [{ channelId: channelA, role: 'member' }],
+    });
+    assert.match(String(device.token), /^pct_/);
+
+    // 3) 身份模式下频道密钥不再被接受
+    const legacy = await fetch(`${base}/v1/publish`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer legacy-channel-key' },
+      body: JSON.stringify({ channel: channelA, id: 'm-legacy', from: 'dev-x', envelope: { iv: 'aXY=', ct: 'Y3Q=' } }),
+    });
+    assert.equal(legacy.status, 403);
+
+    // 4) 设备令牌可以往 A 发
+    const publish = await fetch(`${base}/v1/publish`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${device.token}` },
+      body: JSON.stringify({ channel: channelA, id: 'm-1', from: 'ignored', envelope: { iv: 'aXY=', ct: 'Y3Q=' } }),
+    });
+    assert.equal(publish.status, 200);
+
+    // 5) 同一个令牌往没授权的 B 发 → 403
+    const other = await fetch(`${base}/v1/publish`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${device.token}` },
+      body: JSON.stringify({ channel: channelB, id: 'm-2', from: 'ignored', envelope: { iv: 'aXY=', ct: 'Y3Q=' } }),
+    });
+    assert.equal(other.status, 403);
+
+    // 6) 吊销后连 A 也不能读
+    const revoked = await admin('/v1/admin/devices/revoke', { deviceId: device.device.id });
+    assert.equal(revoked.ok, true);
+    const afterRevoke = await fetch(`${base}/v1/poll?channel=${channelA}&since=0&wait=0`, {
+      headers: { authorization: `Bearer ${device.token}` },
+    });
+    assert.equal(afterRevoke.status, 403);
+  } finally {
+    await relay.close();
+  }
 });
 
 test('中继：密钥不匹配的设备发不进去也读不到', async () => {
