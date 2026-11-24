@@ -45,6 +45,10 @@ test('首页（冰山）：只露一句价值 + 装扩展/手机端，GitHub 账
   // 想深入的人有文档入口（水下）
   assert.match(html, /id="deeper"/);
   assert.match(html, /docs\/COLLAB-SETUP\.md/);
+  // 像标准开源项目一样给出命令行安装与离线下载
+  assert.match(html, /code --install-extension plaitcode\.plaitcode/);
+  assert.match(html, /id="copyInstall"/);
+  assert.match(html, /releases\/latest/);
 
   const noSso = renderLandingPage({
     relayHost: 'relay.example.com',

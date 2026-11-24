@@ -186,6 +186,7 @@ const DICTIONARY: Record<string, Entry> = {
 
   // 对话面板：工具栏与侧栏
   'chat.historyPane': { zh: '对话记录', en: 'Conversations' },
+  'chat.brandTagline': { zh: 'AI 编程协作', en: 'AI coding agent' },
   'chat.closeHistory': { zh: '关闭对话记录', en: 'Close conversations' },
   'chat.newChat': { zh: '新建对话', en: 'New chat' },
   'chat.searchConversations': { zh: '搜索对话', en: 'Search conversations' },

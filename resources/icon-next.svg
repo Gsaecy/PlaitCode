@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="PlaitCode">
+  <!--
+    PlaitCode 图标：三股编成一条。
+
+    「Plait」是编织。三条线从左分头进入、在中段交错一次、再并成一条更粗的主线 ——
+    这正是产品的形状：你的需求与多台设备上的 AI，最后收成一条协作线。
+
+    设计约束（按 VS Code Marketplace 的真实显示尺寸定）：
+      - 三个部件 + 一条主线，缩到 32px 仍分得清；
+      - 描边约 7.4% 画布宽（38/512）：够粗不糊，也不显笨；
+      - 交错只做一次，中大尺寸看得出来，小尺寸退化为干净的合流；
+      - 三条股的起点略微错开，避免一眼看去像"树叉"；
+      - 内容重心居中偏右，符合从左到右的阅读方向；
+      - 不用文字、阴影、3D。
+  -->
+  <defs>
+    <linearGradient id="plait-top" x1="146" y1="158" x2="402" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4C9AFF"/>
+      <stop offset="1" stop-color="#7C5CFF"/>
+    </linearGradient>
+    <linearGradient id="plait-mid" x1="140" y1="256" x2="402" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5FA8FF"/>
+      <stop offset="1" stop-color="#8B6BFF"/>
+    </linearGradient>
+    <linearGradient id="plait-bot" x1="146" y1="354" x2="402" y2="212" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4C9AFF"/>
+      <stop offset="1" stop-color="#7C5CFF"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="#0F1115"/>
+
+  <g fill="none" stroke-width="38" stroke-linecap="round">
+    <!-- 上行：越过中线，落到主线下方 -->
+    <path d="M150 164C226 164 232 276 290 270" stroke="url(#plait-top)"/>
+    <!-- 下行：与上行交错一次，形成真正的"编" -->
+    <path d="M150 348C226 348 232 236 290 242" stroke="url(#plait-bot)"/>
+    <!-- 中线：笔直穿过，被另两条包在中间 -->
+    <path d="M140 256H288" stroke="url(#plait-mid)"/>
+  </g>
+
+  <!-- 并成一条：比任何一股都粗，是"合成一根"的信号 -->
+  <path d="M288 256H402" fill="none" stroke="url(#plait-mid)" stroke-width="54" stroke-linecap="round"/>
+</svg>

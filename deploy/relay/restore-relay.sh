@@ -73,6 +73,12 @@ fi
 # ---------- 4. 恢复文件 ----------
 
 say "4/6 恢复配置与数据"
+# 目标机器上可能有别的站点：先把现有 nginx 配置存一份，避免覆盖后回不去
+if [ -d /etc/nginx ]; then
+  NGX_BAK="/root/nginx-pre-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar czf "$NGX_BAK" /etc/nginx 2>/dev/null || true
+  [ -f "$NGX_BAK" ] && ok "已备份目标机现有 nginx 配置：$NGX_BAK"
+fi
 # 打包时带了绝对路径，直接按原路径解开即可；用 --strip 会破坏 systemd 单元
 tar xzf "$ARCHIVE" -C / 2>/dev/null || die "还原失败"
 

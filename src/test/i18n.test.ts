@@ -79,6 +79,18 @@ test('源文件里引用的键都真实存在', () => {
   assert.deepEqual(missing, [], `引用了不存在的文案键：\n${missing.join('\n')}`);
 });
 
+test('品牌与定位不能写死旧名字（chat 面板副标题走 i18n）', () => {
+  // 曾经把 "DeepSeek workspace" 硬编码在聊天面板里：DeepSeek 只是可选后端之一，
+  // 品牌应该是 PlaitCode。这条守卫防止旧名字再回来。
+  const files = ['src/views/chatPanel.ts', 'src/views/groupPanel.ts', 'src/views/settingsPanel.ts'];
+  for (const file of files) {
+    const source = readFileSync(join(process.cwd(), file), 'utf8');
+    assert.equal(source.includes('DeepSeek workspace'), false, `${file} 里还有硬编码的 DeepSeek workspace`);
+  }
+  const panel = readFileSync(join(process.cwd(), 'src/views/chatPanel.ts'), 'utf8');
+  assert.match(panel, /t\(lang, 'chat\.brandTagline'\)/, '品牌副标题必须走文案键');
+});
+
 test('resolveLanguage：显式值与 auto 回落', () => {
   assert.equal(resolveLanguage('zh', 'en-US'), 'zh');
   assert.equal(resolveLanguage('en', 'zh-CN'), 'en');

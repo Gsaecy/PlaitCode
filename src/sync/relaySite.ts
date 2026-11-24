@@ -269,6 +269,19 @@ export function renderLandingPage(options: {
     color:var(--text-2); font-size:var(--fs-sm); }
   .note-line .icon { color:var(--accent); }
 
+  /* 安装命令：一行能复制，不解释多余的东西 */
+  .install { margin-top:var(--s6); border:1px solid var(--line); border-radius:var(--r-lg);
+    background:var(--surface); overflow:hidden; }
+  .install-head { display:flex; align-items:center; gap:var(--s3); padding:var(--s2) var(--s3) var(--s2) var(--s4);
+    border-bottom:1px solid var(--line); color:var(--text-2); font-size:var(--fs-xs); }
+  .install-head button { margin-left:auto; min-height:28px; padding:0 var(--s2); font-size:var(--fs-xs); }
+  .install pre { margin:0; padding:var(--s4); overflow-x:auto; color:var(--text); }
+  .install pre code { font-size:var(--fs-sm); }
+  .install-foot { display:flex; gap:var(--s2) var(--s4); flex-wrap:wrap; align-items:center;
+    padding:var(--s3) var(--s4); border-top:1px solid var(--line); color:var(--text-3); font-size:var(--fs-xs); }
+  .install-foot a { color:var(--accent); }
+  .install-foot code { color:var(--text-2); }
+
   .cta-band { border-top:1px solid var(--line); padding:var(--s8) 0; }
   .cta-band .inner { display:flex; align-items:center; gap:var(--s5); flex-wrap:wrap; }
   .cta-band h2 { font-size:var(--fs-h2); font-weight:600; }
@@ -341,6 +354,18 @@ export function renderLandingPage(options: {
       <div class="steps">
         ${steps.map(([title, body], index) => `<div class="step"><div class="n">0${index + 1}</div><h3>${title}</h3><p>${body}</p></div>`).join('')}
       </div>
+
+      <div class="install">
+        <div class="install-head">
+          <span>在终端里装（macOS / Windows / Linux 一样）</span>
+          <button class="btn btn-ghost" type="button" id="copyInstall" data-command="code --install-extension plaitcode.plaitcode">复制</button>
+        </div>
+        <pre><code id="installCommand">code --install-extension plaitcode.plaitcode</code></pre>
+        <div class="install-foot">
+          <span>找不到 <code>code</code> 命令？在 VS Code 里 <code>Ctrl+Shift+P</code> 执行 <code>Shell Command: Install 'code' command in PATH</code>。</span>
+          <a href="${repo}/releases/latest">或下载 .vsix 离线安装 →</a>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -403,6 +428,38 @@ export function renderLandingPage(options: {
     </div>
   </div>
 </footer>
+<script>
+(function () {
+  var button = document.getElementById('copyInstall');
+  var command = document.getElementById('installCommand');
+  if (!button || !command) return;
+  var label = button.textContent;
+  button.addEventListener('click', function () {
+    var text = button.getAttribute('data-command') || command.textContent || '';
+    var done = function () {
+      button.textContent = '已复制';
+      setTimeout(function () { button.textContent = label; }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallback(text, done); });
+      return;
+    }
+    fallback(text, done);
+  });
+  // 非 https 或旧浏览器没有 clipboard API 时，退回到选中文本
+  function fallback(text, done) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    try { document.execCommand('copy'); done(); } catch (error) { button.textContent = '请手动选中复制'; }
+    document.body.removeChild(area);
+  }
+})();
+</script>
 </body>
 </html>`;
 }

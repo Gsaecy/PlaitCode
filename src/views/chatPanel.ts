@@ -6750,7 +6750,7 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     <aside id="historyPane" class="history-pane" aria-label="${t(lang, 'chat.historyPane')}">
       <div class="brand-row">
         <img class="brand-mark" src="${logo}" alt="">
-        <div class="brand-copy"><strong>PlaitCode</strong><span>DeepSeek workspace</span></div>
+        <div class="brand-copy"><strong>PlaitCode</strong><span>${t(lang, 'chat.brandTagline')}</span></div>
         <button id="closeHistoryButton" class="icon-button mobile-only" type="button" aria-label="${t(lang, 'chat.closeHistory')}" title="${t(lang, 'common.close')}">${icon('history')}</button>
       </div>
       <button id="newChatButton" class="primary-command" type="button">${icon('plus')}<span>${t(lang, 'chat.newChat')}</span></button>
