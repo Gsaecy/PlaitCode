@@ -1,4 +1,4 @@
-﻿# 网站与控制台
+# 网站与控制台
 
 > 这份文档回答三个问题：**网站长什么样、入口怎么排、后端怎么实现**。
 > 参考的是 2026 年主流代码协作工具（GitHub / GitLab / Bitbucket / Azure DevOps /
@@ -33,7 +33,48 @@
 
 ---
 
-## 2. 入口怎么排
+## 2. 对外怎么讲（场景）
+
+这一节是**文案的依据**，不是设计偏好。改文案前先看这里。
+
+### 2.1 真实场景（来自本项目自己的记录）
+
+- `docs/TEAM-CHAT.md` 里的真实形态：`手机 · 浏览器 · 甲方` 发需求，`Windows · 乙方（产品经理）` 回进度。
+- 角色定义（会话记录）：**用户是甲方，不懂编程；每台设备上的 agent 是乙方产品经理**。
+  Android/Windows 与 macOS 两台设备在做**同一个 app 的两个平台版本**，需求要共享、执行要一起、结果要对齐。
+
+所以「一个人把活指派给某台电脑」不是这个产品的场景 —— 那是开发者视角的工具（Cursor / Claude Code 的场）。
+这里的场景是 **不懂代码的人 → AI 乙方 → 交付后由甲方验收**。
+
+### 2.2 业内同类产品官网怎么定位（2026-11 核对）
+
+| 产品 | 首屏原话 | 结论 |
+|---|---|---|
+| Claude Code | "Hand Claude a bug fix, test, or multi-day migration. You set its permissions." / "**builds the plan, asks clarifying questions**" | 澄清问题是卖点本身 |
+| Cursor | "Agents turn ideas into code — hand off tasks to Cursor, **while you focus on making decisions**" | 人做决策，AI 做执行 |
+| Replit | "Turn ideas into apps in minutes — **no coding needed**" | 明确面向不会写代码的人 |
+
+三家都没有把「多端」当主卖点，多端只作为**入口**列一行。
+
+### 2.3 流程依据（行业标准，不是自创）
+
+Atlassian《User stories with examples and a template》给出的 3C：
+
+- **Card**：用非技术语言写的需求卡，只讲"你要什么结果"。
+- **Conversation**：澄清细节的对话，**细节是确认之后才补的**。
+- **Confirmation**：事先说清什么算完成（验收标准）。
+
+这正好对应 `lanProtocol.ts` 里的 `awaiting-analysis → awaiting-user → agreed → done`。
+网站必须讲这三段，否则等于把最值钱的部分藏起来。
+
+### 2.4 文案禁写
+
+- 不要写「公司电脑 / 家里 Mac」这类**打比方当场景**（曾误用 README 0.8.0 的一句举例）。
+- 不要用程序员语言举例（"把错误提示改成中文并补一条测试"），甲方不会这么说。
+- 不要把「指派给哪台设备」放在首屏当卖点；它是双平台一节的机制，不是价值主张。
+- 不要声称替代 PR / code review。差异要写成"管的是 review 之前那一段"。
+
+## 3. 入口怎么排
 
 每个入口**只有一个去处**，前端不再做二次跳转判断（判断都放在服务端）。
 
@@ -60,7 +101,7 @@
 
 ---
 
-## 3. 后端实现
+## 4. 后端实现
 
 ### 3.1 页面（服务端渲染，无前端框架）
 
@@ -94,13 +135,13 @@ CSP 与 `/m` 一致（`default-src 'none'`，只允许本站 fetch + 内联样�
   "org": { "id": "org_x", "name": "我的团队" },
   "members": [{ "id": "mem_x", "name": "我", "role": "member" }],
   "devices": [{
-    "id": "dev_x", "name": "公司电脑", "platform": "win32",
+    "id": "dev_win", "name": "Windows 版", "platform": "win32",
     "memberName": "我", "grants": [{ "channelId": "…", "role": "member" }],
     "lastSeenAt": 1763000000000, "online": true
   }],
   "channels": [{
     "channelId": "3f2a…", "devices": 2, "online": 1,
-    "deviceNames": ["公司电脑"], "lastMessageAt": 1763000000000
+    "deviceNames": ["Windows 版"], "lastMessageAt": 1763000000000
   }],
   "audit": [{ "ts": "2026-11-24T04:00:00.000Z", "event": "publish", "channel": "3f2a…" }],
   "counts": { "devices": 2, "online": 1, "channels": 1, "members": 2 }
@@ -139,20 +180,23 @@ PLAITCODE_AUTH_SECRET=<32 字节随机串>
 
 ---
 
-## 4. 和现有协作工具的分工
-
-参考文章里的 8 个工具各占一段，PlaitCode 只补它们都不做的那一段：
+## 5. 和现有协作工具的分工
 
 | 工具 | 它擅长 | 差的那一段 |
 |---|---|---|
-| GitHub / GitLab / Bitbucket / Azure DevOps | 异步评审**已经写完**的代码（PR/MR、分支保护、CI） | 代码还没写出来的那一步 |
+| GitHub / GitLab / Bitbucket / Azure DevOps | 异步评审**已经写完**的代码（PR/MR、分支保护、CI） | 需求还没说清、还没人动手的那一段 |
 | Live Share / Code With Me | 两个人**同时**编辑同一份代码 | 要求双方同时在线 |
+| Claude Code / Cursor | 在编辑器里把一件事从头做完 | 单人单机；跨设备、甲方乙方这条线要自己接 |
 | Replit / CodePen | 浏览器里立刻看到结果 | 不是你的真实仓库和环境 |
-| **PlaitCode** | 异步下达需求，让**指定的那台电脑**去写 | 不替代上面任何一件 |
+| **PlaitCode** | 不懂代码的人提需求，AI 先问清再执行；多台设备各有乙方并对齐 | 不替代上面任何一件 |
+
+**这不是"我们有的他们没有"**：单机把活做完，Claude Code / Cursor 做得比这里好。
+差异只有两条 —— **甲方不需要会写代码**，以及**多台设备上各有一个乙方且要对齐**。
+文案里不要把它写成全能替代品。
 
 ---
 
-## 5. 视觉规范（不随手写数值）
+## 6. 视觉规范（不随手写数值）
 
 参考的都是成熟产品的**结构**而不是外观：着陆页按 Linear / Vercel / Stripe 的通行顺序
 （导航 → Hero + 产品示意 → 三步 → 能力 → 安全 → 定位对照 → CTA → 页脚），
@@ -177,7 +221,7 @@ PLAITCODE_AUTH_SECRET=<32 字节随机串>
 - 状态用「圆点 + 文字」，不靠颜色单独表达；
 - 焦点环 2px + 2px 偏移，页首有跳过导航，`prefers-reduced-motion` 下关掉所有过渡。
 
-## 6. 还没做的（明确记下来，避免以后误以为已有）
+## 7. 还没做的（明确记下来，避免以后误以为已有）
 
 | 事项 | 为什么先不做 | 什么时候做 |
 |---|---|---|
