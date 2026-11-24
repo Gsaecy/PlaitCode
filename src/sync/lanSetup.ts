@@ -23,6 +23,7 @@ import { GroupPanel } from '../views/groupPanel';
 import { MobilePanel } from '../views/mobilePanel';
 import { RelayPhonePanel } from '../views/relayPhonePanel';
 import { RelayClient } from './relayClient';
+import { tt } from '../core/i18n';
 import { buildPairingText, deriveKeys, newPairingSecret, parsePairingText } from './relayCrypto';
 
 export interface LanSetupOptions {
@@ -34,8 +35,11 @@ export interface LanSetupOptions {
     runSyncNote(note: import('./lanProtocol').SyncNote): Promise<boolean>;
     /** 群窗口里发一句话（需求或回答），由面板决定走哪条路径。 */
     sendGroupMessage(text: string): Promise<void>;
-    /** 中继上收到甲方需求：开跑但不再广播。 */
-    runRelayedUserRequirement(text: string): Promise<void>;
+    /** 中继上收到甲方需求：开跑但不再广播；跑没跑起来都要回执。 */
+    runRelayedUserRequirement(
+      text: string,
+      onOutcome?: (outcome: { ok: boolean; reasonKey?: string; vars?: Record<string, string | number> }) => void,
+    ): Promise<void>;
   };
   version: string;
 }
@@ -182,8 +186,21 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     /**
      * 手机在群里发的需求（经中继到达）：本机开跑。
      * 不再广播 —— 中继已经发给所有设备了。
+     *
+     * 无论跑没跑起来，都往群里回一条 —— 手机那边看不到电脑上的弹窗，
+     * 没有回执就只能盯着自己那条消息，不知道是排队中还是被拦下了。
      */
-    onRelayUserMessage: (text) => chat.runRelayedUserRequirement(text),
+    onRelayUserMessage: (text) => chat.runRelayedUserRequirement(text, (outcome) => {
+      const project = bridge.peer().project;
+      const body = outcome.ok
+        ? tt('notice.relayStarted', { project })
+        : tt('notice.relayBlocked', {
+          reason: outcome.reasonKey ? tt(outcome.reasonKey, outcome.vars ?? {}) : tt('notice.relayUnknownReason'),
+        });
+      output.info(`[relay] 甲方需求${outcome.ok ? '已开跑' : '未开跑'}：${body}`);
+      void service.postGroup({ author: 'agent', phase: outcome.ok ? 'progress' : 'result', body })
+        .catch((error: unknown) => output.warn(`[relay] 回执发送失败：${error instanceof Error ? error.message : String(error)}`));
+    }),
   };
 
   const service = new LanSyncService(join(context.globalStorageUri.fsPath, 'lan-sync.json'), bridge);

@@ -264,3 +264,51 @@ async function waitFor(check: () => boolean, timeoutMs: number): Promise<void> {
   }
   assert.fail('等待超时：预期的情况没有发生');
 }
+
+test('中继需求按指派门控：指名别人时本机不跑，指名本机才跑，没指派全都跑', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-assign-'));
+  try {
+    const ran: string[] = [];
+    const service = new LanSyncService(join(dir, 'state.json'), {
+      peer: () => macPeer,
+      runRequirement: async () => true,
+      runNote: async () => true,
+      onRelayUserMessage: (text) => { ran.push(text); },
+      writeLedger: async () => undefined,
+      writeTranscript: async () => undefined,
+      log: () => undefined,
+    });
+    await service.load();
+
+    const requirement = (id: string, body: string, assignee?: string) => ({
+      kind: 'group' as const,
+      id,
+      requirementId: id,
+      from: winPeer,
+      author: 'user' as const,
+      phase: 'requirement' as const,
+      body,
+      at: Date.now(),
+      ...(assignee ? { assignee } : {}),
+    });
+
+    await service.ingestRelayMessage(requirement('g1', '给别的设备做', 'p-other'));
+    assert.deepEqual(ran, [], '指派给别人时本机不该开跑');
+
+    await service.ingestRelayMessage(requirement('g2', '给本机做', 'p-mac'));
+    assert.deepEqual(ran, ['给本机做'], '指派给本机才跑');
+
+    await service.ingestRelayMessage(requirement('g3', '没指派'));
+    assert.deepEqual(ran, ['给本机做', '没指派'], '没指派时保持旧行为：本机也跑');
+
+    // 同一条消息重复投递（断线重连）只跑一次
+    await service.ingestRelayMessage(requirement('g2', '给本机做', 'p-mac'));
+    assert.equal(ran.length, 2);
+
+    // 自己发的消息不触发本机再跑一遍
+    await service.ingestRelayMessage({ ...requirement('g4', '我自己发的', 'p-mac'), from: macPeer });
+    assert.equal(ran.length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

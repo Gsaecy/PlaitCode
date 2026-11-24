@@ -228,6 +228,14 @@ interface SendOptions {
   origin?: 'user' | 'sync' | 'group';
   /** 来自同步需求时记下需求号，运行结束时据此回报进度。 */
   syncRequirementId?: string;
+  /**
+   * 这一轮的结局回执（只给 `origin === 'sync'` 用）。
+   *
+   * 手机那头看不见电脑上的弹窗：没同意数据流向、没配 API Key、被策略拦下，
+   * 以前都是"悄悄不跑"，手机只能干等。真实反馈：「消息发出去就没下文了」。
+   * 所以每个提前返回的分支都必须回一条可读的原因。
+   */
+  onOutcome?: (outcome: { ok: boolean; reasonKey?: string; vars?: Record<string, string | number> }) => void;
 }
 
 /**
@@ -951,9 +959,18 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
    *
    * 手机已经把这条消息通过中继发给所有设备了，这里再广播就是环；
    * 用 `origin: 'sync'` 正好跳过广播分支（也不会弹「只发给本机」的提示）。
+   *
+   * `onOutcome` 把「跑没跑起来 / 为什么没跑」交回给调用方 —— 手机那头看不见
+   * 电脑上的弹窗，不回执就等于消息石沉大海。
    */
-  async runRelayedUserRequirement(text: string): Promise<void> {
-    await this.send(text, undefined, undefined, undefined, undefined, undefined, { origin: 'sync' });
+  async runRelayedUserRequirement(
+    text: string,
+    onOutcome?: (outcome: { ok: boolean; reasonKey?: string; vars?: Record<string, string | number> }) => void,
+  ): Promise<void> {
+    await this.send(text, undefined, undefined, undefined, undefined, undefined, {
+      origin: 'sync',
+      ...(onOutcome ? { onOutcome } : {}),
+    });
   }
 
   /**
@@ -1951,9 +1968,15 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     if (!content && !this.pendingAttachments.length && !this.pendingContext) {
       return;
     }
+    /** 远程需求被提前拦下时，除了本机提示，还要给发起端一条回执。 */
+    const reject = async (messageKey: string, vars?: Record<string, string | number>): Promise<void> => {
+      await this.rejectSend(content, messageKey, vars);
+      options?.onOutcome?.({ ok: false, reasonKey: messageKey, ...(vars ? { vars } : {}) });
+    };
     if (this.pendingSends.has(sendKey)) {
       // 连点/连按回车：界面那边已经画过乐观气泡了，这里给它一个回执让它退场。
       await this.post({ type: 'sendRejected', text: content });
+      options?.onOutcome?.({ ok: false, reasonKey: 'notice.busyRejected' });
       return;
     }
     this.pendingSends.add(sendKey);
@@ -1961,7 +1984,7 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     let startedConversationId: string | undefined;
     try {
       if (!await this.callbacks.ensurePrivacyConsent()) {
-        await this.rejectSend(content, 'notice.privacyRequired');
+        await reject('notice.privacyRequired');
         return;
       }
       /*
@@ -2054,7 +2077,7 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       const availableModels = this.modelOptionsForProfile(profile)
         .filter((option) => modelAllowed(policy, option.id));
       if (!availableModels.length) {
-        await this.rejectSend(content, 'notice.modelBlockedByPolicy');
+        await reject('notice.modelBlockedByPolicy');
         return;
       }
       const selectedModel = existingConversation?.model
@@ -2074,7 +2097,7 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         reasoningEffort: effectiveReasoning,
       };
       if (!await hasApiKey(this.secrets, profile.id, profile.id === 'default')) {
-        await this.rejectSend(content, 'notice.configureApiKey', { profile: profile.name });
+        await reject('notice.configureApiKey', { profile: profile.name });
         this.callbacks.openSettings();
         return;
       }
@@ -2098,7 +2121,7 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       // 勾选全部按对话存：界面传了就以它为准，没传就用本对话当前的选择。
       const skillIds = this.effectiveSkillIds(requestedSkillIds ?? this.activeSkillIds);
       if (existingConversation?.archived) {
-        await this.rejectSend(content, 'notice.archivedResume');
+        await reject('notice.archivedResume');
         return;
       }
       let createdConversationId: string | undefined;
@@ -2187,6 +2210,9 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         replyToMessageId: userMessage.id,
       });
       this.callbacks.onHistoryChanged();
+      // 到这里已经真的落盘并开始跑了，先给发起端一个「已在 X 项目开始处理」的回执，
+      // 否则手机那边只能盯着自己那条消息干等。
+      options?.onOutcome?.({ ok: true });
       await this.post({ type: 'runs', runningConversationIds: [...this.runs.keys(), conversationId] });
       await this.post({
         type: 'messageStart',

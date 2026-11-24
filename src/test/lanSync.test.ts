@@ -213,3 +213,23 @@ test('clip：压平空白并截断，超长补省略号', () => {
   assert.equal(clip('x'.repeat(20), 5), 'xxxx…');
   assert.equal(clip(123 as unknown, 5), '');
 });
+
+test('群消息：指派设备与项目能来回传，没填就不出现字段（旧端兼容）', () => {
+  const assigned = makeGroupMessage(win, {
+    author: 'user',
+    phase: 'requirement',
+    body: '改个按钮',
+    assignee: 'p-mac',
+    project: 'app-macos',
+  }, 1_000, 'a');
+  assert.ok(assigned);
+  const parsed = parseSyncMessage(JSON.parse(JSON.stringify(assigned)));
+  assert.ok(parsed && parsed.kind === 'group');
+  assert.equal(parsed!.assignee, 'p-mac');
+  assert.equal(parsed!.project, 'app-macos');
+
+  const plain = makeGroupMessage(win, { author: 'user', phase: 'requirement', body: '不指派' }, 1_000, 'b');
+  assert.ok(plain);
+  assert.equal('assignee' in plain!, false, '没指派就完全不带这个字段，旧客户端不受影响');
+  assert.equal('project' in plain!, false);
+});

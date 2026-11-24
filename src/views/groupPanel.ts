@@ -18,6 +18,7 @@
 import * as vscode from 'vscode';
 import type { LanSyncService } from '../sync/lanSync';
 import { groupSpeaker, platformLabel, type SyncGroupMessage } from '../sync/lanProtocol';
+import { TASK_STATUS_LABEL, buildTaskBoard, groupTasksByStatus } from '../sync/tasks';
 
 const PHASE_LABEL: Record<string, string> = {
   requirement: '需求',
@@ -112,12 +113,26 @@ export class GroupPanel implements vscode.Disposable {
       type: 'state',
       role: state.role,
       peers: state.peers.map((peer) => ({
+        id: peer.id,
         name: peer.name,
         platform: platformLabel(peer.platform),
         project: peer.project,
         isLocal: peer.id === this.service.localPeer().id,
       })),
       openQuestion: state.openQuestion?.body ?? '',
+      taskGroups: groupTasksByStatus(buildTaskBoard(state.messages)).map((group) => ({
+        status: group.status,
+        label: TASK_STATUS_LABEL[group.status],
+        tasks: group.tasks.map((task) => ({
+          id: task.id,
+          title: task.title,
+          project: task.project,
+          assigneeName: task.assignee
+            ? (state.peers.find((peer) => peer.id === task.assignee)?.name ?? task.assignee)
+            : '',
+          lastLine: task.lastLine,
+        })),
+      })),
       lines: state.messages.map((message) => ({
         ...compactGroupLine(message, now),
         requirementId: message.requirementId,
@@ -203,6 +218,16 @@ export class GroupPanel implements vscode.Disposable {
   .send { padding: 11px 22px; border: none; border-radius: var(--radius); cursor: pointer; font-size: 13px; font-weight: 600; color: var(--vscode-button-foreground); background: var(--vscode-button-background); }
   .send:hover { background: var(--vscode-button-hoverBackground); }
   .hint { margin-top: 8px; font-size: 11px; color: var(--muted); }
+  .board { border-bottom: 1px solid var(--line); padding: 10px 16px; background: var(--panel2); }
+  .board-head { display: flex; gap: 10px; align-items: baseline; font-size: 12px; margin-bottom: 8px; }
+  .board-head span { color: var(--muted); font-size: 11px; }
+  .board-cols { display: flex; gap: 10px; overflow-x: auto; }
+  .board-col { min-width: 170px; flex: 0 0 auto; }
+  .board-col > b { display: block; font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+  .task { border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; margin-bottom: 6px; background: var(--panel); }
+  .task .t { font-size: 12px; line-height: 1.35; margin-bottom: 3px; }
+  .task .m { font-size: 10px; color: var(--muted); }
+  .task .badge { display: inline-block; font-size: 9px; padding: 0 5px; border-radius: 999px; border: 1px solid var(--line); margin-right: 4px; }
 </style></head>
 <body>
 <header>
@@ -219,6 +244,10 @@ export class GroupPanel implements vscode.Disposable {
   </div>
 </header>
 <div class="banner" id="banner"><b>乙方在等你回答</b><span id="bannerText"></span></div>
+<section id="board" class="board" style="display:none">
+  <div class="board-head"><b>任务看板</b><span id="boardHint"></span></div>
+  <div class="board-cols" id="boardCols"></div>
+</section>
 <main id="feed"></main>
 <footer>
   <div class="composer">
@@ -238,6 +267,56 @@ function avatar(who, side) {
   node.className = 'avatar ' + side;
   node.textContent = side === 'user' ? '甲' : who.replace(/^.*?·\\s*/, '').slice(0, 1) || '乙';
   return node;
+}
+
+let boardCollapsed = false;
+function renderBoard(groups) {
+  const board = el('board'), cols = el('boardCols'), hint = el('boardHint');
+  const total = groups.reduce((sum, group) => sum + group.tasks.length, 0);
+  if (!total) { board.style.display = 'none'; return; }
+  board.style.display = 'block';
+  const head = board.querySelector('.board-head b');
+  head.onclick = () => {
+    boardCollapsed = !boardCollapsed;
+    cols.style.display = boardCollapsed ? 'none' : 'flex';
+    paintHint();
+  };
+  function paintHint() {
+    hint.textContent = total + ' 条' + (boardCollapsed ? ' · 已折叠' : ' · 点击标题折叠');
+  }
+  paintHint();
+  cols.style.display = boardCollapsed ? 'none' : 'flex';
+  cols.textContent = '';
+  for (const group of groups) {
+    const col = document.createElement('div');
+    col.className = 'board-col';
+    const headNode = document.createElement('b');
+    headNode.textContent = group.label + ' · ' + group.tasks.length;
+    col.appendChild(headNode);
+    for (const task of group.tasks) {
+      const card = document.createElement('div');
+      card.className = 'task';
+      const title = document.createElement('div');
+      title.className = 't';
+      title.textContent = task.title;
+      card.appendChild(title);
+      const meta = document.createElement('div');
+      meta.className = 'm';
+      const parts = [];
+      if (task.project) parts.push(task.project);
+      parts.push(task.assigneeName ? '指派：' + task.assigneeName : '未指派');
+      meta.textContent = parts.join(' · ');
+      card.appendChild(meta);
+      if (task.lastLine) {
+        const last = document.createElement('div');
+        last.className = 'm';
+        last.textContent = task.lastLine;
+        card.appendChild(last);
+      }
+      col.appendChild(card);
+    }
+    cols.appendChild(col);
+  }
 }
 
 function render(state) {
@@ -263,6 +342,8 @@ function render(state) {
 
   if (state.openQuestion) { banner.style.display = 'block'; bannerText.textContent = state.openQuestion; }
   else banner.style.display = 'none';
+
+  renderBoard(state.taskGroups || []);
 
   feed.textContent = '';
   let lastRequirement = '';

@@ -334,16 +334,23 @@ export class LanSyncService implements Disposable {
      * 再广播一次 —— 手机已经通过中继广播过了，再发就是环。
      *
      * 去重按 id：同一条消息被重复投递（断线重连）时只开跑一次。
+     *
+     * **指派**：消息带 `assignee` 时只有被指派的那台跑 —— 一个人两台电脑接力时，
+     * 不说清谁做就是两边各做一遍，改动还会互相覆盖。没带 assignee 才按旧行为全都跑。
      */
     const fresh = message.kind === 'group' && !this.group.some((item) => item.id === message.id);
     await this.applyMessage(message, { relay: false });
-    if (fresh && message.kind === 'group' && message.author === 'user'
-      && message.phase === 'requirement' && message.from.id !== this.bridge.peer().id) {
-      try {
-        await this.bridge.onRelayUserMessage?.(message.body);
-      } catch (error) {
-        this.bridge.log(`[relay] 处理甲方需求失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
-      }
+    if (!fresh || message.kind !== 'group') return;
+    if (message.author !== 'user' || message.phase !== 'requirement') return;
+    if (message.from.id === this.bridge.peer().id) return;
+    if (message.assignee && message.assignee !== this.bridge.peer().id) {
+      this.bridge.log(`[relay] 这条需求指派给 ${message.assignee}，本机不执行`);
+      return;
+    }
+    try {
+      await this.bridge.onRelayUserMessage?.(message.body);
+    } catch (error) {
+      this.bridge.log(`[relay] 处理甲方需求失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
     }
   }
 
@@ -1202,6 +1209,8 @@ export class LanSyncService implements Disposable {
     phase: GroupPhase;
     body: string;
     requirementId?: string;
+    assignee?: string;
+    project?: string;
   }): Promise<{ ok: boolean; message: string; group?: SyncGroupMessage }> {
     /*
      * 关联需求：没指定就用最近的一条。

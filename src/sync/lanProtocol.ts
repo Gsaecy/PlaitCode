@@ -126,6 +126,15 @@ export interface SyncGroupMessage {
   /** 关联的需求号；用户那条自身就是需求，填自己的 id。 */
   requirementId: string;
   at: number;
+  /**
+   * 这条需求指派给哪台设备执行（设备 id）。
+   *
+   * 一台机器多台设备接力时，**必须**说清谁来干：不说就是两台都跑一遍，
+   * 同一个改动做两遍，还可能互相覆盖。留空表示"谁都可以接"（旧行为）。
+   */
+  assignee?: string;
+  /** 这条需求针对的项目（仓库目录名）。换台电脑路径不同，靠它对齐。 */
+  project?: string;
 }
 
 const PHASES: ReadonlySet<string> = new Set(['requirement', 'analysis', 'question', 'answer', 'confirm', 'progress', 'result']);
@@ -139,6 +148,10 @@ export function makeGroupMessage(
     phase: GroupPhase;
     body: string;
     requirementId?: string;
+    /** 指派给哪台设备（留空 = 谁都能接）。 */
+    assignee?: string;
+    /** 针对哪个项目（留空 = 用发送方当前项目）。 */
+    project?: string;
   },
   now = Date.now(),
   seed = `${from.id}:${now}`,
@@ -155,6 +168,8 @@ export function makeGroupMessage(
     body,
     requirementId: clip(input.requirementId, 64) || id,
     at: now,
+    ...(clip(input.assignee, 64) ? { assignee: clip(input.assignee, 64) } : {}),
+    ...(clip(input.project, 80) ? { project: clip(input.project, 80) } : {}),
   };
 }
 
@@ -491,6 +506,8 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       body,
       requirementId: clip(record.requirementId, 64) || id,
       at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
+      ...(clip(record.assignee, 64) ? { assignee: clip(record.assignee, 64) } : {}),
+      ...(clip(record.project, 80) ? { project: clip(record.project, 80) } : {}),
     };
   }
   return undefined;

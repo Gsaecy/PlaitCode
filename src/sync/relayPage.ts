@@ -53,7 +53,20 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   .tag.result { color:var(--ok); border-color:rgba(52,211,153,.5); }
   .tag.requirement { color:var(--brand); border-color:rgba(76,154,255,.5); }
   footer { padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:var(--panel);
-    border-top:1px solid var(--line); display:flex; gap:8px; align-items:flex-end; }
+    border-top:1px solid var(--line); display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }
+  .assign { flex:1 0 100%; display:flex; gap:6px; overflow-x:auto; align-items:center; font-size:12px; color:var(--muted); }
+  .assign .label { flex:0 0 auto; font-size:11px; }
+  .assign .chip { padding:5px 10px; border-radius:999px; border:1px solid var(--line); color:var(--muted);
+    background:var(--panel2); font-size:12px; white-space:nowrap; flex:0 0 auto; }
+  .assign .chip.on { border-color:var(--brand); color:var(--brand); }
+  .board { padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel2); }
+  .board .head { font-size:11px; color:var(--muted); margin-bottom:6px; }
+  .board .cols { display:flex; gap:8px; overflow-x:auto; }
+  .board .col { flex:0 0 auto; min-width:132px; }
+  .board .col b { display:block; font-size:10px; color:var(--muted); margin-bottom:4px; }
+  .board .card { border:1px solid var(--line); border-radius:10px; padding:6px 8px; margin-bottom:6px;
+    background:var(--panel); font-size:12px; line-height:1.35; }
+  .board .card .m { font-size:10px; color:var(--muted); margin-top:2px; }
   textarea { flex:1; resize:none; min-height:42px; max-height:120px; padding:10px 12px; border-radius:12px;
     background:var(--panel2); color:var(--text); border:1px solid var(--line); font:inherit; font-size:15px; }
   button { padding:10px 12px; border-radius:10px; font-size:15px; border:1px solid var(--line);
@@ -78,8 +91,10 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   <span class="title">PlaitCode · 团队群</span>
   <span class="meta" id="meta">${host}</span>
 </header>
+<div class="board" id="board" style="display:none"></div>
 <main id="main"><div class="empty">正在读取频道…</div></main>
 <footer id="footer" style="display:none">
+  <div class="assign" id="assign"></div>
   <textarea id="input" rows="1" placeholder="以甲方身份说一句话（Enter 发送）"></textarea>
   <button class="primary" id="send">发送</button>
 </footer>
@@ -96,6 +111,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   var meta = document.getElementById('meta');
 
   var secret = null, keys = null, deviceId = null, since = 0, busy = false, signature = '';
+  var devices = [], chosen = '';
 
   function el(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }
   function say(text) { main.innerHTML = ''; var box = el('div', 'empty', text); main.appendChild(box); }
@@ -155,12 +171,98 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     }).then(function (result) {
       if (Array.isArray(result.devices)) {
         meta.textContent = (result.devices.length || 1) + ' 台设备在线';
+        // 手机只是"甲方"，真正的执行者是那些电脑：把它们列出来供指派
+        devices = result.devices.filter(function (item) {
+          return item && item.id && item.platform !== 'android';
+        });
+        if (chosen && !devices.some(function (item) { return item.id === chosen; })) chosen = '';
+        renderAssign();
+        renderBoard();
       }
     }).catch(function () {});
   }
 
+  function renderAssign() {
+    var box = document.getElementById('assign');
+    box.textContent = '';
+    var label = el('span', 'label', '由谁执行');
+    box.appendChild(label);
+    function chip(id, text) {
+      var node = el('button', 'chip' + (chosen === id ? ' on' : ''), text);
+      node.type = 'button';
+      node.onclick = function () { chosen = id; renderAssign(); };
+      box.appendChild(node);
+    }
+    chip('', '自动（谁在线谁做）');
+    devices.forEach(function (device) {
+      var name = device.name || device.id;
+      chip(device.id, name + (device.project ? ' · ' + device.project : ''));
+    });
+  }
+
+  function projectOf(id) {
+    var hit = devices.filter(function (item) { return item.id === id; })[0];
+    return hit && hit.project ? hit.project : '';
+  }
+
+  var STATUS_LABEL = { question:'等你回复', running:'进行中', open:'待接', done:'已完成' };
+  var STATUS_ORDER = ['question', 'running', 'open', 'done'];
+  function boardFor(list) {
+    var tasks = {}, order = [];
+    list.slice().sort(function (a, b) { return (a.at || 0) - (b.at || 0); }).forEach(function (m) {
+      var id = m.requirementId || m.id;
+      if (!id) return;
+      if (m.author === 'user' && m.phase === 'requirement') {
+        if (!tasks[id]) {
+          tasks[id] = { id:id, title:(m.body || '').split('\\n')[0].slice(0, 48), project:m.project || '', assignee:m.assignee || '', status:'open', line:'' };
+          order.push(id);
+        } else {
+          if (m.project) tasks[id].project = m.project;
+          if (m.assignee) tasks[id].assignee = m.assignee;
+        }
+        return;
+      }
+      var task = tasks[id];
+      if (!task) return;
+      if (m.phase === 'question') { task.status = 'question'; task.line = m.body; }
+      else if (m.phase === 'result') { task.status = 'done'; task.line = m.body; }
+      else if (task.status !== 'done') { task.status = 'running'; task.line = m.body; }
+    });
+    return order.map(function (id) { return tasks[id]; });
+  }
+
+  function renderBoard() {
+    var box = document.getElementById('board');
+    var tasks = boardFor(messages);
+    if (!tasks.length) { box.style.display = 'none'; return; }
+    box.style.display = 'block';
+    box.innerHTML = '';
+    box.appendChild(el('div', 'head', '任务看板 · ' + tasks.length + ' 条'));
+    var cols = el('div', 'cols');
+    STATUS_ORDER.forEach(function (status) {
+      var group = tasks.filter(function (task) { return task.status === status; });
+      if (!group.length) return;
+      var col = el('div', 'col');
+      col.appendChild(el('b', null, STATUS_LABEL[status] + ' · ' + group.length));
+      group.forEach(function (task) {
+        var card = el('div', 'card');
+        card.appendChild(el('div', null, task.title));
+        var who = task.assignee
+          ? (devices.filter(function (item) { return item.id === task.assignee; })[0] || {}).name || '已指派'
+          : '未指派';
+        var metaLine = [task.project, who].filter(Boolean).join(' · ');
+        card.appendChild(el('div', 'm', metaLine));
+        if (task.line) card.appendChild(el('div', 'm', String(task.line).slice(0, 60)));
+        col.appendChild(card);
+      });
+      cols.appendChild(col);
+    });
+    box.appendChild(cols);
+  }
+
   function render(state) {
     dot.className = 'dot' + (state.connected ? ' on' : '');
+    renderBoard();
     var next = JSON.stringify([state.messages, state.question]);
     if (next === signature) return;
     signature = next;
@@ -247,6 +349,12 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       kind: 'group', id: id, author: 'user', phase: 'requirement', body: text, requirementId: id, at: Date.now(),
       from: { id: deviceId, name: '手机 · 浏览器', platform: 'android', project: 'mobile', version: 'web' }
     };
+    // 指派：说清让哪台电脑做，避免两台都跑一遍、改动互相覆盖
+    if (chosen) {
+      message.assignee = chosen;
+      var targetProject = projectOf(chosen);
+      if (targetProject) message.project = targetProject;
+    }
     seal(id, JSON.stringify(message))
       .then(function (envelope) { return post('/v1/publish', { channel: keys.channel, id: id, from: deviceId, envelope: envelope }); })
       .then(function (result) {

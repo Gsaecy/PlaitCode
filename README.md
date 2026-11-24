@@ -8,6 +8,24 @@ It ships a compact chat surface and settings page, native streaming tool calling
 
 ![PlaitCode chat panel: conversation sidebar and a new conversation](https://raw.githubusercontent.com/Gsaecy/PlaitCode/main/docs/screenshots/chat-panel.png)
 
+## What's new in 0.8.0 (multi-device hand-off + task board)
+
+One person, several machines (office PC + home PC). Two things were missing before:
+**who should do this task**, and **where is it now**.
+
+- **Assign to a device**: a requirement carries `assignee`; only that machine's agent runs it.
+  Before this, every machine in the channel ran the same requirement — the same edit twice,
+  overwriting each other. Leave it unassigned and the old "everyone runs it" behaviour is unchanged.
+- **Task board**: requirements, questions, progress and results fold into task cards
+  (`等你回复 / 进行中 / 待接 / 已完成`), with the project and the assignee on each card.
+  Derived from the group message stream by a pure function, so every device shows the same board
+  and nothing is lost on reconnect.
+- **Outcome receipt**: a relayed requirement now always reports back — started in project X,
+  or why it did not start (privacy notice not accepted, no API key, policy blocked).
+  Previously a phone-sent requirement could silently do nothing.
+- **Project on the message**: the requirement says which project it targets, so a second machine
+  at a different path still knows what it is about.
+
 ## What's new in 0.6.x (cross-network collaboration + enterprise)
 
 ### Cross-network: your phone and your computers no longer need the same WiFi
