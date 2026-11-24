@@ -122,6 +122,38 @@ export function relayMessageId(message: SyncMessage): string {
   ].join(':').slice(0, 80);
 }
 
+/**
+ * 用「本机已登记的设备令牌」给另一台设备签发令牌。
+ *
+ * 独立成函数而不是 `RelayClient` 的方法：签发动作可能在还没连上频道时发生
+ * （例如刚装好扩展、先要配好另一台机器），不该被迫先建一个客户端。
+ */
+export async function enrollRelayDevice(
+  baseUrl: string,
+  deviceToken: string,
+  input: { name: string; platform: string },
+): Promise<{ ok: boolean; token?: string; message: string }> {
+  const token = deviceToken.trim();
+  if (!token.startsWith('pct_')) {
+    return { ok: false, message: '本机还没有设备令牌，无法给别的设备签发' };
+  }
+  try {
+    const response = await relayRequest(
+      `${baseUrl.replace(/\/+$/, '')}/v1/devices/enroll`,
+      { method: 'POST', body: { name: input.name, platform: input.platform }, timeoutMs: 15_000 },
+      { authorization: `Bearer ${token}` },
+    );
+    const issued = typeof response.body?.token === 'string' ? response.body.token : '';
+    if (response.status !== 200 || !issued) {
+      const reason = typeof response.body?.error === 'string' ? response.body.error : `HTTP ${response.status}`;
+      return { ok: false, message: `签发失败：${reason}` };
+    }
+    return { ok: true, token: issued, message: '已为另一台设备签发令牌' };
+  } catch (error) {
+    return { ok: false, message: `签发失败：${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 export class RelayClient implements Disposable {
   private readonly keys: RelayKeys;
   private readonly base: string;

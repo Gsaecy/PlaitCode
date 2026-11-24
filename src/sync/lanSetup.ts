@@ -22,7 +22,7 @@ import { LanSyncService, defaultDeviceName, defaultPlatform, lanAddresses, peerI
 import { GroupPanel } from '../views/groupPanel';
 import { MobilePanel } from '../views/mobilePanel';
 import { RelayPhonePanel } from '../views/relayPhonePanel';
-import { RelayClient } from './relayClient';
+import { RelayClient, enrollRelayDevice } from './relayClient';
 import { tt } from '../core/i18n';
 import { buildPairingText, deriveKeys, newPairingSecret, parsePairingText } from './relayCrypto';
 
@@ -430,6 +430,43 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         '知道了',
       );
     }),
+    /**
+     * 给另一台设备发配对信息：一次粘贴就能同时拿到频道密钥和设备令牌，
+     * 不用再去服务器手工发令牌。这是"我自己的第二台电脑"最常见的操作。
+     */
+    vscode.commands.registerCommand('plaitcode.relay.invite', async () => {
+      const url = relayUrl();
+      const secret = await context.secrets.get(relaySecretKey);
+      if (!url || !secret) {
+        void vscode.window.showWarningMessage('还没有加入频道。先「新建跨网频道」或「加入跨网频道」。');
+        return;
+      }
+      if (!relayDeviceToken) {
+        void vscode.window.showWarningMessage(
+          '本机还没有设备令牌。企业身份模式下需要先用「登记本机设备令牌」登记这台电脑，之后才能给别的设备签发。',
+        );
+        return;
+      }
+      const name = await vscode.window.showInputBox({
+        title: '给另一台设备发配对信息',
+        prompt: '这台新设备叫什么（方便你在看板上区分）',
+        value: `另一台电脑 · ${defaultPlatform()}`,
+        ignoreFocusOut: true,
+      });
+      if (!name) return;
+      const result = await enrollRelayDevice(url, relayDeviceToken, { name: name.trim(), platform: defaultPlatform() });
+      if (!result.ok || !result.token) {
+        void vscode.window.showWarningMessage(result.message);
+        return;
+      }
+      const text = buildPairingText(url, secret, result.token);
+      await vscode.env.clipboard.writeText(text);
+      void vscode.window.showInformationMessage(
+        `已为「${name.trim()}」签发令牌，配对信息已复制。\n`
+        + '在那台电脑上装好 PlaitCode，执行「PlaitCode: 加入跨网频道」粘贴这一行即可，不需要再发令牌。',
+        '知道了',
+      );
+    }),
     vscode.commands.registerCommand('plaitcode.relay.join', async () => {
       const text = await vscode.window.showInputBox({
         title: '加入跨网频道',
@@ -444,10 +481,16 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       }
       await saveRelayUrl(parsed.url);
       await context.secrets.store(relaySecretKey, parsed.secret);
+      // 配对信息里带了设备令牌就一并存下：新设备一次粘贴即可，不用再手工发令牌
+      if (parsed.deviceToken) {
+        await context.secrets.store(relayDeviceTokenKey, parsed.deviceToken);
+        relayDeviceToken = parsed.deviceToken;
+      }
       startRelay(parsed.url, parsed.secret);
       refreshStatus();
       void vscode.window.showInformationMessage(
-        `已加入频道 ${deriveKeys(parsed.secret).channel}（${parsed.url}）。这台设备产生的需求会加密同步给频道内的其它设备。`,
+        `已加入频道 ${deriveKeys(parsed.secret).channel}（${parsed.url}）`
+        + `${parsed.deviceToken ? '，并已登记本机设备令牌' : ''}。这台设备产生的需求会加密同步给频道内的其它设备。`,
       );
     }),
     vscode.commands.registerCommand('plaitcode.relay.share', async () => {

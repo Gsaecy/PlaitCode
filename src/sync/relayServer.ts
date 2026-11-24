@@ -11,6 +11,7 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { AuditLog, type AuditOptions } from './relayAudit';
+import { createChannelHistory } from './relayHistory';
 import { renderRelayMobilePage } from './relayPage';
 import { parseCookies } from './mobileControl';
 import {
@@ -21,6 +22,7 @@ import {
   authorizeSession,
   findMemberByIdentity,
   identitySnapshot,
+  deviceByToken,
   revokeDevice,
   saveIdentity,
   type Action,
@@ -64,6 +66,20 @@ export interface RelayOptions {
     sessionTtlMs?: number;
   };
   log?: (line: string) => void;
+  /**
+   * 频道历史落盘目录。
+   *
+   * 只存密文（iv + ct）与元数据（seq / 发送方 / 时间），服务端仍然看不到内容。
+   * 不填就不落盘，行为与之前一致（内存态，重启丢消息）。
+   */
+  historyDir?: string;
+  /**
+   * 允许已登记的设备给自己的另一台设备签发令牌（默认开）。
+   *
+   * 关掉后只能由管理员用 `/v1/admin/devices` 发令牌，
+   * 适合"设备必须审批"的受监管场景。
+   */
+  selfEnroll?: boolean;
 }
 
 export interface RelayHandle {
@@ -84,6 +100,11 @@ interface Channel {
   createdAt: number;
   seq: number;
   messages: StoredMessage[];
+  /**
+   * 从磁盘补齐历史的一次性任务。poll/publish 在读 `messages` 前先等它，
+   * 否则新设备第一次 `since=0` 会拿到空历史。
+   */
+  ready?: Promise<void>;
   /** 长轮询里正在等的响应。 */
   waiters: Array<() => void>;
   /** 已收到的消息 id：重复投递直接忽略（设备重连补发会用到）。 */
@@ -159,6 +180,26 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
   const audit = new AuditLog(options.audit);
   const channels = new Map<string, Channel>();
   const buckets = new Map<string, { count: number; resetAt: number }>();
+  const history = createChannelHistory(options.historyDir, maxMessages);
+
+  /** 从磁盘补齐历史（只做一次）。补完把 seq 接到已有的最大值上，重启后不会重号。 */
+  const hydrate = (channel: Channel, id: string): Promise<void> => {
+    if (channel.ready) return channel.ready;
+    channel.ready = history.load(id).then((entries) => {
+      if (!entries.length) return;
+      const known = new Set(channel.messages.map((item) => item.id));
+      for (const entry of entries) {
+        if (known.has(entry.id)) continue;
+        channel.messages.push({ seq: entry.seq, id: entry.id, from: entry.from, envelope: { iv: entry.iv, ct: entry.ct }, at: entry.at });
+        channel.seen.add(entry.id);
+        if (entry.seq > channel.seq) channel.seq = entry.seq;
+      }
+      channel.messages.sort((left, right) => left.seq - right.seq);
+      if (channel.messages.length > maxMessages) channel.messages = channel.messages.slice(-maxMessages);
+      log(`[relay] 频道 ${id.slice(0, 8)}… 从磁盘恢复 ${entries.length} 条，seq=${channel.seq}`);
+    }).catch(() => undefined);
+    return channel.ready;
+  };
 
   const channelFor = (id: string, key: string): Channel | undefined => {
     const existing = channels.get(id);
@@ -175,6 +216,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       presence: new Map(),
     };
     channels.set(id, created);
+    void hydrate(created, id);
     log(`[relay] 新频道 ${id.slice(0, 8)}…`);
     return created;
   };
@@ -210,6 +252,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       presence: new Map(),
     };
     channels.set(id, created);
+    void hydrate(created, id);
     log(`[relay] 新频道 ${id.slice(0, 8)}…（身份模式）`);
     return created;
   };
@@ -412,6 +455,75 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         return;
       }
 
+      /* ---------------- 设备自助登记 ---------------- */
+
+      /*
+       * 已连上的设备给「自己的另一台设备」签发令牌。
+       *
+       * 为什么要它：一个人多台电脑时，去服务器手工 curl 发令牌是最大的摩擦点，
+       * 真实使用时没人愿意每次开终端。已授权的设备本来就能代表这个人说话，
+       * 让它再发一张同权限的令牌，风险和"在这台电脑上多开一个窗口"相当。
+       *
+       * 两个硬限制：权限不能超过签发者（不能自我提权）；可在部署时关掉。
+       */
+      if (route === '/v1/devices/enroll' && request.method === 'POST') {
+        if (!identity) {
+          json(response, 404, { ok: false, error: 'identity disabled' });
+          return;
+        }
+        if (options.selfEnroll === false) {
+          json(response, 403, { ok: false, error: 'self enrollment disabled' });
+          return;
+        }
+        // 只校验"这台设备本身有效"，不要求它在这个频道有授权：
+        // 签发的是它自己的授权副本，频道授权由 grants 决定。
+        const token = bearer(request);
+        const candidate = token ? deviceByToken(identity.state, token) : undefined;
+        const enroller = candidate
+          && !candidate.revokedAt
+          && (candidate.expiresAt === undefined || Date.now() <= candidate.expiresAt)
+          ? candidate
+          : undefined;
+        if (!enroller) {
+          audit.record({ event: 'denied', ip: clientIp(request), detail: 'enroll auth failed' });
+          json(response, 403, { ok: false, error: '需要用已登记的设备令牌调用' });
+          return;
+        }
+        const raw = await readBody(request);
+        if (raw === undefined) {
+          json(response, 413, { ok: false, error: 'body too large' });
+          return;
+        }
+        let body: Record<string, unknown> = {};
+        if (raw) {
+          try {
+            body = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            json(response, 400, { ok: false, error: 'invalid json' });
+            return;
+          }
+        }
+        const created = addDevice(identity.state, {
+          memberId: enroller.memberId,
+          name: String(body.name ?? '新设备'),
+          platform: typeof body.platform === 'string' ? body.platform : undefined,
+          // 只继承签发者自己的授权：不能签发一台权限更大的设备
+          channels: enroller.grants.map((grant) => ({ channelId: grant.channelId, role: grant.role })),
+        });
+        if (!created) {
+          json(response, 409, { ok: false, error: '成员不存在' });
+          return;
+        }
+        await persistIdentity();
+        audit.record({ event: 'admin', ip: clientIp(request), detail: `self-enroll ${created.device.name}` });
+        json(response, 200, {
+          ok: true,
+          device: { id: created.device.id, name: created.device.name, grants: created.device.grants },
+          token: created.token,
+        });
+        return;
+      }
+
       /* ---------------- 管理接口 ---------------- */
 
       if (route.startsWith('/v1/admin/')) {
@@ -524,6 +636,9 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 403, { ok: false, error: 'channel denied' });
           return;
         }
+        // 新设备第一次 since=0：先等磁盘历史补齐，否则这一轮拿到空数组，
+        // 客户端会以为频道是空的。
+        if (channel.ready) await channel.ready;
         const since = Number(query.get('since') ?? 0) || 0;
         const wait = Math.min(Math.max(Number(query.get('wait') ?? 20) * 1000 || 20_000, 0), maxWaitMs);
         const collect = (): StoredMessage[] => channel.messages.filter((item) => item.seq > since);
@@ -590,6 +705,9 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 403, { ok: false, error: 'channel denied' });
           return;
         }
+        // 系统重启后第一次发：先把历史读进来，否则 seq 会从 1 重来，
+        // 客户端拿着 since=37 就再也收不到新消息。
+        if (channel.ready) await channel.ready;
         if (channel.seen.has(messageId)) {
           audit.record({ event: 'publish', channel: id, device: from, message: messageId, ip: clientIp(request), detail: 'duplicate' });
           json(response, 200, { ok: true, duplicate: true, seq: channel.seq });
@@ -602,7 +720,10 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           // 只保留最近的一段，防止内存被长期占用。
           channel.seen = new Set([...channel.seen].slice(-maxMessages * 2));
         }
-        channel.messages.push({ seq: channel.seq, id: messageId, from, envelope: { iv, ct }, at: Date.now() });
+        const stored: StoredMessage = { seq: channel.seq, id: messageId, from, envelope: { iv, ct }, at: Date.now() };
+        channel.messages.push(stored);
+        // 落盘只写密文与元数据；失败不影响本轮（内存里已经有了，只是重启会丢这一条）
+        history.append(id, { seq: stored.seq, id: stored.id, from: stored.from, iv, ct, at: stored.at });
         if (channel.messages.length > maxMessages) channel.messages = channel.messages.slice(-maxMessages);
         for (const wake of [...channel.waiters]) wake();
         json(response, 200, { ok: true, seq: channel.seq });
@@ -694,7 +815,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         for (const wake of [...channel.waiters]) wake();
       }
       server.close(() => {
-        void audit.flush().then(() => resolve());
+        void Promise.all([audit.flush(), history.flush()]).then(() => resolve());
       });
       // 长轮询会把 close 拖住，给一个上限。
       setTimeout(() => resolve(), 1_500).unref?.();

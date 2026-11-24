@@ -10,6 +10,7 @@ import { emptyIdentity, loadIdentity } from './relayIdentity';
 import { createSink, parseSink } from './relayAuditSink';
 import type { FeishuConfig } from './relayAuth';
 import { hostname as osHostname } from 'node:os';
+import { dirname, join } from 'node:path';
 
 async function main(): Promise<void> {
   const port = Number(process.env.PLAITCODE_PORT ?? 8787);
@@ -23,6 +24,14 @@ async function main(): Promise<void> {
    */
   const identityPath = process.env.PLAITCODE_IDENTITY?.trim();
   const adminToken = process.env.PLAITCODE_ADMIN_TOKEN?.trim() ?? '';
+  /**
+   * 频道历史落盘目录：只存密文与元数据。
+   * 默认放在审计日志旁边；设成 `-` 可关闭（回到纯内存）。
+   */
+  const historySetting = process.env.PLAITCODE_HISTORY?.trim();
+  const historyDir = historySetting === '-'
+    ? undefined
+    : (historySetting || (auditPath !== '-' ? join(dirname(auditPath), 'channels') : '/var/lib/plaitcode-relay/channels'));
 
   const identity = identityPath
     ? { state: (await loadIdentity(identityPath)) ?? emptyIdentity(), path: identityPath }
@@ -69,6 +78,8 @@ async function main(): Promise<void> {
     ...(identity ? { identity } : {}),
     ...(adminToken ? { adminToken } : {}),
     ...(sso ? { auth: sso } : {}),
+    ...(historyDir ? { historyDir } : {}),
+    ...(process.env.PLAITCODE_SELF_ENROLL === '0' ? { selfEnroll: false } : {}),
     audit: {
       ...(auditPath && auditPath !== '-' ? { path: auditPath } : {}),
       sink: ((line: string) => {

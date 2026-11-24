@@ -81,12 +81,21 @@ export function open(keys: RelayKeys, messageId: string, envelope: SealedEnvelop
 }
 
 /** 设备怎么把另一台设备拉进同一个频道：一行文本，既能贴给人也能做成二维码。 */
-export function buildPairingText(relayUrl: string, secret: string): string {
+/**
+ * 配对信息：一行文本，既能贴给人也能做成二维码。
+ *
+ * `t=` 是设备令牌（可选）。带上它，新设备粘贴一次就能同时拿到频道密钥和身份，
+ * 不必再去服务器手工发令牌。**没有它**也能用（旧的纯频道密钥模式）。
+ *
+ * 整串等于"进入这个频道的钥匙"，别发到公开群里。
+ */
+export function buildPairingText(relayUrl: string, secret: string, deviceToken?: string): string {
   const url = relayUrl.replace(/\/+$/, '');
-  return `plaitcode://join?u=${encodeURIComponent(url)}&s=${encodeURIComponent(secret)}`;
+  const base = `plaitcode://join?u=${encodeURIComponent(url)}&s=${encodeURIComponent(secret)}`;
+  return deviceToken ? `${base}&t=${encodeURIComponent(deviceToken)}` : base;
 }
 
-export function parsePairingText(text: string): { url: string; secret: string } | undefined {
+export function parsePairingText(text: string): { url: string; secret: string; deviceToken?: string } | undefined {
   const value = text.trim();
   if (!value.startsWith('plaitcode://join')) return undefined;
   const query = value.slice(value.indexOf('?') + 1);
@@ -94,5 +103,10 @@ export function parsePairingText(text: string): { url: string; secret: string } 
   const url = (params.get('u') ?? '').trim();
   const secret = (params.get('s') ?? '').trim();
   if (!/^https?:\/\//.test(url) || secret.length < 16) return undefined;
-  return { url: url.replace(/\/+$/, ''), secret };
+  const deviceToken = (params.get('t') ?? '').trim();
+  return {
+    url: url.replace(/\/+$/, ''),
+    secret,
+    ...(deviceToken.startsWith('pct_') ? { deviceToken } : {}),
+  };
 }

@@ -64,6 +64,21 @@ export interface Device {
   grants: DeviceGrant[];
   createdAt: number;
   lastSeenAt?: number;
+  /**
+   * 硬过期时间。未设置表示老记录（0.9.0 之前发的令牌），保持永不过期以免升级即断线；
+   * 新建设备一律带有效期。
+   */
+  expiresAt?: number;
+  /**
+   * 轮换后旧令牌的哈希 + 失效时间。
+   *
+   * 轮换不能立刻掐掉旧令牌：正在执行任务的客户端还在用旧值，
+   * 一瞬间切过去会让它掉线并丢掉本轮的进度。留一段重叠期让它自然切。
+   */
+  previousTokenHash?: string;
+  previousValidUntil?: number;
+  /** 最后一次轮换时间。 */
+  rotatedAt?: number;
   revokedAt?: number;
 }
 
@@ -76,6 +91,16 @@ export interface IdentityState {
 
 export const IDENTITY_VERSION = 1;
 const MAX_GRANTS = 100;
+/**
+ * 新设备令牌默认**不设**有效期。
+ *
+ * 个人多设备场景下，90 天到期后令牌静默失效，用户只会看到"某天开始连不上了"，
+ * 而轮换界面还没做好。所以默认关掉，由部署方用 `ttlMs` 显式开启；
+ * 企业客户需要强制轮换时再打开。
+ */
+const DEFAULT_DEVICE_TTL_MS = 0;
+/** 轮换时旧令牌的重叠有效期：24 小时，足够在跑的客户端自然切换。 */
+const DEFAULT_ROTATE_OVERLAP_MS = 24 * 60 * 60_000;
 
 export function emptyIdentity(): IdentityState {
   return { version: IDENTITY_VERSION, orgs: [], members: [], devices: [] };
@@ -168,7 +193,14 @@ export function findMemberByIdentity(state: IdentityState, key: MemberIdentityKe
  */
 export function addDevice(
   state: IdentityState,
-  input: { memberId: string; name: string; platform?: string; channels: Array<{ channelId: string; role?: Role }> },
+  input: {
+    memberId: string;
+    name: string;
+    platform?: string;
+    channels: Array<{ channelId: string; role?: Role }>;
+    /** 有效期（毫秒）。默认 90 天；传 0 表示永不过期（仅用于本地测试）。 */
+    ttlMs?: number;
+  },
 ): { device: Device; token: string } | undefined {
   const member = state.members.find((item) => item.id === input.memberId);
   if (!member) return undefined;
@@ -180,6 +212,7 @@ export function addDevice(
       channelId: entry.channelId.trim().slice(0, 64),
       role: isRole(entry.role) ? entry.role : member.role,
     }));
+  const ttl = input.ttlMs === undefined ? DEFAULT_DEVICE_TTL_MS : input.ttlMs;
   const device: Device = {
     id: newId('dev'),
     memberId: member.id,
@@ -188,8 +221,40 @@ export function addDevice(
     tokenHash: hashToken(token),
     grants,
     createdAt: Date.now(),
+    ...(ttl > 0 ? { expiresAt: Date.now() + ttl } : {}),
   };
   state.devices.push(device);
+  return { device, token };
+}
+
+/**
+ * 轮换设备令牌：发一个新的，旧的在重叠期内仍然可用。
+ *
+ * 为什么不能立刻作废旧令牌：客户端此刻可能正在跑一轮任务，
+ * 一刀切会让它掉线、丢掉本轮进度，用户只看到"任务莫名中断"。
+ */
+export function rotateDeviceToken(
+  state: IdentityState,
+  deviceId: string,
+  options: { ttlMs?: number; overlapMs?: number } = {},
+): { device: Device; token: string } | undefined {
+  const device = state.devices.find((item) => item.id === deviceId);
+  if (!device || device.revokedAt) return undefined;
+  const token = newDeviceToken();
+  const now = Date.now();
+  const overlap = Math.max(0, options.overlapMs ?? DEFAULT_ROTATE_OVERLAP_MS);
+  if (overlap > 0) {
+    device.previousTokenHash = device.tokenHash;
+    device.previousValidUntil = now + overlap;
+  } else {
+    device.previousTokenHash = undefined;
+    device.previousValidUntil = undefined;
+  }
+  device.tokenHash = hashToken(token);
+  device.rotatedAt = now;
+  const ttl = options.ttlMs === undefined ? DEFAULT_DEVICE_TTL_MS : options.ttlMs;
+  if (ttl > 0) device.expiresAt = now + ttl;
+  else device.expiresAt = undefined;
   return { device, token };
 }
 
@@ -201,11 +266,16 @@ export function revokeDevice(state: IdentityState, deviceId: string): boolean {
   return true;
 }
 
-/** 按令牌找设备（只比对哈希）。 */
-export function deviceByToken(state: IdentityState, token: string): Device | undefined {
+/** 按令牌找设备（只比对哈希）。轮换重叠期内的旧令牌也算有效。 */
+export function deviceByToken(state: IdentityState, token: string, now = Date.now()): Device | undefined {
   if (!token.startsWith('pct_')) return undefined;
   const hash = hashToken(token);
-  return state.devices.find((item) => safeEqualHex(item.tokenHash, hash));
+  const current = state.devices.find((item) => safeEqualHex(item.tokenHash, hash));
+  if (current) return current;
+  return state.devices.find((item) => item.previousTokenHash
+    && item.previousValidUntil !== undefined
+    && now < item.previousValidUntil
+    && safeEqualHex(item.previousTokenHash, hash));
 }
 
 export interface Verdict {
@@ -220,10 +290,13 @@ export interface Verdict {
  *
  * 失败原因写得具体 —— 企业排障时「403」没有价值，「设备已被吊销」才有。
  */
-export function authorize(state: IdentityState, token: string, channelId: string, action: Action): Verdict {
-  const device = deviceByToken(state, token);
+export function authorize(state: IdentityState, token: string, channelId: string, action: Action, now = Date.now()): Verdict {
+  const device = deviceByToken(state, token, now);
   if (!device) return { ok: false, reason: '设备令牌无效' };
   if (device.revokedAt) return { ok: false, device, reason: '设备已被吊销' };
+  if (device.expiresAt !== undefined && now > device.expiresAt) {
+    return { ok: false, device, reason: '设备令牌已过期，请重新登记设备' };
+  }
   const member = state.members.find((item) => item.id === device.memberId);
   if (!member) return { ok: false, device, reason: '设备所属成员已不存在' };
   const grant = device.grants.find((item) => item.channelId === channelId);

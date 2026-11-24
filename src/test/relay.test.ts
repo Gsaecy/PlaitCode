@@ -4,7 +4,7 @@ import { makeRequirement, type SyncPeer } from '../sync/lanProtocol';
 import { RelayClient } from '../sync/relayClient';
 import { CHANNEL_PREFIX, ENC_PREFIX, RELAY_PREFIX, buildPairingText, deriveKeys, newPairingSecret, open, parsePairingText, seal } from '../sync/relayCrypto';
 import { createRelayServer } from '../sync/relayServer';
-import { emptyIdentity } from '../sync/relayIdentity';
+import { addDevice, addMember, addOrg, emptyIdentity } from '../sync/relayIdentity';
 import { webcrypto } from 'node:crypto';
 
 /**
@@ -348,4 +348,90 @@ test('中继：密钥不匹配的设备发不进去也读不到', async () => {
   } finally {
     await relay.close();
   }
+});
+
+test('设备自助登记：已登记的设备能给自己的另一台设备签发同权限令牌，不能提权', async () => {
+  const state = emptyIdentity();
+  const org = addOrg(state, 'Acme');
+  const member = addMember(state, { orgId: org.id, name: '小王', role: 'member' })!;
+  const channel = 'd'.repeat(32);
+  const existing = addDevice(state, {
+    memberId: member.id,
+    name: '公司电脑',
+    channels: [{ channelId: channel, role: 'viewer' }],
+  })!;
+
+  const relay = await createRelayServer({ port: 0, identity: { state }, rateLimit: 200 });
+  const base = `http://127.0.0.1:${relay.port}`;
+  const enroll = (token: string, name = '家里电脑') => fetch(`${base}/v1/devices/enroll`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify({ name, platform: 'darwin' }),
+  });
+  try {
+    // 没有令牌 → 拒绝
+    assert.equal((await enroll('')).status, 403);
+
+    const issued = await enroll(existing.token);
+    assert.equal(issued.status, 200);
+    const body = await issued.json() as { token: string; device: { grants: Array<{ channelId: string; role: string }> } };
+    assert.match(body.token, /^pct_/);
+    // 签发的权限必须等于签发者自己的权限，不能因为"给自己发"就变 owner
+    assert.deepEqual(body.device.grants, [{ channelId: channel, role: 'viewer' }]);
+
+    // 新令牌真的能用（viewer 能 poll）
+    const poll = await fetch(`${base}/v1/poll?channel=${channel}&since=0&wait=0`, {
+      headers: { authorization: `Bearer ${body.token}` },
+    });
+    assert.equal(poll.status, 200);
+
+    // 新令牌也能继续签发（同一个人的第三台设备）
+    assert.equal((await enroll(body.token, '第三台')).status, 200);
+
+    // 吊销后立刻不能签发
+    const deviceId = state.devices[0]!.id;
+    state.devices[0]!.revokedAt = Date.now();
+    assert.equal((await enroll(existing.token)).status, 403);
+    assert.ok(deviceId);
+  } finally {
+    await relay.close();
+  }
+});
+
+test('自助登记可以整体关掉（受监管场景只允许管理员发令牌）', async () => {
+  const state = emptyIdentity();
+  const org = addOrg(state, 'Acme');
+  const member = addMember(state, { orgId: org.id, name: '小王', role: 'member' })!;
+  const existing = addDevice(state, {
+    memberId: member.id,
+    name: '公司电脑',
+    channels: [{ channelId: 'e'.repeat(32), role: 'member' }],
+  })!;
+
+  const relay = await createRelayServer({ port: 0, identity: { state }, selfEnroll: false });
+  try {
+    const response = await fetch(`http://127.0.0.1:${relay.port}/v1/devices/enroll`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${existing.token}` },
+      body: JSON.stringify({ name: 'x' }),
+    });
+    assert.equal(response.status, 403);
+  } finally {
+    await relay.close();
+  }
+});
+test('配对信息可以带设备令牌：新设备粘一次就够，旧格式仍然可用', () => {
+  const secret = 's'.repeat(32);
+  const withToken = buildPairingText('https://plaitcode.com/', secret, 'pct_abc123');
+  const parsed = parsePairingText(withToken)!;
+  assert.equal(parsed.url, 'https://plaitcode.com');
+  assert.equal(parsed.secret, secret);
+  assert.equal(parsed.deviceToken, 'pct_abc123');
+
+  const plain = parsePairingText(buildPairingText('https://plaitcode.com', secret))!;
+  assert.equal(plain.deviceToken, undefined, '旧格式没有令牌字段，不能凭空造一个');
+
+  // 伪造的令牌不能被当成设备令牌存下来
+  const bogus = parsePairingText(`plaitcode://join?u=https%3A%2F%2Fx.com&s=${secret}&t=not-a-token`)!;
+  assert.equal(bogus.deviceToken, undefined);
 });
