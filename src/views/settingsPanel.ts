@@ -549,13 +549,13 @@ export class SettingsPanel implements vscode.Disposable {
           <div class="section-heading"><h2>${t(lang, 'settings.collab.title')}</h2></div>
           <div class="privacy-summary"><p>${t(lang, 'settings.collab.body')}</p></div>
           <div class="storage-actions">
-            <button id="collabStartButton" type="button" class="primary">${t(lang, 'settings.collab.start')}</button>
+            <button id="lanSyncConnectButton" type="button" class="primary">${t(lang, 'settings.collab.connect')}</button>
           </div>
           <div class="storage-actions">
             <button id="lanSyncGroupButton" type="button">${t(lang, 'settings.collab.group')}</button>
             <button id="mobileButton" type="button">${t(lang, 'settings.collab.mobile')}</button>
             <button id="lanSyncLedgerButton" type="button">${t(lang, 'settings.collab.ledger')}</button>
-            <button id="lanSyncConnectButton" type="button">${t(lang, 'settings.collab.connect')}</button>
+            <button id="collabStartButton" type="button">${t(lang, 'settings.collab.start')}</button>
             <button id="lanSyncDisconnectButton" type="button">${t(lang, 'settings.collab.disconnect')}</button>
           </div>
         </section>

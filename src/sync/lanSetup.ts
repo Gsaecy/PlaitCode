@@ -443,9 +443,9 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         status.show();
         return;
       }
-      status.text = '$(rocket) 开始协作';
-      status.tooltip = '点一下 → 浏览器里用 GitHub 授权一次 → 手机和第二台电脑就能一起干活。不填地址、不要配对码。';
-      status.command = 'plaitcode.collab.start';
+      status.text = '$(broadcast) 连接另一台设备';
+      status.tooltip = '同一 WiFi 下，两台设备各点一次就能连上。要不要跨网走中继？命令面板执行「开始协作」。';
+      status.command = 'plaitcode.lanSync.connect';
       status.show();
       return;
     }
