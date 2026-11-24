@@ -102,7 +102,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
 (function () {
   var KEY_STORE = 'plaitcode.relay.key';
   var SESSION_AUTH = ${sessionAuth ? 'true' : 'false'};
-  var PHASES = { requirement:'需求', analysis:'解析', question:'追问', answer:'回复', confirm:'确认', progress:'进度', result:'结果' };
+  var PHASES = { requirement:'需求', analysis:'解析', question:'追问', answer:'回复', confirm:'确认', progress:'进度', result:'结果', blocked:'未执行' };
   var main = document.getElementById('main');
   var footer = document.getElementById('footer');
   var input = document.getElementById('input');
@@ -205,8 +205,8 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     return hit && hit.project ? hit.project : '';
   }
 
-  var STATUS_LABEL = { question:'等你回复', running:'进行中', open:'待接', done:'已完成' };
-  var STATUS_ORDER = ['question', 'running', 'open', 'done'];
+  var STATUS_LABEL = { question:'等你回复', blocked:'未执行', running:'进行中', open:'待接', done:'已完成' };
+  var STATUS_ORDER = ['question', 'blocked', 'running', 'open', 'done'];
   function boardFor(list) {
     var tasks = {}, order = [];
     list.slice().sort(function (a, b) { return (a.at || 0) - (b.at || 0); }).forEach(function (m) {
@@ -225,6 +225,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       var task = tasks[id];
       if (!task) return;
       if (m.phase === 'question') { task.status = 'question'; task.line = m.body; }
+      else if (m.phase === 'blocked') { if (task.status !== 'done') { task.status = 'blocked'; task.line = m.body; } }
       else if (m.phase === 'result') { task.status = 'done'; task.line = m.body; }
       else if (task.status !== 'done') { task.status = 'running'; task.line = m.body; }
     });

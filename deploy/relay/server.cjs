@@ -89,7 +89,7 @@
 (function () {
   var KEY_STORE = 'plaitcode.relay.key';
   var SESSION_AUTH = ${n?"true":"false"};
-  var PHASES = { requirement:'\u9700\u6C42', analysis:'\u89E3\u6790', question:'\u8FFD\u95EE', answer:'\u56DE\u590D', confirm:'\u786E\u8BA4', progress:'\u8FDB\u5EA6', result:'\u7ED3\u679C' };
+  var PHASES = { requirement:'\u9700\u6C42', analysis:'\u89E3\u6790', question:'\u8FFD\u95EE', answer:'\u56DE\u590D', confirm:'\u786E\u8BA4', progress:'\u8FDB\u5EA6', result:'\u7ED3\u679C', blocked:'\u672A\u6267\u884C' };
   var main = document.getElementById('main');
   var footer = document.getElementById('footer');
   var input = document.getElementById('input');
@@ -192,8 +192,8 @@
     return hit && hit.project ? hit.project : '';
   }
 
-  var STATUS_LABEL = { question:'\u7B49\u4F60\u56DE\u590D', running:'\u8FDB\u884C\u4E2D', open:'\u5F85\u63A5', done:'\u5DF2\u5B8C\u6210' };
-  var STATUS_ORDER = ['question', 'running', 'open', 'done'];
+  var STATUS_LABEL = { question:'\u7B49\u4F60\u56DE\u590D', blocked:'\u672A\u6267\u884C', running:'\u8FDB\u884C\u4E2D', open:'\u5F85\u63A5', done:'\u5DF2\u5B8C\u6210' };
+  var STATUS_ORDER = ['question', 'blocked', 'running', 'open', 'done'];
   function boardFor(list) {
     var tasks = {}, order = [];
     list.slice().sort(function (a, b) { return (a.at || 0) - (b.at || 0); }).forEach(function (m) {
@@ -212,6 +212,7 @@
       var task = tasks[id];
       if (!task) return;
       if (m.phase === 'question') { task.status = 'question'; task.line = m.body; }
+      else if (m.phase === 'blocked') { if (task.status !== 'done') { task.status = 'blocked'; task.line = m.body; } }
       else if (m.phase === 'result') { task.status = 'done'; task.line = m.body; }
       else if (task.status !== 'done') { task.status = 'running'; task.line = m.body; }
     });

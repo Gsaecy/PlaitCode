@@ -113,7 +113,7 @@ export type SyncMessage = SyncRequirement | SyncReport | SyncNote | SyncGroupMes
  *
  * **工具流水、命令输出、代码片段一律不进群** —— 那是执行记录该待的地方。
  */
-export type GroupPhase = 'requirement' | 'analysis' | 'question' | 'answer' | 'confirm' | 'progress' | 'result';
+export type GroupPhase = 'requirement' | 'analysis' | 'question' | 'answer' | 'confirm' | 'progress' | 'result' | 'blocked';
 
 export interface SyncGroupMessage {
   kind: 'group';
@@ -137,7 +137,7 @@ export interface SyncGroupMessage {
   project?: string;
 }
 
-const PHASES: ReadonlySet<string> = new Set(['requirement', 'analysis', 'question', 'answer', 'confirm', 'progress', 'result']);
+const PHASES: ReadonlySet<string> = new Set(['requirement', 'analysis', 'question', 'answer', 'confirm', 'progress', 'result', 'blocked']);
 export const MAX_GROUP_MESSAGES = 400;
 export const MAX_GROUP_BODY_CHARS = 4_000;
 
@@ -181,6 +181,8 @@ const PHASE_LABEL: Record<GroupPhase, string> = {
   confirm: '确认',
   progress: '进度',
   result: '结果',
+  /** 需求到了但没开跑（缺 API Key、没同意数据流向、被策略拦下）。 */
+  blocked: '未执行',
 };
 
 /** 群消息的说话人标签：`Windows · 乙方（产品经理）` / `用户 · 甲方`。 */

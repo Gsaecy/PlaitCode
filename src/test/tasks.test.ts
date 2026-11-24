@@ -112,3 +112,22 @@ test('看板：没指派 / 没项目的旧消息也能正常成任务（向后�
   assert.equal(board[0]?.project, '');
   assert.equal(board[0]?.status, 'open');
 });
+
+test('看板：需求因缺 API Key 未执行时是「未执行」，不能显示已完成', () => {
+  const id = 'req-blocked';
+  const board = buildTaskBoard([
+    message(PHONE, { author: 'user', phase: 'requirement', body: '改个按钮', requirementId: id }, 1_000, 'a'),
+    message(OFFICE, { author: 'agent', phase: 'blocked', body: '电脑上的 agent 没有开始处理：请先为 DeepSeek 配置 API Key。', requirementId: id }, 2_000, 'b'),
+  ]);
+  assert.equal(board.length, 1);
+  assert.equal(board[0]?.status, 'blocked');
+  assert.match(board[0]!.lastLine, /API Key/);
+
+  // 修好 Key 之后重新跑，状态要能往前走，不能永远卡在 blocked
+  const resumed = buildTaskBoard([
+    message(PHONE, { author: 'user', phase: 'requirement', body: '改个按钮', requirementId: id }, 1_000, 'a'),
+    message(OFFICE, { author: 'agent', phase: 'blocked', body: '没配 Key', requirementId: id }, 2_000, 'b'),
+    message(OFFICE, { author: 'agent', phase: 'progress', body: '开始改 Button.tsx', requirementId: id }, 3_000, 'c'),
+  ]);
+  assert.equal(resumed[0]?.status, 'running');
+});

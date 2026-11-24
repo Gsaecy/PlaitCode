@@ -12,7 +12,7 @@
 import type { GroupPhase, SyncGroupMessage } from './lanProtocol';
 
 /** 任务状态。`question` 单独拎出来，因为它卡在**甲方**身上，不是 agent 在忙。 */
-export type WorkTaskStatus = 'open' | 'running' | 'question' | 'done';
+export type WorkTaskStatus = 'open' | 'running' | 'question' | 'blocked' | 'done';
 
 export interface WorkTask {
   /** 任务号（= 需求号）。 */
@@ -90,6 +90,10 @@ export function buildTaskBoard(messages: readonly SyncGroupMessage[], limit = 50
     if (message.phase === 'question') {
       task.status = 'question';
       task.lastLine = oneLine(message.body);
+    } else if (message.phase === 'blocked') {
+      // 需求到了但没开跑：既不是在做，也不能算完成，否则看板会说谎
+      if (task.status !== 'done') task.status = 'blocked';
+      task.lastLine = oneLine(message.body);
     } else if (message.phase === 'result') {
       task.status = 'done';
       task.lastLine = oneLine(message.body);
@@ -105,11 +109,12 @@ export function buildTaskBoard(messages: readonly SyncGroupMessage[], limit = 50
   return limit > 0 ? tasks.slice(0, limit) : tasks;
 }
 
-/** 看板分组顺序：卡在甲方身上的排最前，然后在做、待接、已完成。 */
-export const TASK_STATUS_ORDER: readonly WorkTaskStatus[] = ['question', 'running', 'open', 'done'];
+/** 看板分组顺序：卡在甲方身上的排最前，然后在做、待接、未执行、已完成。 */
+export const TASK_STATUS_ORDER: readonly WorkTaskStatus[] = ['question', 'blocked', 'running', 'open', 'done'];
 
 export const TASK_STATUS_LABEL: Record<WorkTaskStatus, string> = {
   question: '等你回复',
+  blocked: '未执行',
   running: '进行中',
   open: '待接',
   done: '已完成',

@@ -198,7 +198,9 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
           reason: outcome.reasonKey ? tt(outcome.reasonKey, outcome.vars ?? {}) : tt('notice.relayUnknownReason'),
         });
       output.info(`[relay] 甲方需求${outcome.ok ? '已开跑' : '未开跑'}：${body}`);
-      void service.postGroup({ author: 'agent', phase: outcome.ok ? 'progress' : 'result', body })
+      // 失败用 blocked 而不是 result：result 会让看板把任务标成"已完成"，
+      // 用户看到的却是"根本没跑"，那是假信息。
+      void service.postGroup({ author: 'agent', phase: outcome.ok ? 'progress' : 'blocked', body })
         .catch((error: unknown) => output.warn(`[relay] 回执发送失败：${error instanceof Error ? error.message : String(error)}`));
     }),
   };
