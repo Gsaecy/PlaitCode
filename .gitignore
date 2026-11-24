@@ -9,3 +9,5 @@ coverage/
 docs/screenshots/*.html
 tmp-*
 docs/HWCHAT-PROJECT-NOTES.md
+# 扩展运行期写出的团队群记录（运行时产物，不进仓库）
+docs/TEAM-CHAT.md
