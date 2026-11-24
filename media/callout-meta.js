@@ -81,7 +81,7 @@
     return Object.prototype.hasOwnProperty.call(MARKERS, key) ? MARKERS[key] : '';
   }
 
-  globalThis.PlaitCodeCalloutMeta = {
+  globalThis.HWChatCalloutMeta = {
     TONES: TONES.slice(),
     markers: () => Object.keys(MARKERS),
     toneFor,

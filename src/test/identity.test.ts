@@ -93,7 +93,7 @@ test('令牌只存哈希：库里查不到明文，伪造的令牌进不来', ()
 });
 
 test('身份库：落盘后能读回，快照不含令牌哈希', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-identity-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-identity-'));
   const path = join(dir, 'identity.json');
   try {
     const state = emptyIdentity();

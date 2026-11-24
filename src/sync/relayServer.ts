@@ -1,5 +1,5 @@
 /**
- * PlaitCode 跨网中继（零依赖，单文件可部署）。
+ * HWChat 跨网中继（零依赖，单文件可部署）。
  *
  * 它**只做三件事**：收密文、按频道排队、把新密文送给在线设备。
  * 它看不到消息内容（端到端加密在两端做），也不执行任何命令 —— 越简单越安全。
@@ -67,7 +67,7 @@ export interface RelayOptions {
    * 不再接受频道密钥；没有它时完全是原来的行为。
    */
   identity?: { state: IdentityState; path?: string };
-  /** 管理接口令牌（请求头 `x-plaitcode-admin`）。不填就关闭管理接口。 */
+  /** 管理接口令牌（请求头 `x-hwchat-admin`）。不填就关闭管理接口。 */
   adminToken?: string;
   /** 飞书登录（SSO）。需要身份库一起开启。 */
   auth?: {
@@ -321,7 +321,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
     }
     const sessionKey = sessionSecret();
     if (!sessionKey) return { ok: false, status: 403, reason: '设备令牌无效' };
-    const session = verifySession(sessionKey, parseCookies(request.headers.cookie).plaitcode_session);
+    const session = verifySession(sessionKey, parseCookies(request.headers.cookie).hwchat_session);
     if (!session) return { ok: false, status: 401, reason: '未登录：请先用 GitHub 或飞书登录' };
     const verdict = authorizeSession(identity.state, session.memberId, channelId, action);
     if (!verdict.ok) return { ok: false, status: 403, reason: verdict.reason ?? '未授权' };
@@ -458,7 +458,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         const page = renderLandingPage({
           relayHost: typeof request.headers.host === 'string' ? request.headers.host : 'plaitcode.com',
           consoleEnabled: ssoEnabled(),
-          installUrl: 'https://marketplace.visualstudio.com/items?itemName=plaitcode.plaitcode',
+          installUrl: 'https://marketplace.visualstudio.com/items?itemName=honor-world.hwchat',
           repoUrl: 'https://github.com/Gsaecy/PlaitCode',
         });
         response.writeHead(200, {
@@ -744,7 +744,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         audit.record({ event: 'login', ip: clientIp(request), detail: member.githubLogin ?? member.name });
         response.writeHead(302, {
           location: check.next === 'console' ? '/console' : '/m',
-          'set-cookie': `plaitcode_session=${cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`,
+          'set-cookie': `hwchat_session=${cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`,
           'cache-control': 'no-store',
         });
         response.end();
@@ -848,7 +848,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
         audit.record({ event: 'login', ip: clientIp(request), detail: member.name });
         response.writeHead(302, {
           location: check.next === 'console' ? '/console' : '/m',
-          'set-cookie': `plaitcode_session=${cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`,
+          'set-cookie': `hwchat_session=${cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(ttl / 1000)}`,
           'cache-control': 'no-store',
         });
         response.end();
@@ -861,7 +861,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 404, { ok: false, error: 'sso disabled' });
           return;
         }
-        const session = verifySession(sessionSecret(), parseCookies(request.headers.cookie).plaitcode_session);
+        const session = verifySession(sessionSecret(), parseCookies(request.headers.cookie).hwchat_session);
         if (!session) {
           json(response, 401, { ok: false, error: '未登录' });
           return;
@@ -873,7 +873,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       if (route === '/v1/auth/logout' && request.method === 'POST') {
         response.writeHead(200, {
           'content-type': 'application/json; charset=utf-8',
-          'set-cookie': 'plaitcode_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
+          'set-cookie': 'hwchat_session=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0',
         });
         response.end(JSON.stringify({ ok: true }));
         return;
@@ -1220,7 +1220,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 404, { ok: false, error: 'sso disabled' });
           return;
         }
-        const session = verifySession(sessionSecret(), parseCookies(request.headers.cookie).plaitcode_session);
+        const session = verifySession(sessionSecret(), parseCookies(request.headers.cookie).hwchat_session);
         if (!session) {
           // 配了 GitHub 就优先跳 GitHub：对开发者来说那才是日常那个账号
           const login = options.github
@@ -1295,7 +1295,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
           json(response, 404, { ok: false, error: 'admin api disabled' });
           return;
         }
-        if (!adminMatches(request.headers['x-plaitcode-admin'])) {
+        if (!adminMatches(request.headers['x-hwchat-admin'])) {
           audit.record({ event: 'denied', ip: clientIp(request), detail: 'admin auth failed' });
           json(response, 403, { ok: false, error: 'admin denied' });
           return;
@@ -1374,7 +1374,7 @@ export async function createRelayServer(options: RelayOptions = {}): Promise<Rel
       if (request.method === 'GET' && isHealth) {
         json(response, 200, {
           ok: true,
-          service: 'plaitcode-relay',
+          service: 'hwchat-relay',
           version: RELAY_VERSION,
           channels: channels.size,
           uptime: Math.round(process.uptime()),

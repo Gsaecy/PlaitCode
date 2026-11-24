@@ -81,7 +81,7 @@ test('源文件里引用的键都真实存在', () => {
 
 test('品牌与定位不能写死旧名字（chat 面板副标题走 i18n）', () => {
   // 曾经把 "DeepSeek workspace" 硬编码在聊天面板里：DeepSeek 只是可选后端之一，
-  // 品牌应该是 PlaitCode。这条守卫防止旧名字再回来。
+  // 品牌应该是 HWChat。这条守卫防止旧名字再回来。
   const files = ['src/views/chatPanel.ts', 'src/views/groupPanel.ts', 'src/views/settingsPanel.ts'];
   for (const file of files) {
     const source = readFileSync(join(process.cwd(), file), 'utf8');

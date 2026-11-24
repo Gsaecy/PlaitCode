@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { LanSyncService } from '../sync/lanSync';
+import { LanSyncService, normalizeHubAddress } from '../sync/lanSync';
 import type { SyncNote, SyncPeer, SyncRequirement } from '../sync/lanProtocol';
 
 /**
@@ -23,7 +23,7 @@ async function makeService(peer: SyncPeer, options: {
   onRequirement?: (requirement: SyncRequirement) => Promise<boolean>;
   onNote?: (note: SyncNote) => Promise<boolean>;
 } = {}): Promise<{ service: LanSyncService; dir: string; ledgers: string[] }> {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-sync-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-sync-'));
   const ledgers: string[] = [];
   const service = new LanSyncService(join(dir, 'state.json'), {
     peer: () => peer,
@@ -131,7 +131,7 @@ test('协作消息：主机发一条，对端 agent 收到；纯陈述不触发�
   const hub = await makeService(winPeer);
   const notes: SyncNote[] = [];
   const statements: SyncNote[] = [];
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-sync-note-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-sync-note-'));
   const peer = new LanSyncService(join(dir, 'state.json'), {
     peer: () => macPeer,
     runRequirement: async () => true,
@@ -173,8 +173,8 @@ test('一键连接：陌生设备弹一次「允许」即可加入，之后重�
    * 这是「傻瓜式」的核心：用户不抄配对码，只在弹窗上点一次「允许」。
    * 允许之后这台设备被记住，重连不再打扰。
    */
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-sync-approve-'));
-  const dir2 = await mkdtemp(join(tmpdir(), 'plaitcode-sync-approve2-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-sync-approve-'));
+  const dir2 = await mkdtemp(join(tmpdir(), 'hwchat-sync-approve2-'));
   const asked: string[] = [];
   const hub = new LanSyncService(join(dir, 'state.json'), {
     peer: () => winPeer,
@@ -221,8 +221,8 @@ test('一键连接：陌生设备弹一次「允许」即可加入，之后重�
 });
 
 test('一键连接：用户点「拒绝」时连不进来', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-sync-reject-'));
-  const dir2 = await mkdtemp(join(tmpdir(), 'plaitcode-sync-reject2-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-sync-reject-'));
+  const dir2 = await mkdtemp(join(tmpdir(), 'hwchat-sync-reject2-'));
   const hub = new LanSyncService(join(dir, 'state.json'), {
     peer: () => winPeer,
     runRequirement: async () => true,
@@ -266,7 +266,7 @@ async function waitFor(check: () => boolean, timeoutMs: number): Promise<void> {
 }
 
 test('中继需求按指派门控：指名别人时本机不跑，指名本机才跑，没指派全都跑', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-assign-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-assign-'));
   try {
     const ran: string[] = [];
     const service = new LanSyncService(join(dir, 'state.json'), {
@@ -309,6 +309,26 @@ test('中继需求按指派门控：指名别人时本机不跑，指名本机�
     await service.ingestRelayMessage({ ...requirement('g4', '我自己发的', 'p-mac'), from: macPeer });
     assert.equal(ran.length, 2);
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {
+  assert.equal(normalizeHubAddress('192.168.0.3', 47821), 'http://192.168.0.3:47821');
+  assert.equal(normalizeHubAddress('192.168.0.3:5000', 47821), 'http://192.168.0.3:5000', '显式端口不能被覆盖');
+  assert.equal(normalizeHubAddress('http://192.168.0.3', 47821), 'http://192.168.0.3:47821');
+  assert.equal(normalizeHubAddress('http://192.168.0.3:47821/', 47821), 'http://192.168.0.3:47821');
+  assert.equal(normalizeHubAddress('', 47821), '');
+});
+
+test('没连任何通道时，发需求必须明说「没有同步到任何其它设备」', async () => {
+  const { service, dir } = await makeService(winPeer);
+  try {
+    const result = await service.shareRequirement('加一个托盘图标');
+    assert.equal(result.ok, false, '此刻没有任何设备会收到，不能报成功');
+    assert.match(result.message, /没有同步到任何其它设备/);
+  } finally {
+    service.dispose();
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -272,7 +272,7 @@
     return `:${reference.line}`;
   }
 
-  globalThis.PlaitCodeFileRef = {
+  globalThis.HWChatFileRef = {
     looksLikeFilePath,
     parseReference,
     resolveReference,

@@ -10,10 +10,11 @@
  * 3. **配对码是唯一凭据**，每个请求都要带。同一个 WiFi 上的陌生设备扫到端口也进不来。
  * 4. **网络输入全部当作不可信**：`parseSyncMessage` 卡长度 + 校验形状，处理器只认
  *    校验通过的对象；任何异常都只在日志里留一行，绝不让它冒到面板。
- * 5. **默认关闭**（`plaitcode.lanSync.enabled` 默认 false），不影响现有任何功能。
+ * 5. **默认关闭**（`hwchat.lanSync.enabled` 默认 false），不影响现有任何功能。
  */
 
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { createHash, randomBytes } from 'node:crypto';
 import { createSocket, type Socket as UdpSocket } from 'node:dgram';
 import { hostname, networkInterfaces, platform as osPlatform } from 'node:os';
@@ -114,8 +115,11 @@ export interface LanSyncBridge {
    *
    * 局域网模式下它已经自己广播了；跨网中继模式下由这一条钩子把密文送去中转。
    * 只在「本机产生」时调用，收到别人的消息不会再触发，避免回声。
+   *
+   * 返回值就是**送达凭据**：没连中继要如实说 `ok: false`，
+   * 不能静默丢弃——否则 agent 会把「发出去了」当成「对方收到了」，两台设备各说各的。
    */
-  onOutgoing?(message: SyncMessage): void;
+  onOutgoing?(message: SyncMessage): Promise<{ ok: boolean; message: string }> | void;
   /**
    * 中继上收到「甲方在群里发的需求」：本机要真的开跑。
    *
@@ -180,11 +184,49 @@ export function lanAddresses(): string[] {
   return result;
 }
 
+function isIPv4(value: string): boolean {
+  const parts = value.split('.');
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+/**
+ * 每张网卡的子网定向广播地址（如 `192.168.1.255`）。
+ *
+ * 只发 `255.255.255.255` 时，多网卡机器会让系统挑一张网卡出去，路由器也常直接丢弃；
+ * 定向到本网段才是同一 WiFi 下最稳的一条路。
+ */
+export function subnetBroadcasts(): string[] {
+  const result = new Set<string>();
+  for (const list of Object.values(networkInterfaces())) {
+    for (const entry of list ?? []) {
+      if (entry.family !== 'IPv4' || entry.internal || !entry.netmask) continue;
+      if (!isIPv4(entry.address) || !isIPv4(entry.netmask)) continue;
+      const address = entry.address.split('.').map(Number);
+      const mask = entry.netmask.split('.').map(Number);
+      result.add(address.map((part, index) => (part & (mask[index] ?? 0)) | (~(mask[index] ?? 0) & 255)).join('.'));
+    }
+  }
+  return [...result];
+}
+
+/** 发现包的收件人：全局广播 + 各网段定向广播。 */
+function broadcastTargets(): string[] {
+  return ['255.255.255.255', ...subnetBroadcasts()];
+}
+
 export class LanSyncService implements Disposable {
   private server?: Server;
   private udp?: UdpSocket;
   private role: LanSyncRole = 'off';
+  /** HTTP 实际监听端口：被占用时会换成系统分配的端口。 */
   private port = 47821;
+  /**
+   * 用户配置的端口，UDP 发现固定用它。
+   *
+   * 发现必须有一个双方都知道的固定端口，所以它不能跟着 HTTP 端口漂 ——
+   * 否则端口一换，对端就再也找不到这台机器。
+   */
+  private configuredPort = 47821;
   private hubAddress = '';
   private code = '';
   private requirements: SyncRequirement[] = [];
@@ -281,9 +323,16 @@ export class LanSyncService implements Disposable {
    *
    * 每台设备都点同一个按钮，谁先谁后都能连上 —— 这就是「傻瓜式」的核心。
    */
+  /** 记住用户配置的端口：UDP 发现立刻换过去，HTTP 端口随后由 startListener 调成实际值。 */
+  private usePort(port: number): void {
+    const value = port > 0 ? port : this.configuredPort;
+    this.configuredPort = value;
+    this.port = value;
+  }
+
   async autoConnect(port?: number): Promise<{ ok: boolean; message: string; role: LanSyncRole }> {
-    const targetPort = port && port > 0 ? port : (this.lastPort || this.port);
-    this.port = targetPort;
+    const targetPort = port && port > 0 ? port : (this.lastPort || this.configuredPort);
+    this.usePort(targetPort);
     // 先在局域网里找已有主机（多试几次，给对方一点启动时间）。
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const found = await this.discover();
@@ -454,11 +503,22 @@ export class LanSyncService implements Disposable {
   }
 
   /** 本机产生的消息交给中继（没接中继时是空操作）。 */
-  private relayOut(message: SyncMessage): void {
+  /**
+   * 把一条消息送去中继，并把**真实结果**带回来。
+   *
+   * 这里以前是空操作：没连中继就直接 return，消息无声消失。
+   * 结果就是用户遇到的那种局面——一边说「已同步」，另一边什么都没有，
+   * 而两边都拿不出证据。现在无论成没成都必须有一句话。
+   */
+  private async relayOut(message: SyncMessage): Promise<{ ok: boolean; message: string }> {
     try {
-      this.bridge.onOutgoing?.(message);
+      const result = await this.bridge.onOutgoing?.(message);
+      if (!result) return { ok: false, message: '没有配置中继，这条只留在本机' };
+      return result;
     } catch (error) {
-      this.bridge.log(`[relay] 发送失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+      const text = error instanceof Error ? error.message : String(error);
+      this.bridge.log(`[relay] 发送失败：${text}`, 'warn');
+      return { ok: false, message: `中继发送失败：${text}` };
     }
   }
 
@@ -474,7 +534,7 @@ export class LanSyncService implements Disposable {
    */
   async setMobileControl(enabled: boolean, port?: number): Promise<{ ok: boolean; message: string; url?: string }> {
     this.mobileEnabled = enabled;
-    if (port && port > 0) this.port = port;
+    if (port && port > 0) this.usePort(port);
     if (!enabled) {
       this.gate.revokeAll();
       for (const id of [...this.approvals.keys()]) this.resolveApproval(id, false);
@@ -593,7 +653,7 @@ export class LanSyncService implements Disposable {
        * 局域网/中继都可能没连，`onOutgoing` 内部是空操作，不影响本机弹窗。
        * 授权细节（要跑的命令）不写进群记录，只走这条专用消息。
        */
-      this.bridge.onOutgoing?.({
+      void this.bridge.onOutgoing?.({
         kind: 'approval',
         id: wireId,
         from: this.bridge.peer(),
@@ -664,20 +724,20 @@ export class LanSyncService implements Disposable {
    * 主机同时是「转运站」和「参与者」：自己也会收到并执行需求，并且负责把需求
    * 转发给所有已登记的设备。
    */
-  async startHub(port = this.port): Promise<{ ok: boolean; message: string }> {
+  async startHub(port = this.configuredPort): Promise<{ ok: boolean; message: string }> {
     if (this.role === 'hub' && this.server) return { ok: true, message: `已在主机模式（:${this.port}）` };
     this.stopListener();
-    this.port = port;
+    this.usePort(port);
     try {
       await this.startListener();
       await this.startDiscovery();
       this.role = 'hub';
       this.hubAddress = '';
-      this.bridge.log(`[sync] 主机已启动，端口 ${port}，配对码 ${this.code}`);
+      this.bridge.log(`[sync] 主机已启动，端口 ${this.port}（发现端口 ${this.configuredPort}），配对码 ${this.code}`);
       this.bridge.onState?.();
       return {
         ok: true,
-        message: `主机已启动。同一 WiFi 的另一台设备用配对码 ${this.code} 加入；监听端口 ${port}。`,
+        message: `主机已启动。同一 WiFi 的另一台设备点一次「连接另一台设备」就能加入；配对码 ${this.code}。`,
       };
     } catch (error) {
       this.role = 'off';
@@ -688,8 +748,8 @@ export class LanSyncService implements Disposable {
   }
 
   /** 加入某台主机。地址留空时用 UDP 广播自动寻找。 */
-  async joinHub(address?: string, port = this.port): Promise<{ ok: boolean; message: string }> {
-    this.port = port;
+  async joinHub(address?: string, port = this.configuredPort): Promise<{ ok: boolean; message: string }> {
+    this.usePort(port);
     this.stopListener();
     try {
       await this.startListener();
@@ -697,13 +757,23 @@ export class LanSyncService implements Disposable {
       const message = error instanceof Error ? error.message : String(error);
       return { ok: false, message: `本机监听失败：${message}` };
     }
-    const target = address?.trim() || await this.discover();
+    /*
+     * 手动填的地址常常只有 IP（`192.168.0.3`），不补端口就会连到 80 端口 —— 
+     * 对端根本没在那儿监听。这里把端口补齐，用户不用记端口号。
+     */
+    const typed = address?.trim();
+    const target = typed ? normalizeHubAddress(typed, this.configuredPort) : await this.discover();
     if (!target) {
       this.role = 'off';
       this.stopListener();
-      return { ok: false, message: '没有自动找到主机。请直接填写主机的局域网 IP（状态栏里有）。' };
+      return {
+        ok: false,
+        message: typed
+          ? `地址看不懂：${typed}。填 IP 就行（例如 192.168.0.3），端口会自动补上。`
+          : '没有自动找到主机。如果两台设备和路由器都正常，请在另一台上点一次「连接另一台设备」，或直接在「高级」里填它的 IP。',
+      };
     }
-    const response = await this.postJson(target, '/plaitcode-sync/v1/pair', {
+    const response = await this.postJson(target, '/hwchat-sync/v1/pair', {
       protocol: SYNC_PROTOCOL_VERSION,
       code: this.code,
       peer: this.bridge.peer(),
@@ -756,16 +826,33 @@ export class LanSyncService implements Disposable {
     const server = createServer((request, response) => {
       void this.handleRequest(request, response);
     });
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(this.port, '0.0.0.0', () => {
-        server.off('error', reject);
-        // 端口填 0 时由系统分配：手机遥控因此永远不会和「上次没退干净的端口」打架。
-        const address = server.address();
-        if (address && typeof address === 'object' && address.port > 0) this.port = address.port;
+    const listen = (port: number): Promise<void> => new Promise<void>((resolve, reject) => {
+      const onError = (error: NodeJS.ErrnoException): void => {
+        server.off('listening', onListening);
+        reject(error);
+      };
+      const onListening = (): void => {
+        server.off('error', onError);
         resolve();
-      });
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(port, '0.0.0.0');
     });
+    try {
+      await listen(this.configuredPort);
+    } catch (error) {
+      /*
+       * 端口被上一次没退干净的窗口（或另一个 VS Code 窗口）占着。
+       * 换系统分配的端口继续：对端是靠广播包里带的真实端口连过来的，
+       * 用户不该为了这个去看日志、改设置。
+       */
+      if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error;
+      await listen(0);
+      this.bridge.log(`[sync] 端口 ${this.configuredPort} 被占用，改用 ${(server.address() as AddressInfo).port}`);
+    }
+    const address = server.address();
+    if (address && typeof address === 'object' && address.port > 0) this.port = address.port;
     this.server = server;
   }
 
@@ -774,7 +861,7 @@ export class LanSyncService implements Disposable {
     const udp = createSocket({ type: 'udp4', reuseAddr: true });
     await new Promise<void>((resolve, reject) => {
       udp.once('error', reject);
-      udp.bind(this.port, () => {
+      udp.bind(this.configuredPort, () => {
         udp.off('error', reject);
         resolve();
       });
@@ -791,7 +878,7 @@ export class LanSyncService implements Disposable {
     this.udp = udp;
     this.announceTimer = setInterval(() => {
       const payload = Buffer.from(JSON.stringify({ magic: HUB_MAGIC, port: this.port, addresses: lanAddresses() }));
-      udp.send(payload, this.port, '255.255.255.255', () => { /* 广播失败无所谓 */ });
+      for (const target of broadcastTargets()) udp.send(payload, this.configuredPort, target, () => { /* 广播失败无所谓 */ });
     }, 15_000);
     this.announceTimer.unref?.();
   }
@@ -800,21 +887,22 @@ export class LanSyncService implements Disposable {
     const udp = createSocket({ type: 'udp4', reuseAddr: true });
     return new Promise((resolve) => {
       let settled = false;
+      const timers: NodeJS.Timeout[] = [];
       const finish = (value: string): void => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        for (const timer of timers) clearTimeout(timer);
         try { udp.close(); } catch { /* 已关闭 */ }
         resolve(value);
       };
-      const timer = setTimeout(() => finish(''), 2_000);
+      timers.push(setTimeout(() => finish(''), 2_000));
       udp.on('error', () => finish(''));
       udp.on('message', (buffer) => {
         try {
           const parsed = JSON.parse(buffer.toString('utf8')) as { magic?: string; addresses?: unknown; port?: unknown };
           if (parsed.magic !== HUB_MAGIC || !Array.isArray(parsed.addresses)) return;
           const address = parsed.addresses.find((item): item is string => typeof item === 'string' && Boolean(item));
-          if (address) finish(`http://${address}:${typeof parsed.port === 'number' ? parsed.port : this.port}`);
+          if (address) finish(`http://${address}:${typeof parsed.port === 'number' ? parsed.port : this.configuredPort}`);
         } catch {
           // 不是我们的包。
         }
@@ -822,7 +910,17 @@ export class LanSyncService implements Disposable {
       udp.bind(() => {
         const payload = Buffer.from(DISCOVER_MAGIC);
         udp.setBroadcast(true);
-        udp.send(payload, this.port, '255.255.255.255', () => { /* 忽略 */ });
+        /*
+         * UDP 广播不可靠：丢一个包就是「找不到设备」。
+         *
+         * 所以发四轮，而且不只发 255.255.255.255 —— 多网卡机器上系统常把全局广播
+         * 从错误的网卡送出去，路由器也经常直接丢弃；定向到本网段才走得通。
+         */
+        const ask = (): void => {
+          for (const target of broadcastTargets()) udp.send(payload, this.configuredPort, target, () => { /* 忽略 */ });
+        };
+        ask();
+        timers.push(setTimeout(ask, 350), setTimeout(ask, 800), setTimeout(ask, 1_300));
       });
     });
   }
@@ -855,6 +953,20 @@ export class LanSyncService implements Disposable {
     return [...this.peers.values()].filter((entry) => entry.peer.id !== this.bridge.peer().id);
   }
 
+  /** 对端设备清单（「同步核对」要让人看见到底连上了谁）。 */
+  remotePeers(): Array<{ name: string; platform: string; address: string }> {
+    return this.peerList().map((entry) => ({
+      name: entry.peer.name,
+      platform: entry.peer.platform,
+      address: entry.address,
+    }));
+  }
+
+  /** 本机实际监听端口与发现端口（核对端口是否被换过）。 */
+  ports(): { listen: number; discovery: number } {
+    return { listen: this.port, discovery: this.configuredPort };
+  }
+
   private async handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const url = request.url ?? '/';
     const route = url.split('?')[0] ?? '/';
@@ -867,7 +979,7 @@ export class LanSyncService implements Disposable {
       response.end(payload);
     };
     try {
-      if (request.method === 'GET' && route === '/plaitcode-sync/v1/ping') {
+      if (request.method === 'GET' && route === '/hwchat-sync/v1/ping') {
         json(200, { ok: true, protocol: SYNC_PROTOCOL_VERSION, peer: this.bridge.peer(), role: this.role });
         return;
       }
@@ -901,11 +1013,11 @@ export class LanSyncService implements Disposable {
        * `/pair` 例外：它的放行判断在下面（已允许过的设备 / 对得上码 / 用户点「允许」
        * 三种途径），所以不能在这里一刀切 —— 否则「傻瓜式」的弹窗永远走不到。
        */
-      if (route !== '/plaitcode-sync/v1/pair' && !pairingMatches(parsed.code, this.code)) {
+      if (route !== '/hwchat-sync/v1/pair' && !pairingMatches(parsed.code, this.code)) {
         json(403, { ok: false, error: 'pairing code mismatch' });
         return;
       }
-      if (route === '/plaitcode-sync/v1/pair') {
+      if (route === '/hwchat-sync/v1/pair') {
         const message = parseSyncMessage({ kind: 'report', requirementId: 'pair', from: parsed.peer, status: 'planned' });
         if (message) {
           /*
@@ -953,7 +1065,7 @@ export class LanSyncService implements Disposable {
         });
         return;
       }
-      if (route === '/plaitcode-sync/v1/message') {
+      if (route === '/hwchat-sync/v1/message') {
         const message = parseSyncMessage(parsed.message);
         if (!message) {
           json(400, { ok: false, error: 'invalid message' });
@@ -970,7 +1082,7 @@ export class LanSyncService implements Disposable {
        * 只接受主机转发的消息，且同样校验配对码 —— 这样即使有人知道端口，
        * 没有配对码也没法让别人的机器执行任务。
        */
-      if (route === '/plaitcode-sync/v1/deliver') {
+      if (route === '/hwchat-sync/v1/deliver') {
         const message = parseSyncMessage(parsed.message);
         if (!message) {
           json(400, { ok: false, error: 'invalid message' });
@@ -1097,7 +1209,7 @@ export class LanSyncService implements Disposable {
      * 改状态的接口要求这个自定义头：跨站表单发不出自定义头，
      * 配合 `SameSite=Strict` 就挡住了「别的网页借你的浏览器指挥这台电脑」。
      */
-    if (request.headers['x-plaitcode-mobile'] !== '1') {
+    if (request.headers['x-hwchat-mobile'] !== '1') {
       send(403, { ok: false, error: '缺少请求头' });
       return;
     }
@@ -1231,7 +1343,7 @@ export class LanSyncService implements Disposable {
     if (options.relay && this.role === 'hub') {
       const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message });
       const targets = this.peerList().filter((entry) => entry.address && entry.peer.id !== options.from);
-      await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/plaitcode-sync/v1/deliver', payload)));
+      await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     }
     await this.refreshLedger();
     this.bridge.onState?.();
@@ -1263,13 +1375,13 @@ export class LanSyncService implements Disposable {
     if (!exists) this.requirements = [...this.requirements, requirement].slice(-STATE_LIMIT);
     await this.persist();
     await this.refreshLedger();
-    this.relayOut(requirement);
+    const relayResult = await this.relayOut(requirement);
 
     if (this.role !== 'off') {
       const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message: requirement });
       if (this.role === 'hub') {
         const targets = this.peerList().filter((entry) => entry.address);
-        const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/plaitcode-sync/v1/deliver', payload)));
+        const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
         const failed = results.filter((result) => result.status === 'rejected').length;
         const delivered = targets.length - failed;
         this.bridge.onState?.();
@@ -1281,7 +1393,7 @@ export class LanSyncService implements Disposable {
           requirement,
         };
       }
-      const response = await this.postJson(this.hubAddress, '/plaitcode-sync/v1/message', {
+      const response = await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', {
         protocol: SYNC_PROTOCOL_VERSION,
         code: this.code,
         message: requirement,
@@ -1296,7 +1408,14 @@ export class LanSyncService implements Disposable {
       };
     }
     this.bridge.onState?.();
-    return { ok: true, message: `本机已记录（需求号 ${requirement.id}）。局域网同步未启用，没有广播。`, requirement };
+    if (relayResult.ok) {
+      return { ok: true, message: `已发到中继（需求号 ${requirement.id}）。`, requirement };
+    }
+    return {
+      ok: false,
+      message: `本机已记录（需求号 ${requirement.id}），但**没有同步到任何其它设备**：${relayResult.message}。`,
+      requirement,
+    };
   }
 
   /**
@@ -1310,7 +1429,7 @@ export class LanSyncService implements Disposable {
     if (!note) return { ok: false, message: '消息内容为空。' };
     this.notes = [...this.notes, note].slice(-MAX_NOTES);
     await this.persist();
-    this.relayOut(note);
+    void this.relayOut(note);
     if (this.role === 'off') {
       this.bridge.onState?.();
       return { ok: true, message: '本机已记录。局域网同步未启用，没有发出。' };
@@ -1318,7 +1437,7 @@ export class LanSyncService implements Disposable {
     const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message: note });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
-      const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/plaitcode-sync/v1/deliver', payload)));
+      const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
       const delivered = results.filter((result) => result.status === 'fulfilled').length;
       this.bridge.onState?.();
       return {
@@ -1326,7 +1445,7 @@ export class LanSyncService implements Disposable {
         message: targets.length ? `已发给 ${delivered}/${targets.length} 台设备。` : '已记录，当前没有其它设备加入。',
       };
     }
-    const response = await this.postJson(this.hubAddress, '/plaitcode-sync/v1/message', {
+    const response = await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', {
       protocol: SYNC_PROTOCOL_VERSION,
       code: this.code,
       message: note,
@@ -1363,7 +1482,7 @@ export class LanSyncService implements Disposable {
     this.group = [...this.group, group].slice(-MAX_GROUP_MESSAGES);
     await this.persist();
     await this.refreshTranscript();
-    this.relayOut(group);
+    void this.relayOut(group);
     await this.bridge.onGroupMessage?.(group).catch(() => undefined);
     this.bridge.onState?.();
     if (this.role === 'off') return { ok: true, message: '已记入团队群（未启用局域网同步，没有发给队友）。', group };
@@ -1371,9 +1490,9 @@ export class LanSyncService implements Disposable {
     const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message: group });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
-      await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/plaitcode-sync/v1/deliver', payload)));
+      await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     } else {
-      await this.postJson(this.hubAddress, '/plaitcode-sync/v1/message', { code: this.code, message: group }).catch(() => undefined);
+      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.code, message: group }).catch(() => undefined);
     }
     return { ok: true, message: '已发到团队群。', group };
   }
@@ -1467,14 +1586,14 @@ export class LanSyncService implements Disposable {
     else this.reports = [...this.reports, report].slice(-STATE_LIMIT * 3);
     await this.persist();
     await this.refreshLedger();
-    this.relayOut(report);
+    void this.relayOut(report);
     if (this.role === 'off') return;
     const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.code, message: report });
     if (this.role === 'hub') {
       const targets = this.peerList().filter((entry) => entry.address);
-      await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/plaitcode-sync/v1/deliver', payload)));
+      await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
     } else {
-      await this.postJson(this.hubAddress, '/plaitcode-sync/v1/message', { code: this.code, message: report }).catch(() => undefined);
+      await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.code, message: report }).catch(() => undefined);
     }
     this.bridge.onState?.();
   }
@@ -1520,6 +1639,18 @@ function readBody(request: IncomingMessage): Promise<string | undefined> {
     request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     request.on('error', () => resolve(undefined));
   });
+}
+
+/** 把「只有 IP」的输入补齐成完整地址；看不懂就返回空串。 */
+export function normalizeHubAddress(input: string, port: number): string {
+  const value = input.replace(/\/+$/, '');
+  try {
+    const url = new URL(/^https?:\/\//i.test(value) ? value : `http://${value}`);
+    if (!url.port) url.port = String(port);
+    return url.origin;
+  } catch {
+    return '';
+  }
 }
 
 function postRaw(address: string, path: string, payload: string): Promise<string> {

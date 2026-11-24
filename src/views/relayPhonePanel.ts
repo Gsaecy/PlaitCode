@@ -22,7 +22,7 @@ export class RelayPhonePanel implements vscode.Disposable {
   async open(): Promise<void> {
     const link = this.callbacks.link();
     if (!link) {
-      void vscode.window.showWarningMessage('还没有加入跨网频道。先执行「PlaitCode: 新建跨网频道」或「加入跨网频道」。');
+      void vscode.window.showWarningMessage('还没有加入跨网频道。先执行「HWChat: 新建跨网频道」或「加入跨网频道」。');
       return;
     }
     if (this.panel) {
@@ -31,7 +31,7 @@ export class RelayPhonePanel implements vscode.Disposable {
       return;
     }
     const panel = vscode.window.createWebviewPanel(
-      'plaitcode.relayPhone',
+      'hwchat.relayPhone',
       '手机加入团队群',
       vscode.ViewColumn.Beside,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [this.extensionUri] },

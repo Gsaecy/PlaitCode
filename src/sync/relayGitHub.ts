@@ -63,7 +63,7 @@ export async function exchangeGitHubCode(
   try {
     const response = await fetchImpl(config.tokenUrl ?? DEFAULT_TOKEN, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'application/json', 'user-agent': 'PlaitCode-Relay' },
+      headers: { 'content-type': 'application/json', accept: 'application/json', 'user-agent': 'HWChat-Relay' },
       body: JSON.stringify({
         client_id: config.clientId,
         client_secret: config.clientSecret,
@@ -86,7 +86,7 @@ export async function exchangeGitHubCode(
   const headers = {
     authorization: `Bearer ${token}`,
     accept: 'application/vnd.github+json',
-    'user-agent': 'PlaitCode-Relay',
+    'user-agent': 'HWChat-Relay',
     'x-github-api-version': '2022-11-28',
   };
 

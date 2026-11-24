@@ -57,19 +57,19 @@ test('模型白名单：支持 * 通配，空名单等于不限制', () => {
   assert.equal(modelAllowed({ version: 1 }, 'gpt-4o'), true);
 });
 
-test('策略文件：读工作区 .plaitcode/policy.json；缺失不算错，坏 JSON 要报错', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-policy-'));
+test('策略文件：读工作区 .hwchat/policy.json；缺失不算错，坏 JSON 要报错', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-policy-'));
   try {
     assert.deepEqual(await loadPolicy(dir), {}, '没有文件时什么都不限制');
     assert.deepEqual(await loadPolicy(undefined), {});
 
-    await mkdir(join(dir, '.plaitcode'), { recursive: true });
-    await writeFile(join(dir, '.plaitcode', 'policy.json'), JSON.stringify({ version: 1, permissionPreset: 'review' }), 'utf8');
+    await mkdir(join(dir, '.hwchat'), { recursive: true });
+    await writeFile(join(dir, '.hwchat', 'policy.json'), JSON.stringify({ version: 1, permissionPreset: 'review' }), 'utf8');
     const loaded = await loadPolicy(dir);
     assert.equal(loaded.policy?.permissionPreset, 'review');
     assert.match(loaded.source ?? '', /policy\.json$/);
 
-    await writeFile(join(dir, '.plaitcode', 'policy.json'), '{ oops', 'utf8');
+    await writeFile(join(dir, '.hwchat', 'policy.json'), '{ oops', 'utf8');
     const broken = await loadPolicy(dir);
     assert.equal(broken.policy, undefined);
     assert.match(broken.error ?? '', /合法 JSON/);

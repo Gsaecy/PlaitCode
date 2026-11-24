@@ -30,7 +30,7 @@ async function poll(port: number, since: number): Promise<{ messages: Array<{ id
 }
 
 test('重启后消息还在，seq 继续递增而不是从 1 重来', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-history-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-history-'));
   try {
     const first = await createRelayServer({ port: 0, historyDir: dir });
     try {
@@ -60,7 +60,7 @@ test('重启后消息还在，seq 继续递增而不是从 1 重来', async () =
 });
 
 test('重复投递在重启后依然被识别（历史里的 id 也进 seen）', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-history-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-history-'));
   try {
     const first = await createRelayServer({ port: 0, historyDir: dir });
     try {
@@ -84,7 +84,7 @@ test('重复投递在重启后依然被识别（历史里的 id 也进 seen）',
 });
 
 test('落地文件只含密文与元数据，坏行被跳过', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-history-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-history-'));
   try {
     const file = join(dir, `${CHANNEL}.jsonl`);
     const good = JSON.stringify({ seq: 1, id: 'm1', from: 'dev-a', iv: 'aXY=', ct: 'Y3Q=', at: 1 });
@@ -113,7 +113,7 @@ test('落地文件只含密文与元数据，坏行被跳过', async () => {
 });
 
 test('超出上限只保留最近的消息，seq 仍取最大值', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-history-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-history-'));
   try {
     const history = createChannelHistory(dir, 100);
     for (let seq = 1; seq <= 30; seq += 1) {

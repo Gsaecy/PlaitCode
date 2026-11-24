@@ -31,5 +31,5 @@
     return stripCheckboxMarker(text);
   }
 
-  globalThis.PlaitCodeFollowUpFormat = { stripCheckboxMarker, listItemText };
+  globalThis.HWChatFollowUpFormat = { stripCheckboxMarker, listItemText };
 })();

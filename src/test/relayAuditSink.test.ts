@@ -72,7 +72,7 @@ test('syslog：UDP 上收到 RFC5424 行，正文里带完整 JSON', async () =>
     sink.send('{"event":"denied","detail":"channel denied"}');
     await new Promise((resolve) => setTimeout(resolve, 250));
     assert.equal(messages.length, 1);
-    assert.match(messages[0]!, /^<14>1 - relay-host plaitcode-relay - AUDIT - /);
+    assert.match(messages[0]!, /^<14>1 - relay-host hwchat-relay - AUDIT - /);
     assert.match(messages[0]!, /"event":"denied"/);
     sink.close();
   } finally {

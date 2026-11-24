@@ -130,7 +130,7 @@ export class GroupPanel implements vscode.Disposable {
       return;
     }
     const panel = vscode.window.createWebviewPanel(
-      'plaitcode.teamGroup',
+      'hwchat.teamGroup',
       '团队群',
       vscode.ViewColumn.Beside,
       { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [this.extensionUri] },
@@ -161,7 +161,7 @@ export class GroupPanel implements vscode.Disposable {
         await this.refresh();
       }
       // 工具栏按钮：直接转发给命令，面板不重复实现打开账本 / 状态那套逻辑。
-      if (record.type === 'command' && typeof record.command === 'string' && record.command.startsWith('plaitcode.')) {
+      if (record.type === 'command' && typeof record.command === 'string' && record.command.startsWith('hwchat.')) {
         await vscode.commands.executeCommand(record.command);
         await this.refresh();
       }
@@ -344,9 +344,9 @@ export class GroupPanel implements vscode.Disposable {
   <div class="sub" id="sub">甲方提需求，乙方（频道里各台设备上的 agent）先解析、必要时追问，达成一致后才动手。</div>
   <div class="members" id="members"></div>
   <div class="toolbar">
-    <button data-command="plaitcode.lanSync.openLedger">对齐账本</button>
-    <button data-command="plaitcode.lanSync.status">连接状态</button>
-    <button data-command="plaitcode.lanSync.advanced">高级设置</button>
+    <button data-command="hwchat.lanSync.openLedger">对齐账本</button>
+    <button data-command="hwchat.lanSync.status">连接状态</button>
+    <button data-command="hwchat.lanSync.advanced">高级设置</button>
   </div>
 </header>
 <div class="banner" id="banner"><b>乙方在等你回答</b><span id="bannerText"></span></div>

@@ -16,7 +16,7 @@ async function main(): Promise<void> {
   const port = Number(process.env.PLAITCODE_PORT ?? 8787);
   const host = process.env.PLAITCODE_HOST ?? '127.0.0.1';
   /** 审计日志落盘路径；设为 `-` 表示只走 stdout（交给 journald）。 */
-  const auditPath = process.env.PLAITCODE_AUDIT ?? '/var/lib/plaitcode-relay/audit.jsonl';
+  const auditPath = process.env.PLAITCODE_AUDIT ?? '/var/lib/hwchat-relay/audit.jsonl';
   const auditToStdout = process.env.PLAITCODE_AUDIT_STDOUT !== '0';
   /**
    * 企业身份层：给了库路径就启用（orgs/members/devices），
@@ -31,7 +31,7 @@ async function main(): Promise<void> {
   const historySetting = process.env.PLAITCODE_HISTORY?.trim();
   const historyDir = historySetting === '-'
     ? undefined
-    : (historySetting || (auditPath !== '-' ? join(dirname(auditPath), 'channels') : '/var/lib/plaitcode-relay/channels'));
+    : (historySetting || (auditPath !== '-' ? join(dirname(auditPath), 'channels') : '/var/lib/hwchat-relay/channels'));
 
   const identity = identityPath
     ? { state: (await loadIdentity(identityPath)) ?? emptyIdentity(), path: identityPath }

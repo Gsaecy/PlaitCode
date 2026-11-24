@@ -17,8 +17,11 @@ export interface RelayStatus {
   url: string;
   peers: number;
   lastError?: string;
+  /** 服务器确认收到的条数。这是唯一的「已送达」凭据。 */
   received: number;
   sent: number;
+  /** 发不出去的条数（连不上 / 被拒 / 超时）。 */
+  failed: number;
 }
 
 export interface RelayClientOptions {
@@ -188,6 +191,7 @@ export class RelayClient implements Disposable {
   private backoff = 0;
   private received = 0;
   private sent = 0;
+  private failed = 0;
   private peers = 0;
   /** 中继上最近一次 presence 返回的在线设备（团队群「由谁执行」用）。 */
   private lastDevices: Array<{ id: string; name: string; platform: string; project: string }> = [];
@@ -218,6 +222,7 @@ export class RelayClient implements Disposable {
       peers: this.peers,
       received: this.received,
       sent: this.sent,
+      failed: this.failed,
       ...(this.lastError ? { lastError: this.lastError } : {}),
     };
   }
@@ -264,13 +269,19 @@ export class RelayClient implements Disposable {
       }, this.authHeaders());
       if (response.status !== 200 || response.body?.ok !== true) {
         const reason = typeof response.body?.error === 'string' ? response.body.error : `HTTP ${response.status}`;
+        this.failed += 1;
+        this.lastError = `中转拒绝：${reason}`;
+        this.emit();
         return { ok: false, message: `中转拒绝：${reason}` };
       }
       this.sent += 1;
+      // 成功就把上一次的错误清掉：否则一次失败会让状态栏永远显示「断开」。
+      this.lastError = undefined;
       this.emit();
       return { ok: true, message: '已发到中转' };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      this.failed += 1;
       this.lastError = message;
       this.emit();
       return { ok: false, message: `发不出去：${message}` };
@@ -346,7 +357,7 @@ export class RelayClient implements Disposable {
         this.abortPoll = undefined;
         if (!this.running) break;
         if (response.status === 403) {
-          this.fail(new Error('中转拒绝了本机：身份模式下要先用「PlaitCode: 登记本机设备令牌」'));
+          this.fail(new Error('中转拒绝了本机：身份模式下要先用「HWChat: 登记本机设备令牌」'));
           await sleep(MAX_BACKOFF_MS);
           continue;
         }

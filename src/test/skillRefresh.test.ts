@@ -41,7 +41,7 @@ async function writeSkill(relativeDir: string, name: string, body: string): Prom
 }
 
 before(async () => {
-  root = await mkdtemp(join(tmpdir(), 'plaitcode-skills-'));
+  root = await mkdtemp(join(tmpdir(), 'hwchat-skills-'));
   await writeSkill('.agents/skills/alpha', 'Alpha Skill', 'alpha body');
   setWorkspaceRoots([root]);
   invalidateWorkspaceSearch();

@@ -20,8 +20,8 @@ import {
 
 /** X25519 公钥的 SPKI 头：raw 32 字节前面拼上它就能给 Node 当 DER 用。 */
 const SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
-const HKDF_INFO = Buffer.from('plaitcode-handoff-v1', 'utf8');
-const AAD = Buffer.from('plaitcode-handoff-v1', 'utf8');
+const HKDF_INFO = Buffer.from('hwchat-handoff-v1', 'utf8');
+const AAD = Buffer.from('hwchat-handoff-v1', 'utf8');
 
 export interface HandoffKeyPair {
   /** base64(raw 32 字节)。 */

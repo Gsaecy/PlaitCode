@@ -1,4 +1,4 @@
-﻿import assert from 'node:assert/strict';
+import assert from 'node:assert/strict';
 import test from 'node:test';
 import { signSession, readState } from '../sync/relayAuth';
 import { addDevice, addMember, addOrg, emptyIdentity } from '../sync/relayIdentity';
@@ -23,14 +23,14 @@ const SESSION_SECRET = 'session-secret-for-tests';
 
 function cookieFor(memberId: string, name: string): string {
   const value = signSession(SESSION_SECRET, { memberId, name, exp: Date.now() + 60 * 60_000 });
-  return `plaitcode_session=${value}`;
+  return `hwchat_session=${value}`;
 }
 
 test('首页（冰山）：只露一句价值 + 装扩展/手机端，GitHub 账号有注册引导', () => {
   const html = renderLandingPage({
     relayHost: 'relay.example.com',
     consoleEnabled: true,
-    installUrl: 'https://marketplace.visualstudio.com/items?itemName=plaitcode.plaitcode',
+    installUrl: 'https://marketplace.visualstudio.com/items?itemName=honor-world.hwchat',
     repoUrl: 'https://github.com/Gsaecy/PlaitCode',
   });
   // 水面之上：装扩展 + 手机端，两个按钮就够
@@ -46,7 +46,7 @@ test('首页（冰山）：只露一句价值 + 装扩展/手机端，GitHub 账
   assert.match(html, /id="deeper"/);
   assert.match(html, /docs\/COLLAB-SETUP\.md/);
   // 像标准开源项目一样给出命令行安装与离线下载
-  assert.match(html, /code --install-extension plaitcode\.plaitcode/);
+  assert.match(html, /code --install-extension honor-world\.hwchat/);
   assert.match(html, /id="copyInstall"/);
   assert.match(html, /releases\/latest/);
 
@@ -86,17 +86,17 @@ test('网站路由：/ 返回首页 HTML，/health 仍是 JSON', async () => {
     const home = await fetch(`${base}/`);
     assert.equal(home.status, 200);
     assert.match(home.headers.get('content-type') ?? '', /text\/html/);
-    assert.match(await home.text(), /PlaitCode/);
+    assert.match(await home.text(), /HWChat/);
 
     const health = await fetch(`${base}/health`);
     assert.equal(health.status, 200);
     assert.match(health.headers.get('content-type') ?? '', /application\/json/);
     const payload = (await health.json()) as Record<string, unknown>;
-    assert.equal(payload.service, 'plaitcode-relay');
+    assert.equal(payload.service, 'hwchat-relay');
 
     const consolePage = await fetch(`${base}/console`);
     assert.equal(consolePage.status, 200);
-    assert.match(await consolePage.text(), /PlaitCode 控制台/);
+    assert.match(await consolePage.text(), /HWChat 控制台/);
   } finally {
     await relay.close();
   }

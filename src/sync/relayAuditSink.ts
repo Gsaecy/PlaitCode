@@ -85,12 +85,12 @@ export function toOtlpPayload(line: string, hostname: string): string {
     resourceLogs: [{
       resource: {
         attributes: [
-          { key: 'service.name', value: { stringValue: 'plaitcode-relay' } },
+          { key: 'service.name', value: { stringValue: 'hwchat-relay' } },
           { key: 'host.name', value: { stringValue: hostname } },
         ],
       },
       scopeLogs: [{
-        scope: { name: 'plaitcode.audit' },
+        scope: { name: 'hwchat.audit' },
         logRecords: [{ timeUnixNano: nanos, severityText: 'INFO', body: { stringValue: line } }],
       }],
     }],
@@ -98,7 +98,7 @@ export function toOtlpPayload(line: string, hostname: string): string {
 }
 
 export function createSink(spec: SinkSpec, options: { hostname?: string } = {}): Sink {
-  const hostname = options.hostname ?? 'plaitcode-relay';
+  const hostname = options.hostname ?? 'hwchat-relay';
   if (spec.kind === 'webhook') {
     return { send: (line) => post(spec.url, line, 5_000), close: () => undefined };
   }
@@ -113,7 +113,7 @@ export function createSink(spec: SinkSpec, options: { hostname?: string } = {}):
     socket.unref?.();
     return {
       send: (line) => {
-        const message = `<14>1 - ${hostname} plaitcode-relay - AUDIT - ${line}`;
+        const message = `<14>1 - ${hostname} hwchat-relay - AUDIT - ${line}`;
         try {
           socket.send(Buffer.from(message, 'utf8'), port, host, () => undefined);
         } catch {
@@ -138,7 +138,7 @@ export function createSink(spec: SinkSpec, options: { hostname?: string } = {}):
       const socket = ensure();
       if (!socket) return;
       try {
-        socket.write(`<14>1 - ${hostname} plaitcode-relay - AUDIT - ${line}\n`);
+        socket.write(`<14>1 - ${hostname} hwchat-relay - AUDIT - ${line}\n`);
       } catch {
         connection = undefined;
       }

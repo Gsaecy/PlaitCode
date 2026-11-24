@@ -83,7 +83,7 @@ export function localPeer(input: {
 }
 
 function setting<T>(key: string, fallback: T): T {
-  return vscode.workspace.getConfiguration('plaitcode').get<T>(key, fallback);
+  return vscode.workspace.getConfiguration('hwchat').get<T>(key, fallback);
 }
 
 /** 当前工作区目录（多根工作区取第一个，和「项目根」的口径一致）。 */
@@ -98,12 +98,12 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   let relay: RelayClient | undefined;
   /** 频道密钥：SecretStorage 是异步的，这里缓存一份，供同步拼手机链接用。 */
   let relayKey = '';
-  const relaySecretKey = 'plaitcode.relay.secret';
+  const relaySecretKey = 'hwchat.relay.secret';
   /** 企业身份模式下的设备令牌（SecretStorage，不进 settings.json）。 */
   let relayDeviceToken = '';
-  const relayDeviceTokenKey = 'plaitcode.relay.deviceToken';
+  const relayDeviceTokenKey = 'hwchat.relay.deviceToken';
   /** 频道密钥交接用的本机密钥对（私钥只在 SecretStorage 里）。 */
-  const relayHandoffKeyKey = 'plaitcode.relay.handoffKey';
+  const relayHandoffKeyKey = 'hwchat.relay.handoffKey';
   let handoffKeys: HandoffKeyPair | undefined;
 
   const bridge: LanSyncBridge = {
@@ -164,7 +164,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         void vscode.window
           .showInformationMessage(`乙方在等你确认需求：${message.body.slice(0, 120)}`, '打开团队群')
           .then(async (choice) => {
-            if (choice) await vscode.commands.executeCommand('plaitcode.lanSync.openGroup');
+            if (choice) await vscode.commands.executeCommand('hwchat.lanSync.openGroup');
           });
       }
     },
@@ -196,11 +196,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      *
      * 只在「本机产生」时触发；收到对端的消息走 `ingestRelayMessage`，不会回环。
      */
-    onOutgoing: (message) => {
-      if (!relay) return;
-      void relay.send(message).then((result) => {
-        if (!result.ok) output.warn(`[relay] ${result.message}`);
-      });
+    onOutgoing: async (message) => {
       /*
        * 需要批准时推一条飞书：人可能已经离开电脑，只有推送能把他叫回来。
        * 只发标题与摘要（元数据），不发命令全文。
@@ -218,6 +214,16 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
           });
         }
       }
+      /*
+       * 没连中继时**必须如实返回失败**。
+       *
+       * 以前这里是 `if (!relay) return;`：消息静默消失，调用方拿不到任何信号，
+       * agent 于是照着「本机已记录」回一句「已同步」—— 用户就再也没法判断谁说的是真的。
+       */
+      if (!relay) return { ok: false, message: '没连中继（跨网同步不可用）' };
+      const result = await relay.send(message);
+      if (!result.ok) output.warn(`[relay] ${result.message}`);
+      return result;
     },
     /**
      * 手机发来的远程控制：改权限档位 / 改步数 / 中止当前任务。
@@ -319,7 +325,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     rotate: () => service.rotateMobileCode(),
     getApprove: () => setting('mobile.allowApproval', false),
     setApprove: async (value) => {
-      await vscode.workspace.getConfiguration('plaitcode').update('mobile.allowApproval', value, vscode.ConfigurationTarget.Global);
+      await vscode.workspace.getConfiguration('hwchat').update('mobile.allowApproval', value, vscode.ConfigurationTarget.Global);
       output.info(`[mobile] 手机批准工具授权：${value ? '已允许' : '已禁止'}`);
     },
   });
@@ -335,7 +341,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    *
    * 普通用户不该知道也不需要填服务器地址 —— 他要的只是"能用"。
    * 自托管的人把它改成自己的域名就行；想彻底关掉托管（企业内网）可以把设置里的
-   * `plaitcode.relay.url` 显式填成自己的地址，这里只作为缺省值。
+   * `hwchat.relay.url` 显式填成自己的地址，这里只作为缺省值。
    */
   const DEFAULT_RELAY_URL = 'https://plaitcode.com';
   const relayUrl = (): string => (setting('relay.url', '') || DEFAULT_RELAY_URL).trim();
@@ -345,7 +351,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    */
   const saveRelayUrl = async (url: string): Promise<boolean> => {
     try {
-      await vscode.workspace.getConfiguration('plaitcode').update('relay.url', url, vscode.ConfigurationTarget.Global);
+      await vscode.workspace.getConfiguration('hwchat').update('relay.url', url, vscode.ConfigurationTarget.Global);
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -422,39 +428,114 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    * 状态栏**始终可见** —— 这就是「傻瓜式」的入口。
    * 没连接时写着「连接另一台设备」，点一下开始找；连上后显示设备数与待对齐项。
    */
-  const status = vscode.window.createStatusBarItem('plaitcode.lanSync', vscode.StatusBarAlignment.Right, 90);
+  const status = vscode.window.createStatusBarItem('hwchat.lanSync', vscode.StatusBarAlignment.Right, 90);
   const refreshStatus = (): void => {
-    // 中继优先显示：它覆盖"任何网络"，局域网只是同一 WiFi 下的更短路径。
     const relayState = relay?.status();
-    if (relayState) {
-      status.text = `$(globe) ${relayState.connected ? '中继已连接' : '中继重连中'} · ${relayState.peers + 1}台`;
-      status.tooltip = `${relayState.url}\n频道 ${relayState.channel.slice(0, 8)}…\n收到 ${relayState.received} 条 / 发出 ${relayState.sent} 条${relayState.lastError ? `\n${relayState.lastError}` : ''}\n点击查看详情。`;
-      status.command = 'plaitcode.relay.status';
+    const state = service.state();
+    /*
+     * 局域网连上就以它为主 —— 那是此刻唯一确定能送达的通道。
+     * 中继状态放进 tooltip，不抢位置。
+     */
+    if (state.role !== 'off') {
+      status.text = `$(broadcast) ${state.peers}台 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
+      const relayLine = relayState
+        ? `\n\n中继：${relayState.connected ? '已连接' : `连不上${relayState.lastError ? `（${relayState.lastError}）` : ''}`}`
+        : '';
+      status.tooltip = `${state.text}\n点击查看详情 / 打开对齐账本。${relayLine}`;
+      status.command = 'hwchat.lanSync.status';
       status.show();
       return;
     }
-    const state = service.state();
+    if (relayState) {
+      /*
+       * 连不上就直说「连不上」。
+       *
+       * 以前这里写「中继重连中」，看起来像正在恢复，实际可能是一台已经不存在的服务器 ——
+       * 用户会以为发出去的消息对方迟早能收到，然后两边各说各的。
+       */
+      status.text = relayState.connected
+        ? `$(globe) 中继已连接 · ${relayState.peers + 1}台`
+        : '$(warning) 中继连不上';
+      status.tooltip = [
+        relayState.url,
+        `频道 ${relayState.channel.slice(0, 8)}…`,
+        `服务器确认送达 ${relayState.sent} 条，发不出去 ${relayState.failed} 条，收到 ${relayState.received} 条`,
+        ...(relayState.lastError ? [relayState.lastError] : []),
+        '',
+        relayState.connected ? '点击查看详情。' : '跨网同步现在不可用。两台在同一 WiFi 时，各点一次「连接另一台设备」就能连上。',
+      ].join('\n');
+      status.command = relayState.connected ? 'hwchat.relay.status' : 'hwchat.sync.check';
+      status.show();
+      return;
+    }
     if (state.role === 'off') {
       // 单机 + 手机遥控：状态栏直接说清楚「手机那端能连」，不然用户会以为没生效。
       if (service.mobileAllowed()) {
         status.text = '$(device-mobile) 手机遥控已开';
         status.tooltip = `手机打开 ${service.mobileUrl()}（或用二维码）。点这里看二维码 / 换验证码。`;
-        status.command = 'plaitcode.mobile.open';
+        status.command = 'hwchat.mobile.open';
         status.show();
         return;
       }
       status.text = '$(broadcast) 连接另一台设备';
       status.tooltip = '同一 WiFi 下，两台设备各点一次就能连上。要不要跨网走中继？命令面板执行「开始协作」。';
-      status.command = 'plaitcode.lanSync.connect';
+      status.command = 'hwchat.lanSync.connect';
       status.show();
-      return;
     }
-    status.text = `$(broadcast) ${state.peers}台 · ${state.divergences ? `${state.divergences}处待对齐` : '已对齐'}`;
-    status.tooltip = `${state.text}\n点击查看详情 / 打开对齐账本。`;
-    status.command = 'plaitcode.lanSync.status';
-    status.show();
   };
   bridge.onState = refreshStatus;
+
+  /**
+   * 「同步核对」：把这一台设备看到的真相列成一屏。
+   *
+   * 用户遇到的困境不是同步坏了，而是**没法判断哪一边说的是真的**：
+   * 一边说已同步、一边说没收到。所以这里只列可核对的事实 —— 连上了谁、
+   * 几条被服务器确认、几条发不出去、最后一条错误是什么。
+   */
+  const syncCheckReport = (): string[] => {
+    const now = new Date();
+    const pad = (value: number): string => String(value).padStart(2, '0');
+    const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    const state = service.state();
+    const ports = service.ports();
+    const peers = service.remotePeers();
+    const relayState = relay?.status();
+    const lines: string[] = [
+      '===== HWChat 同步核对 =====',
+      `时间：${stamp}`,
+      `本机：${deviceName || bridge.peer().name} · ${lanAddresses().join(' / ') || '（未发现局域网地址）'}`,
+      '',
+      '[局域网]',
+    ];
+    if (state.role === 'off') lines.push('状态：未启用（还没有和另一台设备连过）');
+    else if (state.role === 'hub') lines.push('状态：主机，正在等另一台加入');
+    else lines.push(`状态：已加入 ${state.address || '（未知主机）'}`);
+    lines.push(`监听端口：${ports.listen}（发现端口 ${ports.discovery}）`);
+    lines.push(`对端设备：${peers.length} 台`);
+    for (const item of peers) lines.push(`  - ${item.name} · ${item.platform}${item.address ? ` · ${item.address}` : ''}`);
+    lines.push('', '[中继]（跨网才需要）');
+    if (!relayState) {
+      lines.push('状态：没有连接');
+    } else {
+      lines.push(`地址：${relayState.url}`);
+      lines.push(`状态：${relayState.connected ? '已连接' : '连不上'}`);
+      lines.push(`服务器确认送达：${relayState.sent} 条`);
+      lines.push(`发不出去：${relayState.failed} 条`);
+      lines.push(`收到：${relayState.received} 条 · 在线设备 ${relayState.peers} 台`);
+      if (relayState.lastError) lines.push(`最后错误：${relayState.lastError}`);
+    }
+    lines.push('', '[判定]');
+    const lanUsable = state.role !== 'off' && peers.length > 0;
+    const relayUsable = relayState?.connected === true;
+    lines.push(lanUsable ? '- 局域网：可用，另一台能收到' : '- 局域网：不可用（还没连上另一台）');
+    lines.push(relayUsable ? '- 跨网：可用' : '- 跨网：不可用，消息只留在本机，对方收不到');
+    if (!lanUsable && !relayUsable) {
+      lines.push('- 结论：现在发出去的内容**没有任何设备会收到**。');
+      lines.push('  两台在同一 WiFi 时，各点一次状态栏的「连接另一台设备」即可。');
+    }
+    lines.push('===========================');
+    return lines;
+  };
 
   const announce = async (role: 'hub' | 'peer' | 'off', message: string): Promise<void> => {
     refreshStatus();
@@ -472,7 +553,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     status,
     service,
     { dispose: () => { if (handoffTimer) clearInterval(handoffTimer); } },
-    vscode.commands.registerCommand('plaitcode.lanSync.connect', async () => {
+    vscode.commands.registerCommand('hwchat.lanSync.connect', async () => {
       const result = await service.autoConnect(setting('lanSync.port', 47821));
       if (result.role === 'hub') {
         await announce('hub', `已让这台电脑等待连接（地址：${lanAddresses().join(' / ') || '未发现局域网地址'}）。`);
@@ -480,12 +561,12 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         await announce(result.role, result.message);
       }
     }),
-    vscode.commands.registerCommand('plaitcode.lanSync.disconnect', async () => {
+    vscode.commands.registerCommand('hwchat.lanSync.disconnect', async () => {
       service.stop();
       refreshStatus();
       void vscode.window.showInformationMessage('已断开。随时可以再点状态栏的「连接另一台设备」。');
     }),
-    vscode.commands.registerCommand('plaitcode.lanSync.status', async () => {
+    vscode.commands.registerCommand('hwchat.lanSync.status', async () => {
       const state = service.state();
       const requirements = service.requirementTitles(6);
       const notes = service.recentNotes(6);
@@ -498,10 +579,21 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         notes.length ? `最近队友消息：\n${notes.map((note) => `${note.from.name}：${note.body.slice(0, 120)}`).join('\n')}` : '最近队友消息：（无）',
       ]) output.info(line);
       const choice = await vscode.window.showInformationMessage(state.text, '打开对齐账本', '断开连接');
-      if (choice === '打开对齐账本') await vscode.commands.executeCommand('plaitcode.lanSync.openLedger');
-      if (choice === '断开连接') await vscode.commands.executeCommand('plaitcode.lanSync.disconnect');
+      if (choice === '打开对齐账本') await vscode.commands.executeCommand('hwchat.lanSync.openLedger');
+      if (choice === '断开连接') await vscode.commands.executeCommand('hwchat.lanSync.disconnect');
     }),
-    vscode.commands.registerCommand('plaitcode.lanSync.openGroup', async () => {
+    vscode.commands.registerCommand('hwchat.sync.check', async () => {
+      const lines = syncCheckReport();
+      for (const line of lines) output.info(line);
+      output.show(true);
+      try {
+        await vscode.env.clipboard.writeText(lines.join('\n'));
+        void vscode.window.showInformationMessage('同步核对已复制到剪贴板：把那一段贴给另一台设备，就能对着看谁说的对。');
+      } catch {
+        void vscode.window.showInformationMessage('同步核对已输出到 HWChat 日志面板。');
+      }
+    }),
+    vscode.commands.registerCommand('hwchat.lanSync.openGroup', async () => {
       await groupPanel.open();
     }),
     /*
@@ -510,21 +602,21 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 打开时**顺手把监听起起来** —— 单机（没连第二台电脑）也要能用手机指挥，
      * 所以不能依赖 `lanSync.enabled`。
      */
-    vscode.commands.registerCommand('plaitcode.mobile.open', async () => {
+    vscode.commands.registerCommand('hwchat.mobile.open', async () => {
       if (!service.mobileAllowed()) {
         const started = await service.setMobileControl(true, setting('lanSync.port', 47821));
         if (!started.ok) {
           void vscode.window.showWarningMessage(started.message);
           return;
         }
-        await vscode.workspace.getConfiguration('plaitcode').update('mobile.enabled', true, vscode.ConfigurationTarget.Global);
+        await vscode.workspace.getConfiguration('hwchat').update('mobile.enabled', true, vscode.ConfigurationTarget.Global);
       }
       await mobilePanel.open();
     }),
-    vscode.commands.registerCommand('plaitcode.mobile.toggle', async () => {
+    vscode.commands.registerCommand('hwchat.mobile.toggle', async () => {
       const next = !service.mobileAllowed();
       const result = await service.setMobileControl(next, setting('lanSync.port', 47821));
-      await vscode.workspace.getConfiguration('plaitcode').update('mobile.enabled', next, vscode.ConfigurationTarget.Global);
+      await vscode.workspace.getConfiguration('hwchat').update('mobile.enabled', next, vscode.ConfigurationTarget.Global);
       refreshStatus();
       if (!result.ok) {
         void vscode.window.showWarningMessage(result.message);
@@ -536,13 +628,13 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     /*
      * 跨网中继：新建 / 加入 / 分享配对 / 状态 / 退出。
      *
-     * 配对信息只有一行 `plaitcode://join?u=…&s=…`：里面同时含中继地址和频道密钥，
+     * 配对信息只有一行 `hwchat://join?u=…&s=…`：里面同时含中继地址和频道密钥，
      * 所以它等于"进入这个频道的钥匙"——别发到公开的群里。
      */
-    vscode.commands.registerCommand('plaitcode.relay.create', async () => {
+    vscode.commands.registerCommand('hwchat.relay.create', async () => {
       const url = (await vscode.window.showInputBox({
         title: '新建跨网频道 · 中继地址',
-        prompt: '你服务器的地址，例如 https://plaitcode.example.com（不带路径）',
+        prompt: '你服务器的地址，例如 https://hwchat.example.com（不带路径）',
         value: relayUrl(),
         ignoreFocusOut: true,
         validateInput: (value) => (/^https?:\/\/[^\s]+$/.test(value.trim()) ? undefined : '要写成 https://域名 的形式'),
@@ -557,7 +649,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       await vscode.env.clipboard.writeText(buildPairingText(url, secret));
       const channel = deriveKeys(secret).channel;
       void vscode.window.showInformationMessage(
-        `频道已创建：${channel}\n（授权设备时用这个频道 ID）\n配对信息已复制到剪贴板，另一台设备用「PlaitCode: 加入跨网频道」粘贴它。`,
+        `频道已创建：${channel}\n（授权设备时用这个频道 ID）\n配对信息已复制到剪贴板，另一台设备用「HWChat: 加入跨网频道」粘贴它。`,
         '知道了',
       );
     }),
@@ -565,7 +657,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 给另一台设备发配对信息：一次粘贴就能同时拿到频道密钥和设备令牌，
      * 不用再去服务器手工发令牌。这是"我自己的第二台电脑"最常见的操作。
      */
-    vscode.commands.registerCommand('plaitcode.relay.invite', async () => {
+    vscode.commands.registerCommand('hwchat.relay.invite', async () => {
       const url = relayUrl();
       const secret = await context.secrets.get(relaySecretKey);
       if (!url || !secret) {
@@ -594,7 +686,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       await vscode.env.clipboard.writeText(text);
       void vscode.window.showInformationMessage(
         `已为「${name.trim()}」签发令牌，配对信息已复制。\n`
-        + '在那台电脑上装好 PlaitCode，执行「PlaitCode: 加入跨网频道」粘贴这一行即可，不需要再发令牌。',
+        + '在那台电脑上装好 HWChat，执行「HWChat: 加入跨网频道」粘贴这一行即可，不需要再发令牌。',
         '知道了',
       );
     }),
@@ -605,7 +697,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 密钥不变就还是同一个频道；把服务器的 channels 目录一起搬过去，
      * 历史消息也就接上了。
      */
-    vscode.commands.registerCommand('plaitcode.relay.move', async () => {
+    vscode.commands.registerCommand('hwchat.relay.move', async () => {
       const secret = await context.secrets.get(relaySecretKey);
       if (!secret) {
         void vscode.window.showWarningMessage('还没有加入频道。先「新建跨网频道」或「加入跨网频道」。');
@@ -633,16 +725,16 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         '知道了',
       );
     }),
-    vscode.commands.registerCommand('plaitcode.relay.join', async () => {
+    vscode.commands.registerCommand('hwchat.relay.join', async () => {
       const text = await vscode.window.showInputBox({
         title: '加入跨网频道',
-        placeHolder: 'plaitcode://join?u=https://…&s=…',
+        placeHolder: 'hwchat://join?u=https://…&s=…',
         ignoreFocusOut: true,
       });
       if (!text) return;
       const parsed = parsePairingText(text);
       if (!parsed) {
-        void vscode.window.showWarningMessage('这段配对信息看不懂：应以 plaitcode://join 开头，并包含 u= 与 s=。');
+        void vscode.window.showWarningMessage('这段配对信息看不懂：应以 hwchat://join 开头，并包含 u= 与 s=。');
         return;
       }
       await saveRelayUrl(parsed.url);
@@ -659,7 +751,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         + `${parsed.deviceToken ? '，并已登记本机设备令牌' : ''}。这台设备产生的需求会加密同步给频道内的其它设备。`,
       );
     }),
-    vscode.commands.registerCommand('plaitcode.relay.share', async () => {
+    vscode.commands.registerCommand('hwchat.relay.share', async () => {
       const secret = await context.secrets.get(relaySecretKey);
       const url = relayUrl();
       if (!secret || !url) {
@@ -674,7 +766,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      *
      * 没有登录态时控制台会自己跳到飞书登录再回来，所以这里只负责"把浏览器打开到正确地址"。
      */
-    vscode.commands.registerCommand('plaitcode.relay.console', async () => {
+    vscode.commands.registerCommand('hwchat.relay.console', async () => {
       const url = relayUrl();
       if (!url) {
         void vscode.window.showWarningMessage('还没有设置中继地址。先「新建跨网频道」或「加入跨网频道」。');
@@ -683,7 +775,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       const target = `${url.replace(/\/+$/, '')}/console`;
       await vscode.env.openExternal(vscode.Uri.parse(target));
     }),
-    vscode.commands.registerCommand('plaitcode.relay.status', async () => {
+    vscode.commands.registerCommand('hwchat.relay.status', async () => {
       const state = relay?.status();
       if (!state) {
         // 没有活动连接时，只要存过密钥就还能报出频道 ID —— 授权设备正需要它
@@ -692,7 +784,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         void vscode.window.showInformationMessage(
           channel
             ? `中继未连接。频道 ${channel}（授权设备时用这个 ID）\n地址：${relayUrl() || '（没保存）'}\n用「新建 / 加入跨网频道」重新连接。`
-            : '还没有连接中继。用「PlaitCode: 新建跨网频道」开始。',
+            : '还没有连接中继。用「HWChat: 新建跨网频道」开始。',
         );
         return;
       }
@@ -706,7 +798,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 登记设备令牌：开了身份模式的中转只认设备令牌（手机走登录 Cookie）。
      * 令牌由管理员在服务器上生成、只显示一次，这里存进 SecretStorage。
      */
-    vscode.commands.registerCommand('plaitcode.relay.device', async () => {
+    vscode.commands.registerCommand('hwchat.relay.device', async () => {
       const secret = await context.secrets.get(relaySecretKey);
       const channel = secret ? deriveKeys(secret).channel : '';
       const token = await vscode.window.showInputBox({
@@ -726,7 +818,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       refreshStatus();
       void vscode.window.showInformationMessage(trimmed ? '设备令牌已保存，正用新令牌重连中继。' : '已清除设备令牌，改回频道密钥鉴权。');
     }),
-    vscode.commands.registerCommand('plaitcode.relay.leave', async () => {
+    vscode.commands.registerCommand('hwchat.relay.leave', async () => {
       relay?.stop();
       relay = undefined;
       relayKey = '';
@@ -735,7 +827,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       void vscode.window.showInformationMessage('已退出跨网频道。');
     }),
     /** 手机加入：显示二维码（密钥在 fragment 里，扫码即进）。 */
-    vscode.commands.registerCommand('plaitcode.relay.phone', async () => {
+    vscode.commands.registerCommand('hwchat.relay.phone', async () => {
       await relayPhonePanel.open();
     }),
     /**
@@ -744,9 +836,9 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 用户视角只有三步：点命令 → 浏览器登录 → 授权。
      * 不问服务器地址（有缺省值）、不要配对码、不要二维码密钥串。
      */
-    vscode.commands.registerCommand('plaitcode.collab.start', async () => {
+    vscode.commands.registerCommand('hwchat.collab.start', async () => {
       const url = relayUrl();
-      const firstTime = !context.globalState.get<boolean>('plaitcode.collab.powerHintShown');
+      const firstTime = !context.globalState.get<boolean>('hwchat.collab.powerHintShown');
       const storedSecret = (await context.secrets.get(relaySecretKey)) ?? '';
       const storedToken = relayDeviceToken || (await context.secrets.get(relayDeviceTokenKey)) || '';
 
@@ -756,23 +848,23 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
        * 不假设人人都有：没有的人要能立刻知道去哪注册（免费、不用付费版），
        * 有的人一键跳过。提示只出现一次，不反复打扰。
        */
-      if (!storedToken && !context.globalState.get<boolean>('plaitcode.collab.accountHintShown')) {
+      if (!storedToken && !context.globalState.get<boolean>('hwchat.collab.accountHintShown')) {
         const choice = await vscode.window.showInformationMessage(
           '协作要用 GitHub 账号确认「这是你本人」，免费账号就行（不需要付费版）。',
           '继续登录',
           '去注册 GitHub',
         );
-        await context.globalState.update('plaitcode.collab.accountHintShown', true);
+        await context.globalState.update('hwchat.collab.accountHintShown', true);
         if (choice === '去注册 GitHub') {
           await vscode.env.openExternal(vscode.Uri.parse('https://github.com/signup'));
-          void vscode.window.showInformationMessage('注册好之后，再执行一次「PlaitCode: 开始协作」就行。');
+          void vscode.window.showInformationMessage('注册好之后，再执行一次「HWChat: 开始协作」就行。');
           return;
         }
         if (choice !== '继续登录') return;
       }
 
       const result = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'PlaitCode 开始协作', cancellable: false },
+        { location: vscode.ProgressLocation.Notification, title: 'HWChat 开始协作', cancellable: false },
         async (progress) => quickStart({
           relayUrl: url,
           deviceName: bridge.peer().name,
@@ -801,7 +893,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
             '重新等待',
             '取消',
           );
-          if (choice === '重新等待') await vscode.commands.executeCommand('plaitcode.collab.start');
+          if (choice === '重新等待') await vscode.commands.executeCommand('hwchat.collab.start');
           return;
         }
         void vscode.window.showErrorMessage(result.error ?? '没能开始协作。');
@@ -827,7 +919,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
        * 但系统设置各版本不一样，直接替用户改太危险，给一条能复制的命令最稳。
        */
       if (firstTime) {
-        await context.globalState.update('plaitcode.collab.powerHintShown', true);
+        await context.globalState.update('hwchat.collab.powerHintShown', true);
         const pick = await vscode.window.showInformationMessage(
           '还有一件事：这台电脑要一直开着才能接需求（显示器可以关，系统不能睡）。需要关闭睡眠吗？',
           '复制卸载休眠的命令',
@@ -848,7 +940,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     { dispose: () => relay?.stop() },
     groupPanel,
     mobilePanel,
-    vscode.commands.registerCommand('plaitcode.lanSync.openLedger', async () => {
+    vscode.commands.registerCommand('hwchat.lanSync.openLedger', async () => {
       const root = workspaceRoot();
       if (!root) {
         void vscode.window.showWarningMessage('当前没有打开工作区，无法定位对齐账本。');
@@ -865,7 +957,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       await vscode.window.showTextDocument(target, { preview: true });
     }),
     // 高级：手动地址 / 固定配对码 / 固定主机。正常流程用不到，保留给跨网段或固定码场景。
-    vscode.commands.registerCommand('plaitcode.lanSync.advanced', async () => {
+    vscode.commands.registerCommand('hwchat.lanSync.advanced', async () => {
       const choice = await vscode.window.showQuickPick([
         { label: '手动填写对方 IP', description: '自动找不到时用（同一 WiFi 通常不需要）', target: 'address' },
         { label: '设置固定配对码', description: '多台设备共用同一个配对码时用', target: 'code' },
@@ -890,11 +982,11 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       await announce(started.ok ? 'hub' : 'off', started.message);
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration('plaitcode.lanSync')) {
+      if (event.affectsConfiguration('hwchat.lanSync')) {
         deviceName = setting('lanSync.deviceName', '');
       }
       // 只认「开关本身」的变化：改「允许手机批准」不该把验证码和会话重置一遍。
-      if (event.affectsConfiguration('plaitcode.mobile.enabled')) {
+      if (event.affectsConfiguration('hwchat.mobile.enabled')) {
         void service.setMobileControl(setting('mobile.enabled', false), setting('lanSync.port', 47821)).then((result) => {
           refreshStatus();
           if (!result.ok) output.warn(`[mobile] ${result.message}`);
@@ -911,17 +1003,17 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    * 与其写一堆说明，不如在升级后第一次打开时直接给一个带按钮的提示，
    * 用户点一次就懂了；之后再也不会打扰。
    */
-  const hintedKey = 'plaitcode.lanSync.hinted.v1';
+  const hintedKey = 'hwchat.lanSync.hinted.v1';
   if (!context.globalState.get<boolean>(hintedKey) && !setting('lanSync.enabled', false)) {
     void context.globalState.update(hintedKey, true);
     void vscode.window
       .showInformationMessage(
-        'PlaitCode 新功能：同一 WiFi 下的多台设备可以一起开发同一个项目（各管一个平台也行）。要现在连一台试试吗？',
+        'HWChat 新功能：同一 WiFi 下的多台设备可以一起开发同一个项目（各管一个平台也行）。要现在连一台试试吗？',
         '连接另一台设备',
         '以后再说',
       )
       .then(async (choice) => {
-        if (choice === '连接另一台设备') await vscode.commands.executeCommand('plaitcode.lanSync.connect');
+        if (choice === '连接另一台设备') await vscode.commands.executeCommand('hwchat.lanSync.connect');
       });
   }
   /*

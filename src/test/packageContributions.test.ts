@@ -3,7 +3,7 @@
  *
  * 漏声明的后果不是"读不到默认值"，而是**命令直接抛错**：
  * `settings.update()` 遇到未注册的 key 会报
- * `没有注册配置 plaitcode.xxx，因此无法写入 用户设置`。
+ * `没有注册配置 hwchat.xxx，因此无法写入 用户设置`。
  * 「新建跨网频道」就这么坏过一次——读的时候没问题，一写就崩。
  */
 import assert from 'node:assert/strict';
@@ -28,13 +28,13 @@ function sourceFiles(dir: string): string[] {
   return found;
 }
 
-/** 源码里所有 `getConfiguration('plaitcode').update('<key>'` 的 key。 */
+/** 源码里所有 `getConfiguration('hwchat').update('<key>'` 的 key。 */
 function writtenKeys(): string[] {
   const keys = new Set<string>();
   for (const file of sourceFiles(SRC)) {
     const text = readFileSync(file, 'utf8');
-    for (const match of text.matchAll(/getConfiguration\('plaitcode'\)\.update\(\s*'([^']+)'/g)) {
-      keys.add(`plaitcode.${match[1]}`);
+    for (const match of text.matchAll(/getConfiguration\('hwchat'\)\.update\(\s*'([^']+)'/g)) {
+      keys.add(`hwchat.${match[1]}`);
     }
   }
   return [...keys].sort();
@@ -57,8 +57,8 @@ test('跨网中继地址是可写的字符串配置（「新建 / 加入跨网�
   const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
     contributes?: { configuration?: { properties?: Record<string, { type?: string; default?: unknown }> } };
   };
-  const relay = pkg.contributes?.configuration?.properties?.['plaitcode.relay.url'];
-  assert.ok(relay, '缺少 plaitcode.relay.url');
+  const relay = pkg.contributes?.configuration?.properties?.['hwchat.relay.url'];
+  assert.ok(relay, '缺少 hwchat.relay.url');
   assert.equal(relay.type, 'string');
   assert.equal(relay.default, '');
 });

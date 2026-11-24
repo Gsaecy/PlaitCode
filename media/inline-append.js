@@ -44,5 +44,5 @@
     return true;
   }
 
-  globalThis.PlaitCodeInlineAppend = { canAppendPlainText };
+  globalThis.HWChatInlineAppend = { canAppendPlainText };
 })();

@@ -10,7 +10,7 @@
  * 可接受，比在构建期引入 PNG 编码器要划算。
  */
 
-export const APP_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="PlaitCode">
+export const APP_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="HWChat">
   <defs>
     <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#4c9aff"/>
@@ -25,8 +25,8 @@ export const APP_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 
 
 export function renderManifest(): string {
   return JSON.stringify({
-    name: 'PlaitCode · 团队群',
-    short_name: 'PlaitCode',
+    name: 'HWChat · 团队群',
+    short_name: 'HWChat',
     description: '在手机上指挥电脑上的编码 agent：提需求、看进度、批准操作。',
     start_url: '/m',
     scope: '/',
@@ -48,7 +48,7 @@ export function renderManifest(): string {
  * **绝不经手 /v1/**：那些是轮询和发送密文的请求，被 SW 缓存或延迟会造成
  * 「消息丢了但不报错」，排障代价极高。
  */
-export const SERVICE_WORKER_JS = `/* PlaitCode PWA service worker */
+export const SERVICE_WORKER_JS = `/* HWChat PWA service worker */
 self.addEventListener('install', function (event) { self.skipWaiting(); });
 self.addEventListener('activate', function (event) { event.waitUntil(self.clients.claim()); });
 self.addEventListener('fetch', function (event) {

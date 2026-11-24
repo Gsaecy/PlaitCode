@@ -31,7 +31,7 @@ const KIND_ICON: Record<NotifyKind, string> = {
 
 /** 飞书自定义机器人的文本消息体。文本比卡片稳：卡片 schema 变过一次。 */
 export function buildFeishuText(payload: NotifyPayload, link: string): string {
-  const head = `${KIND_ICON[payload.kind]} PlaitCode · ${KIND_LABEL[payload.kind]}`;
+  const head = `${KIND_ICON[payload.kind]} HWChat · ${KIND_LABEL[payload.kind]}`;
   const lines = [
     head,
     payload.title ? `事项：${payload.title}` : '',

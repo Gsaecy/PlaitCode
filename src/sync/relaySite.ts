@@ -200,7 +200,7 @@ export function renderLandingPage(options: {
   const repo = escapeHtml(options.repoUrl);
 
   const steps: Array<[string, string]> = [
-    ['装扩展', '在 VS Code 里装 PlaitCode，或用 VSIX 离线安装。'],
+    ['装扩展', '在 VS Code 里装 HWChat，或用 VSIX 离线安装。'],
     ['登录一次', '命令面板执行「开始协作」，浏览器里用 GitHub 授权。不填地址、不要配对码。'],
     ['开始用', '第二台电脑执行同一个命令；手机扫一次码。都在同一条频道里。'],
   ];
@@ -222,10 +222,10 @@ export function renderLandingPage(options: {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0f1115">
-<meta name="description" content="PlaitCode：不会写代码也能把想法做出来。用中文提需求，AI 先复述、再追问、确认后才动手，交付时告诉你自己怎么验。">
+<meta name="description" content="HWChat：不会写代码也能把想法做出来。用中文提需求，AI 先复述、再追问、确认后才动手，交付时告诉你自己怎么验。">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: 'self'; connect-src 'self'; manifest-src 'self'">
-<title>PlaitCode · 你说要什么，它先问清楚再动手</title>
+<title>HWChat · 你说要什么，它先问清楚再动手</title>
 <style>${BASE_CSS}
   .hero { padding:var(--s7) 0 var(--s8); position:relative; }
   .hero::before { content:""; position:absolute; inset:-40% 20% auto; height:420px; pointer-events:none;
@@ -293,7 +293,7 @@ export function renderLandingPage(options: {
 <a class="skip" href="#main">跳到主要内容</a>
 <header class="nav">
   <div class="inner">
-    <a class="brand" href="/"><img src="/icon.svg" alt="">PlaitCode</a>
+    <a class="brand" href="/"><img src="/icon.svg" alt="">HWChat</a>
     <nav class="nav-links" aria-label="主导航">
       <a href="#start">怎么开始</a>
       <a href="#ask">为什么这么用</a>
@@ -358,9 +358,9 @@ export function renderLandingPage(options: {
       <div class="install">
         <div class="install-head">
           <span>在终端里装（macOS / Windows / Linux 一样）</span>
-          <button class="btn btn-ghost" type="button" id="copyInstall" data-command="code --install-extension plaitcode.plaitcode">复制</button>
+          <button class="btn btn-ghost" type="button" id="copyInstall" data-command="code --install-extension honor-world.hwchat">复制</button>
         </div>
-        <pre><code id="installCommand">code --install-extension plaitcode.plaitcode</code></pre>
+        <pre><code id="installCommand">code --install-extension honor-world.hwchat</code></pre>
         <div class="install-foot">
           <span>找不到 <code>code</code> 命令？在 VS Code 里 <code>Ctrl+Shift+P</code> 执行 <code>Shell Command: Install 'code' command in PATH</code>。</span>
           <a href="${repo}/releases/latest">或下载 .vsix 离线安装 →</a>
@@ -421,7 +421,7 @@ export function renderLandingPage(options: {
 <footer class="site">
   <div class="wrap">
     <div class="foot-bottom" style="margin-top:0;border-top:0;padding-top:0">
-      <span>© 2026 PlaitCode</span>
+      <span>© 2026 HWChat</span>
       <span><a href="${repo}">GitHub</a></span>
       <span><a href="${repo}/tree/main/docs">全部文档</a></span>
       <span style="margin-left:auto">只转发密文 · 不存代码</span>
@@ -477,7 +477,7 @@ export function renderAuthResultPage(options: { ok: boolean; title: string; body
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0f1115">
-<title>${escapeHtml(options.title)} · PlaitCode</title>
+<title>${escapeHtml(options.title)} · HWChat</title>
 <style>${BASE_CSS}
   .stage { min-height:100vh; display:grid; place-items:center; padding:var(--s5); }
   .card { max-width:420px; width:100%; border:1px solid var(--line); border-radius:var(--r-lg);
@@ -517,7 +517,7 @@ export function renderConsolePage(options: { relayHost: string; sessionAuth: boo
 <meta name="theme-color" content="#0f1115">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: 'self'; connect-src 'self'; manifest-src 'self'">
-<title>PlaitCode 控制台</title>
+<title>HWChat 控制台</title>
 <style>${BASE_CSS}
   .shell { display:grid; grid-template-columns:216px minmax(0,1fr); min-height:100vh; }
   .side { border-right:1px solid var(--line); padding:var(--s4) var(--s3); display:flex; flex-direction:column; gap:var(--s4); }
@@ -582,7 +582,7 @@ export function renderConsolePage(options: { relayHost: string; sessionAuth: boo
   <aside class="side">
     <div class="side-head">
       <img src="/icon.svg" alt="">
-      <div><b>PlaitCode 控制台</b><span>${host}</span></div>
+      <div><b>HWChat 控制台</b><span>${host}</span></div>
     </div>
     <nav aria-label="控制台导航" id="tabs">
       <a href="#overview" data-tab="overview" aria-current="page">${icon('activity', 'icon icon-sm')}概览</a>
@@ -782,14 +782,14 @@ export function renderConsolePage(options: { relayHost: string; sessionAuth: boo
   function renderDevices() {
     var invite = el('button', 'btn', '怎么加入新设备');
     invite.addEventListener('click', function () {
-      alert('在已授权的设备上执行：\\n\\nPlaitCode: 给另一台设备发配对信息（含设备令牌）\\n\\n把复制出来的那一行粘到新设备的「加入跨网频道」即可。控制台不发令牌 —— 频道密钥只存在你的设备上。');
+      alert('在已授权的设备上执行：\\n\\nHWChat: 给另一台设备发配对信息（含设备令牌）\\n\\n把复制出来的那一行粘到新设备的「加入跨网频道」即可。控制台不发令牌 —— 频道密钥只存在你的设备上。');
     });
     view.appendChild(pageHead('设备', '每台设备一条记录（Windows 版、macOS 版各一条）。换机器时先在这里吊销旧的，再让新设备接入。', [invite]));
 
     var list = panel('设备', data.devices.length);
     if (!data.devices.length) {
       list.body.appendChild(emptyState('terminal', '还没有设备',
-        '在 VS Code 里执行「PlaitCode: 新建跨网频道」，这台设备会自动登记进来。'));
+        '在 VS Code 里执行「HWChat: 新建跨网频道」，这台设备会自动登记进来。'));
     } else {
       var t = table([{ label: '设备' }, { label: '平台' }, { label: '成员' }, { label: '最近在线' }, { label: '状态' }, { label: '操作', num: true }]);
       data.devices.forEach(function (device) {
@@ -859,7 +859,7 @@ export function renderConsolePage(options: { relayHost: string; sessionAuth: boo
     var list = panel('通道', data.channels.length);
     if (!data.channels.length) {
       list.body.appendChild(emptyState('board', '还没有通道',
-        '在 VS Code 里执行「PlaitCode: 新建跨网频道」后，这里会出现第一条通道。'));
+        '在 VS Code 里执行「HWChat: 新建跨网频道」后，这里会出现第一条通道。'));
     } else {
       var t = table([{ label: '频道 ID' }, { label: '在线 / 设备' }, { label: '最近消息' }, { label: '设备' }]);
       data.channels.forEach(function (channel) {

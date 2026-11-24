@@ -75,15 +75,15 @@ test('端到端加密：能往返；改密文、换消息 id、换密钥都解�
 test('配对文本：一行能来回解析，格式不对直接拒绝', () => {
   const secret = newPairingSecret();
   const text = buildPairingText('https://plaitcode.com/', secret);
-  assert.match(text, /^plaitcode:\/\/join\?u=/);
+  assert.match(text, /^hwchat:\/\/join\?u=/);
   const parsed = parsePairingText(text);
   assert.ok(parsed);
   assert.equal(parsed!.url, 'https://plaitcode.com');
   assert.equal(parsed!.secret, secret);
 
   assert.equal(parsePairingText('https://plaitcode.com'), undefined);
-  assert.equal(parsePairingText('plaitcode://join?u=ftp://x&s=abcdefghijklmnopqrstuvwx'), undefined);
-  assert.equal(parsePairingText('plaitcode://join?u=https://x&s=short'), undefined);
+  assert.equal(parsePairingText('hwchat://join?u=ftp://x&s=abcdefghijklmnopqrstuvwx'), undefined);
+  assert.equal(parsePairingText('hwchat://join?u=https://x&s=short'), undefined);
 });
 
 test('中继：两台设备经真实中转互通，且中转只拿到密文', async () => {
@@ -181,9 +181,9 @@ test('中继：/m 返回手机页面（不占限流额度）', async () => {
       assert.equal(page.status, 200, `第 ${index + 1} 次打开页面不该被限流`);
       assert.match(page.headers.get('content-type') ?? '', /text\/html/);
       const html = await page.text();
-      assert.match(html, /PlaitCode · 团队群/);
+      assert.match(html, /HWChat · 团队群/);
       assert.ok(html.includes(CHANNEL_PREFIX), '页面里必须带与 Node 端一致的派生前缀');
-      assert.match(html, /plaitcode\.relay\.key/);
+      assert.match(html, /hwchat\.relay\.key/);
     }
   } finally {
     await relay.close();
@@ -252,7 +252,7 @@ test('企业身份模式：管理接口发令牌，设备令牌按频道授权�
   const admin = async (path: string, body: unknown): Promise<Record<string, any>> => {
     const response = await fetch(`${base}${path}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-plaitcode-admin': 'admin-secret' },
+      headers: { 'content-type': 'application/json', 'x-hwchat-admin': 'admin-secret' },
       body: JSON.stringify(body),
     });
     return response.json() as Promise<Record<string, any>>;
@@ -261,7 +261,7 @@ test('企业身份模式：管理接口发令牌，设备令牌按频道授权�
   const channelB = 'b'.repeat(32);
   try {
     // 1) 管理令牌不对 → 403
-    const denied = await fetch(`${base}/v1/admin/state`, { headers: { 'x-plaitcode-admin': 'wrong' } });
+    const denied = await fetch(`${base}/v1/admin/state`, { headers: { 'x-hwchat-admin': 'wrong' } });
     assert.equal(denied.status, 403);
 
     // 2) 建组织 → 成员 → 设备（只授权 A 频道）
@@ -432,7 +432,7 @@ test('配对信息可以带设备令牌：新设备粘一次就够，旧格式�
   assert.equal(plain.deviceToken, undefined, '旧格式没有令牌字段，不能凭空造一个');
 
   // 伪造的令牌不能被当成设备令牌存下来
-  const bogus = parsePairingText(`plaitcode://join?u=https%3A%2F%2Fx.com&s=${secret}&t=not-a-token`)!;
+  const bogus = parsePairingText(`hwchat://join?u=https%3A%2F%2Fx.com&s=${secret}&t=not-a-token`)!;
   assert.equal(bogus.deviceToken, undefined);
 });
 test('PWA：manifest / sw.js / 图标都能取到，且 service worker 不动 /v1/', async () => {

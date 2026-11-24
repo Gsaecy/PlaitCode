@@ -169,7 +169,7 @@
     return lines.map((line) => (line.startsWith(prefix) ? line.slice(prefix.length) : line)).join('\n');
   }
 
-  globalThis.PlaitCodeCodeBlockMeta = {
+  globalThis.HWChatCodeBlockMeta = {
     isShellLanguage,
     canonicalTool,
     normalizeLocation,

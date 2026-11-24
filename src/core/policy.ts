@@ -1,7 +1,7 @@
 /**
  * 企业策略（`policy.json`）：管理员下发、**只允许收紧**、不允许放宽。
  *
- * 放在工作区里（或由 MDM 推到 `.plaitcode/policy.json`）：
+ * 放在工作区里（或由 MDM 推到 `.hwchat/policy.json`）：
  *
  * ```json
  * {
@@ -44,7 +44,7 @@ export interface PolicyLoad {
   error?: string;
 }
 
-export const POLICY_FILE = join('.plaitcode', 'policy.json');
+export const POLICY_FILE = join('.hwchat', 'policy.json');
 
 const PRESET_ORDER: PermissionPreset[] = ['askAll', 'review', 'autopilot', 'full'];
 

@@ -27,13 +27,13 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
 <meta name="theme-color" content="#0f1115">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="PlaitCode">
+<meta name="apple-mobile-web-app-title" content="HWChat">
 <meta name="mobile-web-app-capable" content="yes">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/icon.svg">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data: 'self'; manifest-src 'self'; worker-src 'self'">
-<title>PlaitCode · 团队群</title>
+<title>HWChat · 团队群</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a; --text:#e5e7eb; --muted:#9aa3b2;
     --brand:#4c9aff; --warn:#f0b429; --ok:#34d399; --bad:#f87171; }
@@ -112,7 +112,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
 <body>
 <header>
   <span class="dot" id="dot"></span>
-  <span class="title">PlaitCode · 团队群</span>
+  <span class="title">HWChat · 团队群</span>
   <span class="meta" id="meta">${host}</span>
 </header>
 <div class="board" id="board" style="display:none"></div>
@@ -125,7 +125,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
 </footer>
 <script>
 (function () {
-  var KEY_STORE = 'plaitcode.relay.key';
+  var KEY_STORE = 'hwchat.relay.key';
   var SESSION_AUTH = ${sessionAuth ? 'true' : 'false'};
   var PHASES = { requirement:'需求', analysis:'解析', question:'追问', answer:'回复', confirm:'确认', progress:'进度', result:'结果', blocked:'未执行' };
   var main = document.getElementById('main');
@@ -469,14 +469,14 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   function redirectToLogin() {
     if (loginAttempted) return false;
     try {
-      if (sessionStorage.getItem('plaitcode.loginRedirect') === '1') {
+      if (sessionStorage.getItem('hwchat.loginRedirect') === '1') {
         loginAttempted = true;
         return false;
       }
     } catch (error) {}
     loginAttempted = true;
     say('需要先用${loginLabel}登录，正在跳转…');
-    try { sessionStorage.setItem('plaitcode.loginRedirect', '1'); } catch (error) {}
+    try { sessionStorage.setItem('hwchat.loginRedirect', '1'); } catch (error) {}
     setTimeout(function () { location.replace('${loginPath}'); }, 400);
     return true;
   }
@@ -487,7 +487,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     return fetch('/v1/auth/me', { credentials: 'same-origin' })
       .then(function (r) {
         if (r.ok) {
-          try { sessionStorage.removeItem('plaitcode.loginRedirect'); } catch (error) {}
+          try { sessionStorage.removeItem('hwchat.loginRedirect'); } catch (error) {}
           return true;
         }
         if (r.status === 401) return false;
@@ -578,9 +578,9 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
     var form = document.createElement('form');
     form.className = 'join';
     form.appendChild(el('h1', null, '加入团队群'));
-    form.appendChild(el('p', null, '把电脑上「PlaitCode: 手机加入频道」显示的二维码扫一下，或粘贴那一整条配对信息。'));
+    form.appendChild(el('p', null, '把电脑上「HWChat: 手机加入频道」显示的二维码扫一下，或粘贴那一整条配对信息。'));
     var field = document.createElement('input');
-    field.placeholder = 'plaitcode://join?u=https://…&s=…';
+    field.placeholder = 'hwchat://join?u=https://…&s=…';
     field.autocomplete = 'off';
     form.appendChild(field);
     var submitBtn = el('button', 'primary', '进入');
@@ -608,10 +608,10 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       return ensureSession().then(function (loggedIn) {
         if (!loggedIn) { redirectToLogin(); return; }
         keys = ready;
-        deviceId = localStorage.getItem('plaitcode.relay.device');
+        deviceId = localStorage.getItem('hwchat.relay.device');
         if (!deviceId) {
           deviceId = 'web' + Math.random().toString(36).slice(2, 10);
-          localStorage.setItem('plaitcode.relay.device', deviceId);
+          localStorage.setItem('hwchat.relay.device', deviceId);
         }
         footer.style.display = 'flex';
         presence();
@@ -636,7 +636,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   if (fromHash && fromHash.length >= 16) {
     localStorage.setItem(KEY_STORE, fromHash);
     // 重新扫了一次码 = 用户主动重来，允许再跳一次登录
-    try { sessionStorage.removeItem('plaitcode.loginRedirect'); } catch (error) {}
+    try { sessionStorage.removeItem('hwchat.loginRedirect'); } catch (error) {}
     loginAttempted = false;
     boot(fromHash);
   } else if (stored && stored.length >= 16) {

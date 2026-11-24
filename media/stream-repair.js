@@ -209,5 +209,5 @@
     return repairStreamingMarkdown(value) !== value;
   }
 
-  globalThis.PlaitCodeStreamRepair = { repairStreamingMarkdown, needsRepair };
+  globalThis.HWChatStreamRepair = { repairStreamingMarkdown, needsRepair };
 })();

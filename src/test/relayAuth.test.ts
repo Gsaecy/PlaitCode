@@ -157,7 +157,7 @@ test('端到端：登录跳转 → 回调换 token → 下发会话 → /v1/auth
     assert.equal(callback.status, 302);
     assert.equal(callback.headers.get('location'), '/m');
     const cookie = (callback.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
-    assert.match(cookie, /^plaitcode_session=/);
+    assert.match(cookie, /^hwchat_session=/);
 
     // 会话可用，且成员是自动开户的
     const me = await fetch(`${base}/v1/auth/me`, { headers: { cookie } });
@@ -257,7 +257,7 @@ test('身份模式：手机凭会话 Cookie 收发；没登录 401，跨组织 4
   });
   try {
     assert.equal((await publish()).status, 401, '既没设备令牌也没登录');
-    const cookie = `plaitcode_session=${signSession('session-secret', { memberId: member.id, name: member.name, exp: Date.now() + 60_000 })}`;
+    const cookie = `hwchat_session=${signSession('session-secret', { memberId: member.id, name: member.name, exp: Date.now() + 60_000 })}`;
     assert.equal((await publish({ cookie })).status, 200);
 
     const poll = await fetch(`${base}/v1/poll?channel=${channel}&since=0&wait=1`, { headers: { cookie } });
@@ -268,7 +268,7 @@ test('身份模式：手机凭会话 Cookie 收发；没登录 401，跨组织 4
 
     // 别的组织的成员：有会话但没有频道归属
     const outsider = addMember(state, { orgId: addOrg(state, 'Other').id, name: '外人', role: 'member' })!;
-    const otherCookie = `plaitcode_session=${signSession('session-secret', { memberId: outsider.id, name: outsider.name, exp: Date.now() + 60_000 })}`;
+    const otherCookie = `hwchat_session=${signSession('session-secret', { memberId: outsider.id, name: outsider.name, exp: Date.now() + 60_000 })}`;
     assert.equal((await publish({ cookie: otherCookie })).status, 403);
   } finally {
     relay.close();

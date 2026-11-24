@@ -22,9 +22,9 @@ export interface RelayKeys {
   enc: Buffer;
 }
 
-export const CHANNEL_PREFIX = 'plaitcode/channel/1:';
-export const RELAY_PREFIX = 'plaitcode/relay/1:';
-export const ENC_PREFIX = 'plaitcode/enc/1:';
+export const CHANNEL_PREFIX = 'hwchat/channel/1:';
+export const RELAY_PREFIX = 'hwchat/relay/1:';
+export const ENC_PREFIX = 'hwchat/enc/1:';
 
 function hash(prefix: string, secret: string): Buffer {
   return createHash('sha256').update(prefix).update(secret, 'utf8').digest();
@@ -91,13 +91,13 @@ export function open(keys: RelayKeys, messageId: string, envelope: SealedEnvelop
  */
 export function buildPairingText(relayUrl: string, secret: string, deviceToken?: string): string {
   const url = relayUrl.replace(/\/+$/, '');
-  const base = `plaitcode://join?u=${encodeURIComponent(url)}&s=${encodeURIComponent(secret)}`;
+  const base = `hwchat://join?u=${encodeURIComponent(url)}&s=${encodeURIComponent(secret)}`;
   return deviceToken ? `${base}&t=${encodeURIComponent(deviceToken)}` : base;
 }
 
 export function parsePairingText(text: string): { url: string; secret: string; deviceToken?: string } | undefined {
   const value = text.trim();
-  if (!value.startsWith('plaitcode://join')) return undefined;
+  if (!value.startsWith('hwchat://join')) return undefined;
   const query = value.slice(value.indexOf('?') + 1);
   const params = new URLSearchParams(query);
   const url = (params.get('u') ?? '').trim();

@@ -19,7 +19,7 @@ async function makeService(options: {
   allowPhone?: boolean;
   onRemoteControl?: (control: { action: string; preset?: string; steps?: number }) => Promise<{ ok: boolean; message: string }>;
 } = {}): Promise<{ service: LanSyncService; sent: Array<Record<string, unknown>>; dir: string }> {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-approval-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-approval-'));
   const sent: Array<Record<string, unknown>> = [];
   const service = new LanSyncService(join(dir, 'state.json'), {
     peer: () => PC,

@@ -24,7 +24,7 @@ import type { LanguageSetting } from './i18n';
 export type { Language, LanguageSetting } from './i18n';
 
 /**
- * 旧版本写在 `plaitcode.*` 全局设置里的运行时设置。
+ * 旧版本写在 `hwchat.*` 全局设置里的运行时设置。
  *
  * 0.2.5 之前这三项只有全局一份、不随对话存档。升级后那些**老对话**里没有对应
  * 字段，需要靠这份旧值补一次，否则它们会统一掉回「每次询问 / 24 步」。
@@ -297,7 +297,7 @@ export interface ConversationSummary {
   /**
    * 本对话自己的运行时设置。
    *
-   * 以前这三项直接写 `plaitcode.*` 全局设置，多线程对话时互相污染：在 A 调成
+   * 以前这三项直接写 `hwchat.*` 全局设置，多线程对话时互相污染：在 A 调成
    * 「完全访问」，B 立刻也跟着放宽；B 把步骤数改成 8，正在跑的 A 下一轮就被截断。
    * 现在它们属于对话，全局设置只作为新对话的默认值。
    */
@@ -407,7 +407,7 @@ export interface CleanupResult extends StorageStats {
   /** 本轮被另一个窗口的「清理主」跳过（跨进程锁没拿到）。 */
   skippedByPeer?: boolean;
   /**
-   * 缓存体积是否已超出 `plaitcode.cacheBudgetMB`。
+   * 缓存体积是否已超出 `hwchat.cacheBudgetMB`。
    *
    * 超预算**不会**触发删除：清理只做瘦身与统计，空间由用户在设置里自己清。
    */
@@ -436,7 +436,7 @@ export interface ChatSettings {
   baseUrl: string;
   model: string;
   /**
-   * 企业策略（`.plaitcode/policy.json`）。
+   * 企业策略（`.hwchat/policy.json`）。
    *
    * 由 ChatPanel 在每轮开始时读入并挂在这里，工具执行侧只读不写。
    * 声明为可选：没有策略文件时整条链路的行为与以前完全一致。
@@ -452,7 +452,7 @@ export interface ChatSettings {
   cleanupIntervalMinutes: number;
   maxMessagesInContext: number;
   /**
-   * 追加的搜索排除目录名（`plaitcode.searchExclude`）。
+   * 追加的搜索排除目录名（`hwchat.searchExclude`）。
    *
    * 声明为可选：这是 resource 作用域的配置（多根工作区里用户可能只写在某个根的
    * `.vscode/settings.json` 里），读取侧由 `workspaceSearch` 逐根取并集；设置页只
@@ -487,7 +487,7 @@ export interface ChatSettings {
    * 而 api.deepseek.com 在国内通常可以直连。默认只放行它，其它域名（网页检索、图片下载）
    * 仍按 `proxy` 走。
    *
-   * 注意：这里只管 **PlaitCode 自己发出的请求**。`git push/pull`、`npm` 等由 `run_command`
+   * 注意：这里只管 **HWChat 自己发出的请求**。`git push/pull`、`npm` 等由 `run_command`
    * 起的子进程走它们自己的代理配置（环境变量 / git config），完全不受本项影响。
    */
   proxyBypassHosts?: string[];

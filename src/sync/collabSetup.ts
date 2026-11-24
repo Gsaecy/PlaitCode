@@ -114,7 +114,7 @@ export async function quickStart(deps: QuickStartDeps): Promise<QuickStartResult
           ok: false,
           // 弹窗只说人话；环境变量名留给日志，普通用户看不懂也不需要懂
           error: started.error === 'github login disabled'
-            ? '这个服务暂时没有开放 GitHub 登录。请稍后再试，或换一个中继地址（设置里搜 plaitcode.relay.url）。'
+            ? '这个服务暂时没有开放 GitHub 登录。请稍后再试，或换一个中继地址（设置里搜 hwchat.relay.url）。'
             : (started.error ?? `连不上协作服务（HTTP ${response.status}）`),
         };
       }

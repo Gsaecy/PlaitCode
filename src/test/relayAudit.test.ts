@@ -8,7 +8,7 @@ import { AuditLog } from '../sync/relayAudit';
 /** 中继审计：一行一条 JSON、不含明文、会轮转、可以关掉 IP。 */
 
 test('审计：写 JSONL，字段齐全，且不可能出现消息正文', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-audit-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-audit-'));
   const path = join(dir, 'audit.jsonl');
   try {
     const audit = new AuditLog({ path, includeIp: true });
@@ -40,7 +40,7 @@ test('审计：写 JSONL，字段齐全，且不可能出现消息正文', async
 });
 
 test('审计：可以关掉 IP（某些地区 IP 属于个人信息）', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-audit-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-audit-'));
   const path = join(dir, 'audit.jsonl');
   try {
     const audit = new AuditLog({ path, includeIp: false });
@@ -54,7 +54,7 @@ test('审计：可以关掉 IP（某些地区 IP 属于个人信息）', async (
 });
 
 test('审计：超过单文件上限会轮转，历史文件不会无限增长', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'plaitcode-audit-'));
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-audit-'));
   const path = join(dir, 'audit.jsonl');
   try {
     const audit = new AuditLog({ path, maxBytes: 4 * 1024, keep: 2 });
