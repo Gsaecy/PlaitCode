@@ -984,11 +984,14 @@ export class LanSyncService implements Disposable {
 
   private absorbPeers(value: unknown): void {
     if (!Array.isArray(value)) return;
+    const selfId = this.bridge.peer().id;
     for (const item of value.slice(0, MAX_PEERS)) {
       if (!item || typeof item !== 'object') continue;
       const record = item as { peer?: unknown; address?: unknown };
       const message = parseSyncMessage({ kind: 'report', requirementId: 'x', from: record.peer, status: 'planned' });
       if (!message) continue;
+      // 对端可能把它看到的「我们」也发回来；把自己记成队友会让设备数虚高一位。
+      if (message.from.id === selfId) continue;
       const address = typeof record.address === 'string' ? record.address : '';
       this.peers.set(message.from.id, { peer: message.from, address });
     }
