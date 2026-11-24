@@ -2039,12 +2039,39 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       if (this.lanSync && !options?.resumedTodos && content) {
         if (options?.origin === 'group') {
           /*
-           * 群里说的话，本机 agent 必须和对端 agent 拿到**同一套协议提示词**。
+           * 群聊是「大家一起说话的地方」，不是命令行。
            *
-           * 以前这里把用户原文直接塞进主对话：本机 agent 看到「agent 报数」四个字
-           * 就开干，既不解析也不追问；而对端 agent 拿到的是完整协议提示词 ——
-           * 同一句话，两边的行为完全不一样。
+           * 所以先判断这条消息是什么：
+           *  - 问答/闲聊（报数、1+1、你是谁）→ **只在群里回一句**，主对话完全不动；
+           *  - 要做的事 → 才走「解析 → 追问 → 确认 → 各自执行」。
+           *
+           * 以前一律当成任务：群里说「报数」，右侧对话框就开跑一轮，还什么都不做。
            */
+          const { classifyGroupIntent, answerGroupChat } = await import('../sync/groupIntent.js');
+          const recentGroup = this.lanSync.recentGroup(6).map((item) => `${item.from.name}：${item.body}`);
+          const controller = new AbortController();
+          const verdict = await classifyGroupIntent(
+            this.client,
+            readSettings(),
+            content,
+            controller.signal,
+            recentGroup,
+          );
+          this.log(`[sync] 群消息判定：${verdict.intent}（${verdict.reason}）← ${content.slice(0, 40)}`);
+          if (verdict.intent === 'chat') {
+            // 先把用户这句记进群（否则群窗口里看不到自己说的话）。
+            await this.lanSync.postGroup({ author: 'user', phase: 'analysis', body: content });
+            const answer = await answerGroupChat(
+              this.client,
+              readSettings(),
+              content,
+              controller.signal,
+              recentGroup,
+              this.lanSync.localPeer().name,
+            );
+            await this.lanSync.postGroup({ author: 'agent', phase: 'analysis', body: answer });
+            return;
+          }
           const { requirementPromptForLocal, renderGroupLine } = await import('../sync/lanProtocol.js');
           const openRequirement = this.lanSync.openQuestionRequirement();
           if (openRequirement) {

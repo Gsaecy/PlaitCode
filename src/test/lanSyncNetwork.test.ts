@@ -906,6 +906,34 @@ test('两台各自当主机、邀请码不同，也必须能互通（不能互�
   }
 });
 
+test('群消息分类：报数/算数/问句只回一句，改代码才算任务', async () => {
+  const { fallbackGroupIntent, parseGroupIntent } = await import('../sync/groupIntent.js');
+
+  // 模型给词时的解析
+  assert.equal(parseGroupIntent('CHAT'), 'chat');
+  assert.equal(parseGroupIntent('TASK'), 'task');
+  assert.equal(parseGroupIntent('chat'), 'chat');
+  assert.equal(parseGroupIntent('不知道'), undefined, '看不懂就交给关键词兜底');
+
+  /*
+   * 关键词兜底：这是分类模型不可用时的最后一道。
+   * 用户明确要求「报数、1+1 这类不需要执行，直接在群里回」。
+   */
+  assert.equal(fallbackGroupIntent('报数'), 'chat');
+  assert.equal(fallbackGroupIntent('1+1等于几'), 'chat');
+  assert.equal(fallbackGroupIntent('1 + 1 = ?'), 'chat');
+  assert.equal(fallbackGroupIntent('你是谁？'), 'chat');
+  assert.equal(fallbackGroupIntent('你好'), 'chat');
+
+  // 要动手的才判成任务
+  assert.equal(fallbackGroupIntent('把按钮改成蓝色'), 'task');
+  assert.equal(fallbackGroupIntent('修复登录失败的问题'), 'task');
+  assert.equal(fallbackGroupIntent('add a dark mode toggle'), 'task');
+
+  // 「报数」带任务动词时不能误判成闲聊
+  assert.equal(fallbackGroupIntent('报数之后把结果写进 README'), 'task');
+});
+
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {
   assert.equal(normalizeHubAddress('192.168.0.3', 47821), 'http://192.168.0.3:47821');
   assert.equal(normalizeHubAddress('192.168.0.3:5000', 47821), 'http://192.168.0.3:5000', '显式端口不能被覆盖');
