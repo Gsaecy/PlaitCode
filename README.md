@@ -8,6 +8,32 @@ It ships a compact chat surface and settings page, native streaming tool calling
 
 ![PlaitCode chat panel: conversation sidebar and a new conversation](https://raw.githubusercontent.com/Gsaecy/PlaitCode/main/docs/screenshots/chat-panel.png)
 
+## What's new in 0.6.x (cross-network collaboration + enterprise)
+
+### Cross-network: your phone and your computers no longer need the same WiFi
+
+A relay service ships with the project (`https://plaitcode.com`, or self-host it):
+
+- On the desktop: `PlaitCode: 新建跨网频道` → get a pairing string;
+- On the second machine: `PlaitCode: 加入跨网频道` → paste it;
+- On the phone: `PlaitCode: 手机加入团队群（二维码）` → scan, and the same team group opens in the browser.
+
+**End-to-end encryption**: devices use AES-256-GCM; the channel key lives only in the URL fragment and local storage,
+so the relay forwards ciphertext — the server cannot read your code or your requirements.
+
+### Four enterprise-ready pieces
+
+| Capability | What it does |
+|---|---|
+| **Audit** | JSONL on the relay: who / which device / when / ciphertext size — **never the content**; can forward to syslog, webhook, or OTLP |
+| **Policy** | `.plaitcode/policy.json`: permission ceiling, command denylist, model allowlist, disable web reference; a broken file fails closed |
+| **Identity** | org / member / device / role (viewer, member, admin, owner); one person many devices, one device many channels; tokens stored hashed and revocable |
+| **Self-hosting** | single file + systemd + nginx, 5-minute deploy, zero external dependencies |
+
+Everything is **off by default**: without `policy.json` or `PLAITCODE_IDENTITY`, behavior is identical to before.
+
+See [docs/ENTERPRISE.md](docs/ENTERPRISE.md) and [deploy/relay/README.md](deploy/relay/README.md).
+
 ## What's new in 0.5.0
 
 **Renamed: HWChat → PlaitCode.**

@@ -12,6 +12,32 @@ PlaitCode 是一个在 VS Code 内直接编码的 DeepSeek / OpenAI 兼容 Agent
 
 架构与功能实现清单（含 12 个待评审漏洞点及**代码坐标**、以及「刻意取舍」清单）见 [docs/ARCHITECTURE-REVIEW.md](docs/ARCHITECTURE-REVIEW.md) —— 这份文档就是为外部评审（Claude / GPT）准备的，可直接整份贴出去。
 
+## 0.6.x 更新了什么（跨网络协作 + 企业能力）
+
+### 跨网络：手机和电脑不必在同一个 WiFi
+
+新增中继服务（`https://plaitcode.com`，也可私有化部署）：
+
+- 电脑上执行 `PlaitCode: 新建跨网频道`，拿到一条配对信息；
+- 另一台电脑执行 `PlaitCode: 加入跨网频道` 粘贴即可；
+- 手机扫码 `PlaitCode: 手机加入团队群（二维码）`，浏览器里就是同一个团队群，发需求、回答追问、看结果。
+
+**端到端加密**：设备间用 AES-256-GCM，频道密钥只放 URL 的 fragment 和本地存储，
+中继只转发密文——服务器跑在谁的机房里都看不到你的代码和需求。
+
+### 企业能用的四块
+
+| 能力 | 说明 |
+|---|---|
+| **审计** | 中继侧 JSONL：谁 / 哪台设备 / 什么时间 / 多大密文，**不含正文**；可外送 syslog、webhook、OTLP |
+| **策略** | `.plaitcode/policy.json`：强制权限上限、命令黑名单、模型白名单、禁联网参考；坏文件按最严处理 |
+| **身份** | 组织 / 成员 / 设备 / 角色（viewer/member/admin/owner）；一人多设备、一设备多频道；令牌只存哈希、可随时吊销 |
+| **私有化** | 单文件 + systemd + nginx，5 分钟部署，不需要任何外部依赖 |
+
+默认全部**关闭**：没有 `policy.json`、没有 `PLAITCODE_IDENTITY` 时，行为与之前完全一致。
+
+详见 [docs/ENTERPRISE.md](docs/ENTERPRISE.md) 与 [deploy/relay/README.md](deploy/relay/README.md)。
+
 ## 0.5.0 更新了什么
 
 **改名了：HWChat → PlaitCode。**
