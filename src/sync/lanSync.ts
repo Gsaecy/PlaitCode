@@ -292,9 +292,9 @@ export class LanSyncService implements Disposable {
   private inviteCode = '';
   /**
    * UDP 发现端口（固定，不随 HTTP 端口变化）。
-   * 可注入只是为了让测试在同一台机器上跑；生产永远用 `DISCOVERY_PORT`。
+   * 可注入只是为了让测试与真实运行中的实例隔离；生产永远用 `DISCOVERY_PORT`。
    */
-  readonly discoveryPort: number = DISCOVERY_PORT;
+  readonly discoveryPort: number;
   private readonly peers = new Map<string, { peer: SyncPeer; address: string }>();
   private disposed = false;
   private announceTimer?: NodeJS.Timeout;
@@ -310,7 +310,12 @@ export class LanSyncService implements Disposable {
   constructor(
     private readonly storagePath: string,
     private readonly bridge: LanSyncBridge,
-  ) {}
+    options: { discoveryPort?: number } = {},
+  ) {
+    this.discoveryPort = options.discoveryPort && options.discoveryPort > 0
+      ? options.discoveryPort
+      : DISCOVERY_PORT;
+  }
 
   /** 读取持久化的配对码与历史记录（同步调用，避免每次判断都要 await）。 */
   async load(): Promise<void> {
@@ -839,24 +844,29 @@ export class LanSyncService implements Disposable {
   async joinGroup(code: string, port?: number, address?: string): Promise<{ ok: boolean; message: string }> {
     const wanted = normalizeInviteCode(code);
     if (!wanted) return { ok: false, message: '请填写邀请码。' };
+    this.bridge.log(`[sync] 加入群聊：规范化后的邀请码 ${wanted}`);
     this.usePort(port ?? this.configuredPort);
     this.stopListener();
     try {
       await this.startListener();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      this.bridge.log(`[sync] 加入群聊失败：本机监听起不来（${message}）`, 'warn');
       return { ok: false, message: `本机监听失败：${message}` };
     }
+    this.bridge.log(`[sync] 加入群聊：本机已在 ${this.port} 监听，开始在 ${this.discoveryPort} 上找群`);
     const typed = address?.trim();
     const target = typed ? normalizeHubAddress(typed, this.port) : await this.discover(wanted);
     if (!target) {
       this.role = 'off';
       this.stopListener();
+      this.bridge.log(`[sync] 加入群聊失败：广播里没有邀请码 ${wanted} 的群`, 'warn');
       return {
         ok: false,
-        message: `没找到邀请码 ${wanted} 的群聊。请确认另一台电脑已经点了「启动群聊」，并且两台在同一个 WiFi。`,
+        message: `没找到邀请码 ${wanted} 的群聊。请确认另一台电脑已经点了「启动群聊」（并且还在等着），两台在同一个 WiFi。`,
       };
     }
+    this.bridge.log(`[sync] 加入群聊：找到 ${target}，正在配对`);
     return this.finishJoin(target, wanted);
   }
 
@@ -898,6 +908,7 @@ export class LanSyncService implements Disposable {
       this.role = 'off';
       this.stopListener();
       const reason = answer.error ?? '';
+      this.bridge.log(`[sync] 加入群聊失败：主机拒绝或不可达（${reason || '没有响应'}）`, 'warn');
       // 邀请码错与连不上，用户要做的事完全不同，分开说。
       if (/邀请码/.test(reason)) {
         return { ok: false, message: `加入失败：${reason}。请核对另一台电脑上显示的邀请码。` };

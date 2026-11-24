@@ -91,6 +91,21 @@ function workspaceRoot(): string | undefined {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }
 
+/**
+ * 命令是否真的注册过。
+ *
+ * 「点了没反应」第一嫌疑就是命令不存在（装的是旧版本）。
+ * VS Code 没有公开的「列已注册命令」API，所以用 getCommands 找一遍。
+ */
+async function hasCommand(id: string): Promise<boolean> {
+  try {
+    const all = await vscode.commands.getCommands(true);
+    return all.includes(id);
+  } catch {
+    return false;
+  }
+}
+
 export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupResult> {
   const { context, output, chat } = options;
   let deviceName = setting('lanSync.deviceName', '');
@@ -634,18 +649,78 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         ignoreFocusOut: true,
         validateInput: (value) => (value.trim() ? undefined : '请填写邀请码'),
       });
-      if (!typed) return;
-      const result = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'HWChat 正在找这个群聊…' },
-        async () => service.joinGroup(typed, setting('lanSync.port', 47821)),
-      );
-      refreshStatus();
-      if (!result.ok) {
-        void vscode.window.showWarningMessage(result.message);
+      if (!typed) {
+        output.info('[sync] 加入群聊：用户取消了输入');
         return;
       }
-      await groupPanel.open();
-      void vscode.window.showInformationMessage(result.message);
+      output.info(`[sync] 加入群聊：开始，邀请码 ${typed.trim().slice(0, 12)}`);
+      /*
+       * 整条路径包住：任何异常都必须变成用户看得见的一句话。
+       *
+       * 「点了没反应」是这条命令以前最糟的失败方式 —— 命令 handler 抛异常时
+       * VS Code 只在后台记录，界面上什么都没有，用户无法判断是在等、还是已经失败。
+       */
+      try {
+        const result = await vscode.window.withProgress(
+          { location: vscode.ProgressLocation.Notification, title: 'HWChat 加入群聊', cancellable: false },
+          async (progress) => {
+            progress.report({ message: '正在同一个 WiFi 里找这个邀请码…' });
+            return service.joinGroup(typed, setting('lanSync.port', 47821));
+          },
+        );
+        output.info(`[sync] 加入群聊：${result.ok ? '成功' : '失败'} — ${result.message}`);
+        refreshStatus();
+        if (!result.ok) {
+          const choice = await vscode.window.showErrorMessage(result.message, '查看日志', '重新输入');
+          if (choice === '查看日志') output.show(true);
+          if (choice === '重新输入') await vscode.commands.executeCommand('hwchat.lanSync.joinGroup');
+          return;
+        }
+        await groupPanel.open();
+        void vscode.window.showInformationMessage(result.message);
+      } catch (error) {
+        const detail = error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error);
+        output.error(`[sync] 加入群聊异常：${detail}`);
+        const choice = await vscode.window.showErrorMessage(
+          `加入群聊时出错：${error instanceof Error ? error.message : String(error)}`,
+          '查看日志',
+        );
+        if (choice === '查看日志') output.show(true);
+      }
+    }),
+    /*
+     * 诊断：什么都不用猜，一条命令列出它到底看到了什么。
+     * 遇到「点了没反应」时先跑这个，能立刻区分「命令没注册」和「网络没通」。
+     */
+    vscode.commands.registerCommand('hwchat.lanSync.diagnose', async () => {
+      const state = service.state();
+      const ports = service.ports();
+      const lines = [
+        '===== HWChat 协作诊断 =====',
+        `扩展版本：${options.version}`,
+        `本机设备：${deviceName || bridge.peer().name}（id ${bridge.peer().id.slice(0, 12)}）`,
+        `本机地址：${lanAddresses().join(' / ') || '（未发现局域网地址）'}`,
+        '',
+        `角色：${state.role}`,
+        `邀请码：${service.currentInviteCode() || '（没有，说明这台不是群主）'}`,
+        `HTTP 端口：${ports.listen} · 发现端口：${ports.discovery}`,
+        `对端设备：${service.remotePeers().length} 台`,
+        ...service.remotePeers().map((peer) => `  - ${peer.name} · ${peer.platform} · ${peer.address}`),
+        '',
+        '命令是否已注册（都应为 true）：',
+        `  启动群聊：${await hasCommand('hwchat.lanSync.startGroup')}`,
+        `  加入群聊：${await hasCommand('hwchat.lanSync.joinGroup')}`,
+        `  打开团队群：${await hasCommand('hwchat.lanSync.openGroup')}`,
+        '==========================',
+      ];
+      for (const line of lines) output.info(line);
+      output.show(true);
+      try {
+        await vscode.env.clipboard.writeText(lines.join('\n'));
+        void vscode.window.showInformationMessage(`协作诊断已复制到剪贴板（版本 ${options.version}）。`);
+      } catch {
+        void vscode.window.showInformationMessage(`协作诊断已输出到 HWChat 日志面板（版本 ${options.version}）。`);
+      }
     }),
     vscode.commands.registerCommand('hwchat.lanSync.connect', async () => {
       // 兼容旧入口：等同于「启动群聊」。

@@ -13,6 +13,9 @@ import type { SyncNote, SyncPeer, SyncRequirement } from '../sync/lanProtocol';
  * 主机自己，需求永远送不到对端）。所以这里不打桩，用真实 HTTP + 真实端口。
  */
 
+/** 测试专用发现端口：避开真实运行中的扩展（它占 47821）。 */
+const ISOLATED_DISCOVERY_PORT = 48_960;
+
 const HUB_PORT = 48_321;
 const PEER_PORT = 48_322;
 
@@ -23,6 +26,8 @@ async function makeService(peer: SyncPeer, options: {
   onRequirement?: (requirement: SyncRequirement) => Promise<boolean>;
   onNote?: (note: SyncNote) => Promise<boolean>;
   onGroupMessage?: (message: any) => Promise<void>;
+  /** 测试与真实运行中的扩展隔离：真实实例会占用 47821 广播。 */
+  discoveryPort?: number;
 } = {}): Promise<{ service: LanSyncService; dir: string; ledgers: string[] }> {
   const dir = await mkdtemp(join(tmpdir(), 'hwchat-sync-'));
   const ledgers: string[] = [];
@@ -34,7 +39,7 @@ async function makeService(peer: SyncPeer, options: {
     writeLedger: async (markdown) => { ledgers.push(markdown); },
     writeTranscript: async () => undefined,
     log: () => undefined,
-  });
+  }, { discoveryPort: options.discoveryPort ?? 48_900 });
   await service.load();
   return { service, dir, ledgers };
 }
@@ -121,7 +126,7 @@ test('端到端：配对后主机发需求，对端真的收到并执行；对�
     writeLedger: async () => undefined,
     writeTranscript: async () => undefined,
     log: () => undefined,
-  });
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
   await peerWithHook.load();
   await peerWithHook.setPairingCode('TEST-CODE');
 
@@ -173,7 +178,7 @@ test('端到端：配对码不一致时加入失败，需求不会外泄', async
     writeLedger: async () => undefined,
     writeTranscript: async () => undefined,
     log: () => undefined,
-  });
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
   await spy.load();
   await spy.setPairingCode('WRONG-CODE');
 
@@ -206,7 +211,7 @@ test('协作消息：主机发一条，对端 agent 收到；纯陈述不触发�
     writeLedger: async () => undefined,
     writeTranscript: async () => undefined,
     log: () => undefined,
-  });
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
   await peer.load();
   await hub.service.setPairingCode('NOTE-CODE');
   await peer.setPairingCode('NOTE-CODE');
@@ -251,7 +256,7 @@ test('一键连接：陌生设备弹一次「允许」即可加入，之后重�
     writeTranscript: async () => undefined,
     log: () => undefined,
     approvePeer: async (peer) => { asked.push(peer.id); return true; },
-  });
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
   await hub.load();
   await hub.setPairingCode('HUB-ONLY-CODE');
 
@@ -262,7 +267,7 @@ test('一键连接：陌生设备弹一次「允许」即可加入，之后重�
     writeLedger: async () => undefined,
     writeTranscript: async () => undefined,
     log: () => undefined,
-  });
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
   await strangerA.load();
   await strangerA.setPairingCode('DIFFERENT-CODE');
 
@@ -298,7 +303,7 @@ test('一键连接：用户点「拒绝」时连不进来', async () => {
     writeTranscript: async () => undefined,
     log: () => undefined,
     approvePeer: async () => false,
-  });
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
   await hub.load();
   await hub.setPairingCode('HUB-CODE');
   const stranger = new LanSyncService(join(dir2, 'a.json'), {
@@ -308,7 +313,7 @@ test('一键连接：用户点「拒绝」时连不进来', async () => {
     writeLedger: async () => undefined,
     writeTranscript: async () => undefined,
     log: () => undefined,
-  });
+  }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
   await stranger.load();
   await stranger.setPairingCode('OTHER');
   try {
@@ -344,7 +349,7 @@ test('中继需求按指派门控：指名别人时本机不跑，指名本机�
       writeLedger: async () => undefined,
       writeTranscript: async () => undefined,
       log: () => undefined,
-    });
+    }, { discoveryPort: ISOLATED_DISCOVERY_PORT });
     await service.load();
 
     const requirement = (id: string, body: string, assignee?: string) => ({

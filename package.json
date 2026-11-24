@@ -2,7 +2,7 @@
   "name": "hwchat",
   "displayName": "HWChat",
   "description": "A secure coding agent for VS Code with DeepSeek: approval-controlled workspace tools, plan-tracking task lists, copyable local/server commands and durable local history.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "honor-world",
   "license": "MIT",
   "icon": "resources/logo.png",
@@ -191,6 +191,10 @@
       {
         "command": "hwchat.lanSync.joinGroup",
         "title": "HWChat: 加入群聊（填邀请码）"
+      },
+      {
+        "command": "hwchat.lanSync.diagnose",
+        "title": "HWChat: 协作诊断（点了没反应时先跑这个）"
       },
       {
         "command": "hwchat.lanSync.disconnect",
