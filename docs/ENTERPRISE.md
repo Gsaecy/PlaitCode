@@ -98,6 +98,28 @@ curl -s $BASE/v1/admin/state -H "x-plaitcode-admin: $ADMIN"
 
 **审计里没有消息正文** —— 中继本来就看不懂（端到端加密），这对客户是卖点不是限制。
 
+### 送到企业已有的日志平台
+
+不用等我们去对接：把 `PLAITCODE_AUDIT_SINK` 指过去就行，**一行 JSON 原样外送**。
+
+```bash
+# UDP syslog（传统 SIEM / rsyslog）
+PLAITCODE_AUDIT_SINK=syslog://10.0.0.5:514
+
+# TCP syslog（要可靠就选它，断线自动重连）
+PLAITCODE_AUDIT_SINK=syslog+tcp://siem.internal:1514
+
+# 通用 webhook（Splunk HEC / Datadog / 自建网关都能收）
+PLAITCODE_AUDIT_SINK=https://siem.example.com/ingest
+
+# OpenTelemetry（经 OTel Collector 接任何后端）
+PLAITCODE_AUDIT_SINK=otlp+http://collector:4318/v1/logs
+```
+
+外送一律 **fire-and-forget**：日志平台挂了不影响中继，失败不重试、不排队——
+完整性由本地 JSONL 保证，外送只是为了集中检索。OTLP 的 payload 是标准
+`resourceLogs → scopeLogs → logRecords`，`timeUnixNano` 取自审计行的 `ts`。
+
 ### 企业策略（`policy.json`）
 
 放在工作区 `.plaitcode/policy.json`，或用 MDM / 仓库模板统一下发：
@@ -130,7 +152,7 @@ curl -s $BASE/v1/admin/state -H "x-plaitcode-admin: $ADMIN"
 | **组织 / 团队 / 成员 / 设备 / 角色** | ✅ 已完成 | 一人多设备、一设备多频道；设备令牌只存哈希；可吊销 |
 | **SSO（OIDC / SAML）** | ⬜ 未开始 | 需要客户提供 IdP（Azure AD / Okta / 飞书 / 企业微信） |
 | SCIM 自动开户销户 | ⬜ 未开始 | 依赖 SSO |
-| 审计导出到 SIEM | 🟡 半成品 | JSONL 已经是标准的可采集格式，接 OTLP/Syslog 是一层薄封装 |
+| 审计导出到 SIEM | ✅ 已完成 | `PLAITCODE_AUDIT_SINK`：syslog(UDP/TCP) / webhook / OTLP |
 | 境内节点 + 备案 | ⬜ 待启动 | **流程 1–3 周，建议尽早开始**，不占开发资源 |
 | 配额与计量 | ⬜ 未开始 | 按席位 / 设备 / 消息量；需要先有组织模型 |
 

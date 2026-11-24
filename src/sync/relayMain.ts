@@ -7,6 +7,8 @@
 
 import { createRelayServer } from './relayServer';
 import { emptyIdentity, loadIdentity } from './relayIdentity';
+import { createSink, parseSink } from './relayAuditSink';
+import { hostname as osHostname } from 'node:os';
 
 async function main(): Promise<void> {
   const port = Number(process.env.PLAITCODE_PORT ?? 8787);
@@ -29,6 +31,11 @@ async function main(): Promise<void> {
     if (!adminToken) console.log('[relay] 警告：没设 PLAITCODE_ADMIN_TOKEN，管理接口不可用');
   }
 
+  /* 审计外送：`PLAITCODE_AUDIT_SINK=syslog://host:514 | https://siem/ingest | otlp+http://collector/v1/logs` */
+  const sinkSpec = parseSink(process.env.PLAITCODE_AUDIT_SINK);
+  const externalSink = sinkSpec ? createSink(sinkSpec, { hostname: osHostname() }) : undefined;
+  if (sinkSpec) console.log(`[relay] 审计外送：${sinkSpec.kind} → ${sinkSpec.url.host}`);
+
   const handle = await createRelayServer({
     port: Number.isFinite(port) && port > 0 ? port : 8787,
     host,
@@ -37,7 +44,10 @@ async function main(): Promise<void> {
     ...(adminToken ? { adminToken } : {}),
     audit: {
       ...(auditPath && auditPath !== '-' ? { path: auditPath } : {}),
-      ...(auditToStdout ? { sink: (line: string) => console.log(`[audit] ${line}`) } : {}),
+      sink: ((line: string) => {
+        if (auditToStdout) console.log(`[audit] ${line}`);
+        externalSink?.send(line);
+      }),
       includeIp: process.env.PLAITCODE_AUDIT_IP !== '0',
       maxBytes: Number(process.env.PLAITCODE_AUDIT_MAX_BYTES ?? 20 * 1024 * 1024),
       keep: Number(process.env.PLAITCODE_AUDIT_KEEP ?? 5),
@@ -47,6 +57,7 @@ async function main(): Promise<void> {
   console.log(`[relay] ready on http://${host}:${handle.port}`);
   const shutdown = (signal: string): void => {
     console.log(`[relay] ${signal}，正在关闭`);
+    externalSink?.close();
     void handle.close().then(() => process.exit(0));
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));

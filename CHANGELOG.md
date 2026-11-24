@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.1（2026-11-24）
+
+### 审计外送：syslog / webhook / OTLP
+
+企业不用等我们对接日志平台，指一个地址就行：
+
+```bash
+PLAITCODE_AUDIT_SINK=syslog://10.0.0.5:514              # UDP syslog
+PLAITCODE_AUDIT_SINK=syslog+tcp://siem.internal:1514    # TCP syslog（断线自动重连）
+PLAITCODE_AUDIT_SINK=https://siem.example.com/ingest    # 通用 webhook（Splunk HEC / Datadog）
+PLAITCODE_AUDIT_SINK=otlp+http://collector:4318/v1/logs # OpenTelemetry
+```
+
+- **fire-and-forget**：日志平台挂了不影响中继，失败不重试、不排队——完整性由本地 JSONL 保证；
+- syslog 走 RFC5424（`<14>1 - <host> plaitcode-relay - AUDIT - <整行 JSON>`）；
+- OTLP 是标准 `resourceLogs → scopeLogs → logRecords`，`timeUnixNano` 取自审计行的 `ts`；
+- 新增 4 条单测：地址解析、webhook 收到原始 JSON、OTLP payload 结构与纳秒时间戳、UDP syslog 真收发。
+
 ## 0.6.0（2026-11-24）
 
 ### 企业身份层：组织 / 成员 / 设备 / 角色
