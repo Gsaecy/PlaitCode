@@ -220,6 +220,21 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    * 密钥存在 SecretStorage（不进 settings.json），中转只见到密文。
    */
   const relayUrl = (): string => setting('relay.url', '').trim();
+  /**
+   * 写中继地址。失败不往命令层抛（会变成「命令导致错误」的红色弹窗），
+   * 而是明确说清是哪一步坏了——0.7.2 就因为配置项没声明，用户只看到一句英文式报错。
+   */
+  const saveRelayUrl = async (url: string): Promise<boolean> => {
+    try {
+      await vscode.workspace.getConfiguration('plaitcode').update('relay.url', url, vscode.ConfigurationTarget.Global);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      output.warn(`[relay] 保存中继地址失败：${message}`);
+      void vscode.window.showWarningMessage(`没能保存中继地址（${message}）。频道当次可用，但重启后不会自动恢复。`);
+      return false;
+    }
+  };
   /** 手机要打开的地址：密钥放在 fragment，不会进服务器日志。 */
   const relayPhoneLink = (): string | undefined => {
     const url = relayUrl();
@@ -382,13 +397,15 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       }))?.trim();
       if (!url) return;
       const secret = newPairingSecret();
+      // 先把地址落盘再存密钥：任一步失败都不会留下"有密钥没地址"的半截状态
+      await saveRelayUrl(url);
       await context.secrets.store(relaySecretKey, secret);
-      await vscode.workspace.getConfiguration('plaitcode').update('relay.url', url, vscode.ConfigurationTarget.Global);
       startRelay(url, secret);
       refreshStatus();
       await vscode.env.clipboard.writeText(buildPairingText(url, secret));
+      const channel = deriveKeys(secret).channel;
       void vscode.window.showInformationMessage(
-        '频道已创建，配对信息已复制到剪贴板。在另一台设备上执行「PlaitCode: 加入跨网频道」并粘贴它。',
+        `频道已创建：${channel}\n（授权设备时用这个频道 ID）\n配对信息已复制到剪贴板，另一台设备用「PlaitCode: 加入跨网频道」粘贴它。`,
         '知道了',
       );
     }),
@@ -404,11 +421,13 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         void vscode.window.showWarningMessage('这段配对信息看不懂：应以 plaitcode://join 开头，并包含 u= 与 s=。');
         return;
       }
+      await saveRelayUrl(parsed.url);
       await context.secrets.store(relaySecretKey, parsed.secret);
-      await vscode.workspace.getConfiguration('plaitcode').update('relay.url', parsed.url, vscode.ConfigurationTarget.Global);
       startRelay(parsed.url, parsed.secret);
       refreshStatus();
-      void vscode.window.showInformationMessage(`已加入频道（${parsed.url}）。这台设备产生的需求会加密同步给频道内的其它设备。`);
+      void vscode.window.showInformationMessage(
+        `已加入频道 ${deriveKeys(parsed.secret).channel}（${parsed.url}）。这台设备产生的需求会加密同步给频道内的其它设备。`,
+      );
     }),
     vscode.commands.registerCommand('plaitcode.relay.share', async () => {
       const secret = await context.secrets.get(relaySecretKey);
@@ -423,7 +442,14 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     vscode.commands.registerCommand('plaitcode.relay.status', async () => {
       const state = relay?.status();
       if (!state) {
-        void vscode.window.showInformationMessage('还没有连接中继。用「PlaitCode: 新建跨网频道」开始。');
+        // 没有活动连接时，只要存过密钥就还能报出频道 ID —— 授权设备正需要它
+        const secret = await context.secrets.get(relaySecretKey);
+        const channel = secret ? deriveKeys(secret).channel : '';
+        void vscode.window.showInformationMessage(
+          channel
+            ? `中继未连接。频道 ${channel}（授权设备时用这个 ID）\n地址：${relayUrl() || '（没保存）'}\n用「新建 / 加入跨网频道」重新连接。`
+            : '还没有连接中继。用「PlaitCode: 新建跨网频道」开始。',
+        );
         return;
       }
       void vscode.window.showInformationMessage(
