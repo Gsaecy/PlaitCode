@@ -332,3 +332,25 @@ test('没连任何通道时，发需求必须明说「没有同步到任何其�
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('再点一次「连接另一台设备」不会把自己当主机连上去', async () => {
+  const { service, dir } = await makeService(winPeer);
+  const port = 48_331;
+  try {
+    const first = await service.startHub(port);
+    assert.equal(first.ok, true, first.message);
+
+    /*
+     * 用户就是这么操作的：两台都点了，或在同一台又点了一次。
+     * 修之前这里会变成 `peer` 并「加入 http://<本机地址>:47821」——
+     * 界面提示已连上，实际一台都没连。
+     */
+    const again = await service.autoConnect(port);
+    assert.equal(again.role, 'hub', `不该自己加入自己（返回 ${again.role}：${again.message}）`);
+    assert.deepEqual(service.remotePeers(), [], '没有第二台设备时对端清单必须为空');
+    assert.equal(service.state().address, `:${port}`, '仍应作为主机待命');
+  } finally {
+    service.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

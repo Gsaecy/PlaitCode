@@ -214,6 +214,13 @@ function broadcastTargets(): string[] {
   return ['255.255.255.255', ...subnetBroadcasts()];
 }
 
+/** 这个地址是不是本机自己的（用来避开「自己加入自己」）。 */
+function isOwnAddress(value: string): boolean {
+  if (!value) return false;
+  if (value === '127.0.0.1' || value === 'localhost' || value === '::1') return true;
+  return lanAddresses().includes(value);
+}
+
 export class LanSyncService implements Disposable {
   private server?: Server;
   private udp?: UdpSocket;
@@ -240,6 +247,8 @@ export class LanSyncService implements Disposable {
   private lastRole: 'hub' | 'peer' = 'hub';
   private lastHub = '';
   private lastPort = 0;
+  /** 正在让位给另一台主机：避免重复触发。 */
+  private yielding = false;
   private readonly peers = new Map<string, { peer: SyncPeer; address: string }>();
   private disposed = false;
   private announceTimer?: NodeJS.Timeout;
@@ -870,10 +879,50 @@ export class LanSyncService implements Disposable {
     udp.on('message', (buffer, remote) => {
       const text = buffer.toString('utf8');
       if (text === DISCOVER_MAGIC) {
-        // 有人在找主机：把自己的地址回过去。
-        const payload = JSON.stringify({ magic: HUB_MAGIC, port: this.port, addresses: lanAddresses() });
+        /*
+         * 有人在找主机：把自己的地址回过去。
+         *
+         * 但**自己发的那一条不回**：UDP 广播会回环到本机，回了就成了
+         * 「本机回复本机」，加入方拿到的会是自己的地址 —— 那正是
+         * 「已加入主机 192.168.0.3」却两台都没连上的原因。
+         */
+        if (isOwnAddress(remote.address)) return;
+        const payload = JSON.stringify({ magic: HUB_MAGIC, peer: this.bridge.peer().id, port: this.port, addresses: lanAddresses() });
         udp.send(payload, remote.port, remote.address);
+        return;
       }
+      /*
+       * 两台都点了按钮 → 两边都成了主机 → 谁也不连谁。
+       * 这是最容易踩的坑（用户就是这么操作的）。
+       *
+       * 所以听到别的主机广播时按设备 id 谦让：id 大的主动降为从机去加入对方。
+       * 只让一边让位，不会两边同时让步。
+       */
+      if (this.role !== 'hub' || this.yielding) return;
+      let other: { magic?: unknown; peer?: unknown; addresses?: unknown; port?: unknown } | undefined;
+      try {
+        other = JSON.parse(text) as typeof other;
+      } catch {
+        return;
+      }
+      if (other?.magic !== HUB_MAGIC || typeof other.peer !== 'string' || !other.peer) return;
+      if (other.peer === this.bridge.peer().id) return;
+      if (this.bridge.peer().id <= other.peer) return;
+      const address = Array.isArray(other.addresses)
+        ? other.addresses.find((item): item is string => typeof item === 'string' && Boolean(item) && !isOwnAddress(item))
+        : undefined;
+      if (!address) return;
+      const target = `http://${address}:${typeof other.port === 'number' ? other.port : this.configuredPort}`;
+      this.yielding = true;
+      this.bridge.log(`[sync] 发现另一台已经是主机（${address}），本机让位并加入`);
+      // 延后一拍：joinHub 会关掉当前这个发现 socket，不能在它自己的回调里直接关。
+      setTimeout(() => {
+        void this.joinHub(target, this.configuredPort).then((result) => {
+          this.yielding = false;
+          if (result.ok) this.bridge.onState?.();
+          else this.bridge.log(`[sync] 让位失败：${result.message}`, 'warn');
+        });
+      }, 0);
     });
     this.udp = udp;
     this.announceTimer = setInterval(() => {
@@ -901,7 +950,15 @@ export class LanSyncService implements Disposable {
         try {
           const parsed = JSON.parse(buffer.toString('utf8')) as { magic?: string; addresses?: unknown; port?: unknown };
           if (parsed.magic !== HUB_MAGIC || !Array.isArray(parsed.addresses)) return;
-          const address = parsed.addresses.find((item): item is string => typeof item === 'string' && Boolean(item));
+          /*
+           * 只认**别人的**地址。
+           *
+           * 本机如果同时也是主机，它的广播会绕回自己这里；不过滤的话就会
+           * 「自己加入自己」，界面显示连上了，实际一台都没连。
+           */
+          const address = parsed.addresses.find(
+            (item): item is string => typeof item === 'string' && Boolean(item) && !isOwnAddress(item),
+          );
           if (address) finish(`http://${address}:${typeof parsed.port === 'number' ? parsed.port : this.configuredPort}`);
         } catch {
           // 不是我们的包。
