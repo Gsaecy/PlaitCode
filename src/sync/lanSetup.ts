@@ -676,8 +676,18 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
           if (choice === '重新输入') await vscode.commands.executeCommand('hwchat.lanSync.joinGroup');
           return;
         }
-        await groupPanel.open();
+        /*
+         * 先报成功，再开窗口。
+         *
+         * 顺序反了的话，打开群窗口一旦抛异常，用户看到的是「出错」，
+         * 而实际上已经进群了 —— 那种误导比失败更糟。
+         */
         void vscode.window.showInformationMessage(result.message);
+        try {
+          await groupPanel.open();
+        } catch (error) {
+          output.warn(`[sync] 已进群，但打开团队群失败：${error instanceof Error ? error.message : String(error)}`);
+        }
       } catch (error) {
         const detail = error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error);
         output.error(`[sync] 加入群聊异常：${detail}`);

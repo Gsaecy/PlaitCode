@@ -452,6 +452,49 @@ test('填码进群：码对才进得来，同一设备重复加入不会变成�
   }
 });
 
+/**
+ * 真机路径：**不传地址，靠广播找到群**。
+ *
+ * 之前所有 joinGroup 测试都传了 address，等于绕过了广播发现 ——
+ * 而那正是用户实际用的路径。这条用真实 UDP 广播走一遍：
+ * 主机开群 → 成员只填码 → 必须能找到并进群。
+ */
+test('填码进群（走真实广播，不传地址）', async () => {
+  const DISCOVERY = 48_975;
+  const HUB_PORT = 49_321;
+  const PEER_PORT = 49_322;
+
+  const hub = await makeService(winPeer, { discoveryPort: DISCOVERY });
+  // 成员必须用同一个发现端口，否则互相听不到。
+  const peerDir = await mkdtemp(join(tmpdir(), 'hwchat-sync-'));
+  const peer = new LanSyncService(join(peerDir, 'state.json'), {
+    peer: () => macPeer,
+    runRequirement: async () => true,
+    runNote: async () => true,
+    writeLedger: async () => undefined,
+    writeTranscript: async () => undefined,
+    log: () => undefined,
+  }, { discoveryPort: DISCOVERY });
+  await peer.load();
+
+  try {
+    const started = await hub.service.startGroup(HUB_PORT);
+    assert.equal(started.ok, true, started.message);
+    const code = started.code ?? '';
+
+    // 只给码，不给地址 —— 全靠广播。
+    const joined = await peer.joinGroup(code, PEER_PORT);
+    assert.equal(joined.ok, true, `广播没能找到群：${joined.message}`);
+    assert.equal(peer.state().role, 'peer');
+    assert.equal(hub.service.remotePeers().length, 1, '主机必须看到 1 台成员');
+  } finally {
+    hub.service.dispose();
+    peer.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peerDir, { recursive: true, force: true });
+  }
+});
+
 test('手动填的地址只有 IP 时自动补端口，不会傻连 80', () => {
   assert.equal(normalizeHubAddress('192.168.0.3', 47821), 'http://192.168.0.3:47821');
   assert.equal(normalizeHubAddress('192.168.0.3:5000', 47821), 'http://192.168.0.3:5000', '显式端口不能被覆盖');

@@ -860,11 +860,18 @@ export class LanSyncService implements Disposable {
     if (!target) {
       this.role = 'off';
       this.stopListener();
-      this.bridge.log(`[sync] 加入群聊失败：广播里没有邀请码 ${wanted} 的群`, 'warn');
-      return {
-        ok: false,
-        message: `没找到邀请码 ${wanted} 的群聊。请确认另一台电脑已经点了「启动群聊」（并且还在等着），两台在同一个 WiFi。`,
-      };
+      /*
+       * 分清两种失败：
+       *  - 一个群都没听到 → 网络/防火墙/对方没开群；
+       *  - 听到了群但码不对 → 只是抄错了码。
+       * 混成一句「没找到」会让用户去查根本没问题的那一项。
+       */
+      const heard = [...new Set(this.lastHeard.map((item) => item.code).filter(Boolean))];
+      const detail = heard.length
+        ? `这台电脑听到了 ${heard.length} 个群（${heard.join('、')}），但没有一个和 ${wanted} 一致 —— 请核对另一台电脑状态栏上显示的邀请码。`
+        : '这台电脑没有听到任何群聊广播。请确认另一台已点「启动群聊」且还开着，两台在同一个 WiFi，并且没有被防火墙/代理拦掉局域网广播。';
+      this.bridge.log(`[sync] 加入群聊失败：${detail}`, 'warn');
+      return { ok: false, message: `加入失败：${detail}` };
     }
     this.bridge.log(`[sync] 加入群聊：找到 ${target}，正在配对`);
     return this.finishJoin(target, wanted);
@@ -1096,7 +1103,20 @@ export class LanSyncService implements Disposable {
         }
       }
       if (isAsk) {
-        const reply = JSON.stringify({ magic: HUB_MAGIC, peer: selfId, port: this.port, addresses: lanAddresses() });
+        /*
+         * 回复「我在这儿」时**必须带上邀请码**。
+         *
+         * 加入方是按码找群的（`discover(code)` 会丢掉码不对的回应），
+         * 这里漏了码，等于唯一的回应被自己过滤掉 —— 成员永远找不到群，
+         * 界面表现就是「填了码没反应」。
+         */
+        const reply = JSON.stringify({
+          magic: HUB_MAGIC,
+          peer: selfId,
+          code: this.inviteCode,
+          port: this.port,
+          addresses: lanAddresses(),
+        });
         udp.send(reply, remote.port, remote.address);
         return;
       }
@@ -1124,7 +1144,8 @@ export class LanSyncService implements Disposable {
     };
     // 先立刻喊一声：否则两台同时点按钮时要干等 15 秒才知道对方也是主机。
     announce();
-    this.announceTimer = setInterval(announce, 5_000);
+    // 3 秒一轮：比加入方的等待时间短，保证它总能在超时前听到一次。
+    this.announceTimer = setInterval(announce, 3_000);
     this.announceTimer.unref?.();
   }
 
@@ -1173,6 +1194,9 @@ export class LanSyncService implements Disposable {
     void udp;
   }
 
+  /** 最近一次找群时听到的广播（用来区分「没有群」和「有群但码不对」）。 */
+  private lastHeard: Array<{ code: string; peer: string }> = [];
+
   /**
    * 找主机。
    *
@@ -1181,6 +1205,7 @@ export class LanSyncService implements Disposable {
    * 不传码时保持旧行为（自动找任意一台主机），供「高级 → 手动连接」使用。
    */
   private async discover(expectedCode?: string): Promise<string> {
+    this.lastHeard = [];
     const udp = createSocket({ type: 'udp4', reuseAddr: true });
     return new Promise((resolve) => {
       let settled = false;
@@ -1192,8 +1217,8 @@ export class LanSyncService implements Disposable {
         try { udp.close(); } catch { /* 已关闭 */ }
         resolve(value);
       };
-      // 按码找可以多等一会儿：用户抄码需要时间，主机广播也要有时间轮到。
-      timers.push(setTimeout(() => finish(''), expectedCode ? 4_000 : 2_000));
+      // 按码找可以多等一会儿：用户抄码、主机广播、网络往返都要时间。
+      timers.push(setTimeout(() => finish(''), expectedCode ? 6_000 : 2_000));
       udp.on('error', () => finish(''));
       udp.on('message', (buffer) => {
         try {
@@ -1205,6 +1230,15 @@ export class LanSyncService implements Disposable {
             port?: unknown;
           };
           if (parsed.magic !== HUB_MAGIC || !Array.isArray(parsed.addresses)) return;
+          /*
+           * 记下听到过哪些群。
+           *
+           * 找不到时靠它区分两种情况：「这台电脑压根没听到任何群」和
+           * 「听到了群但码不对」—— 用户要做的事完全不同（查 WiFi / 重新抄码）。
+           */
+          if (typeof parsed.peer === 'string' && parsed.peer !== this.bridge.peer().id) {
+            this.lastHeard.push({ code: typeof parsed.code === 'string' ? parsed.code : '', peer: parsed.peer });
+          }
           // 码对不上就不是我要找的群。
           if (expectedCode && parsed.code !== expectedCode) return;
           /*
