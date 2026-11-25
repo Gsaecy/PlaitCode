@@ -42,6 +42,26 @@ One person, several machines (office PC + home PC). Two things were missing befo
 - **Project on the message**: the requirement says which project it targets, so a second machine
   at a different path still knows what it is about.
 
+## What's new in 0.7.x (the team group picks the project, you just talk)
+
+- **Both agents answer in the group**: a question posted by either device is answered by *both*
+  machines' agents, each with its own project and device facts. Previously only the sender answered,
+  so the other side looked like it was not in the group at all.
+- **Devices appear the moment they join**: the host machine used to keep showing "waiting for the
+  other device" until that device spoke first, because joining only updated memory and never
+  refreshed the UI.
+- **Pick the project by talking**: say `用 deepseek-hwchat` / `切到 personal-workstation` / `换成 plaitcode`
+  in the team group and that machine switches immediately; the other machine follows automatically
+  when it has the same project checked out.
+  No menu, no "select a project before starting the group" step.
+- **Default project = the folder you are editing**: a multi-root workspace no longer defaults to
+  `workspaceFolders[0]`, which was the main reason the two machines started on different projects
+  and were then blocked by the project gate.
+- **Chit-chat stays in the group**: questions and small talk are answered in the group only;
+  the main chat panel is untouched and no requirement is broadcast.
+- **Group answers carry project facts**: asking "which project are we on" now returns the real
+  project name, repository URL, path and member list.
+
 ## What's new in 0.6.x (cross-network collaboration + enterprise)
 
 ### Cross-network: your phone and your computers no longer need the same WiFi

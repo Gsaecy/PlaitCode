@@ -20,7 +20,7 @@ test('频道规则：只有 origin=group 才广播给对端', () => {
   // 广播（shareRequirement）必须发生在 origin === 'group' 分支里。
   const groupBranch = PANEL.indexOf("options?.origin === 'group'");
   assert.ok(groupBranch > 0, '必须显式区分群频道');
-  const broadcast = PANEL.indexOf('shareRequirement(content)', groupBranch);
+  const broadcast = PANEL.indexOf('shareRequirement(content', groupBranch);
   assert.ok(broadcast > groupBranch, '广播必须在群频道分支内');
 
   // 主对话（没有 origin）不应再广播：它只提醒一次「这条只发给了本机」。

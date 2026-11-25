@@ -67,11 +67,25 @@ export interface GroupIntentResult {
   reason: string;
 }
 
+export interface GroupChatContext {
+  /** 本机在做的项目名（文件夹名）。 */
+  projectName?: string;
+  /** 项目唯一 ID：GitHub 仓库地址。 */
+  projectRepo?: string;
+  /** 本机项目的绝对路径（agent 据此知道「项目在哪」）。 */
+  projectPath?: string;
+  /** 群里有几台设备、分别是谁。 */
+  members?: readonly string[];
+}
+
 /**
  * 直接在群里回一句（不跑工具、不动任何文件）。
  *
  * 这是「驻留群里的机器人」的核心体验：你问「1+1 等于几」，
  * 它就在群里答一句，而不是把它当任务开一轮。
+ *
+ * **必须带上项目上下文** —— 否则用户问「现在在哪个项目下」，
+ * agent 只能回答「我只知道自己运行在某个 IP 上」，等于没答。
  */
 export async function answerGroupChat(
   client: DeepSeekClient,
@@ -80,8 +94,17 @@ export async function answerGroupChat(
   signal: AbortSignal,
   recent: readonly string[] = [],
   deviceName = '',
+  context: GroupChatContext = {},
 ): Promise<string> {
   let content = '';
+  const facts = [
+    deviceName ? `你在设备「${deviceName}」上。` : '',
+    context.projectName ? `当前项目：${context.projectName}。` : '',
+    context.projectRepo ? `项目仓库：${context.projectRepo}（这是两台设备判断"同一个项目"的唯一依据）。` : '',
+    context.projectPath ? `本机项目目录：${context.projectPath}。` : '',
+    context.members?.length ? `群里的设备：${context.members.join('、')}。` : '',
+  ].filter(Boolean).join('\n');
+
   try {
     const result = await client.streamChat(
       { ...settings, temperature: 0.3, maxTokens: 400 },
@@ -89,11 +112,12 @@ export async function answerGroupChat(
         {
           role: 'system',
           content: [
-            'You are one of the coding agents sitting in a team chat with a non-technical client and another agent on a different computer.',
+            'You are one of the coding agents sitting in a team chat with a non-technical client and other agents on other computers.',
             'Answer ONLY what was asked, in the client\'s language, in 1-3 short sentences.',
-            'Do not describe tools, files, or plans. Do not ask for confirmation. Do not offer to change code.',
-            deviceName ? `Your device: ${deviceName}.` : '',
-            'If the message is small talk, reply briefly and naturally.',
+            'Use the facts below. Never claim you cannot see the project: the facts are given to you.',
+            'Do not describe tools or plans. Do not ask for confirmation. Do not offer to change code.',
+            'If asked to actually change something, say briefly that you will treat it as a task.',
+            facts ? `FACTS:\n${facts}` : '',
           ].filter(Boolean).join(' '),
         },
         {

@@ -1,0 +1,78 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import test from 'node:test';
+import { makeGroupMessage, parseSyncMessage, type SyncPeer } from '../sync/lanProtocol';
+
+/**
+ * 没跑完必须在群里说清并能继续 —— 但**正文只用 agent 自己说的话**。
+ *
+ * 用户 2026-11-24：
+ *  「任务没执行完，agent 停止了…都需要在团队群里说明，或者讨论，得到解答下阶段再继续」
+ *  「我看到的是程序或者提示词设置好的程序，而不是 agent 的智能输出输入和互相对话沟通」
+ *
+ * 所以：项目 / 用时 / 改动文件 / 被停止 → 结构化 `meta`；
+ * 选项 → 结构化 `options`；`body` 只放 agent 自己写的话。
+ */
+const PANEL = readFileSync('src/views/chatPanel.ts', 'utf8');
+
+const win: SyncPeer = { id: 'p-win', name: 'PC', platform: 'win32', project: 'app', version: 't' };
+
+test('没跑完时仍是 question（群里算「等你回复」，下一句能接上）', () => {
+  const index = PANEL.indexOf('private async postGroupOutcome');
+  assert.ok(index > 0);
+  const body = PANEL.slice(index, index + 3_000);
+  assert.match(body, /phase: 'question'/, '必须是 question');
+});
+
+test('没跑完：正文不再拼【需要你决定】/停在这里/请回一句就继续', () => {
+  const index = PANEL.indexOf('private async postGroupOutcome');
+  const body = PANEL.slice(index, index + 3_000);
+  assert.doesNotMatch(body, /【需要你决定】/, '不要再由程序起标题');
+  assert.doesNotMatch(body, /停在这里：/, '不要拼「停在这里」');
+  assert.doesNotMatch(body, /请回一句就继续/, '不要拼恢复方式，改成可点选项');
+});
+
+test('没跑完：选项与元信息走结构化字段', () => {
+  const index = PANEL.indexOf('private async postGroupOutcome');
+  const body = PANEL.slice(index, index + 3_000);
+  assert.match(body, /options: \['接着做', '换个做法', '让另一台先做'\]/, '选项要是数组');
+  assert.match(body, /stopped: true/, '要标出这一轮是被停止的');
+  assert.match(body, /seconds: elapsed/, '用时进 meta');
+  assert.match(body, /files: \[\.\.\.files\]/, '改动文件进 meta');
+});
+
+test('跑完：result + 正文是 agent 自己的结论', () => {
+  const index = PANEL.indexOf('private async postGroupOutcome');
+  const body = PANEL.slice(index, index + 3_000);
+  assert.match(body, /phase: 'result'/, '完成走 result');
+  assert.match(body, /body: lastText\.trim\(\)/, '正文用 agent 自己的话');
+  assert.doesNotMatch(body, /这台做完了/, '不要程序写结论');
+});
+
+test('协议过网保留 replyTo / options / meta', () => {
+  const built = makeGroupMessage(win, {
+    author: 'agent',
+    phase: 'question',
+    body: '导出要 CSV 还是 Excel？',
+    options: ['CSV', 'Excel'],
+    meta: { project: 'app', seconds: 12, files: ['a.ts'], stopped: true },
+  }, 10, 'seed')!;
+  assert.deepEqual(built.options, ['CSV', 'Excel']);
+  assert.equal(built.meta?.seconds, 12);
+
+  const parsed = parseSyncMessage(JSON.parse(JSON.stringify(built)));
+  assert.ok(parsed && parsed.kind === 'group');
+  assert.deepEqual(parsed.options, ['CSV', 'Excel'], '选项要过网');
+  assert.equal(parsed.meta?.stopped, true, '停止标记要过网');
+  assert.deepEqual(parsed.meta?.files, ['a.ts'], '改动文件要过网');
+});
+
+test('meta 不合法时不会把脏数据带进界面', () => {
+  const built = makeGroupMessage(win, {
+    author: 'agent',
+    phase: 'progress',
+    body: '在做',
+    meta: { seconds: -5, files: [''], project: '   ' },
+  }, 10, 'seed')!;
+  assert.equal(built.meta, undefined, '空/非法 meta 直接不要');
+});

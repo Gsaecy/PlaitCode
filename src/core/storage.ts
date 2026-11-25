@@ -24,7 +24,15 @@ const RECALL_HAYSTACK_LIMIT = 32 * 1024;
 import { isEmptyDraftConversation } from './conversationControls';
 import { createId, createOrderedId, previewText, shortTitle } from './ids';
 import { readJsonWithBackup, removeIfPresent, writeJsonAtomic } from './jsonFile';
-import { tryFileLock, withFileLock } from './fileLock';
+import { FileLockTimeoutError, tryFileLock, withFileLock } from './fileLock';
+
+/**
+ * 存档层的诊断输出。
+ *
+ * 不 import vscode（这个模块要能在纯 Node 里跑测试），由一个可选钩子接出去。
+ * 拿不到文件锁这类事只该出现在输出面板 / 扩展宿主日志里，**不该弹窗**。
+ */
+export const storageDiagnostics: { log?: (line: string) => void } = {};
 import {
   AgentTaskNode,
   AgentTaskStatus,
@@ -1836,26 +1844,60 @@ export class ConversationStorage {
 
   private async persistManifest(): Promise<void> {
     const snapshot = this.manifest;
-    await withFileLock(this.manifestLockPath, async () => {
-      const onDisk = await readJsonWithBackup<Manifest>(this.manifestPath);
-      const diskDeleted = await readJsonWithBackup<{ ids?: Record<string, number> }>(this.deletedPath);
-      // 必须是 Set：早先按时间戳做 Map 键，同一毫秒内删多条会互相覆盖。
-      const tombstones = new Set<string>();
-      for (const id of Object.keys(diskDeleted?.ids ?? {})) {
-        if (this.resurrected.has(id)) continue;
-        tombstones.add(id);
-      }
-      for (const id of this.deletedIds.keys()) tombstones.add(id);
-      const merged = mergeManifests(onDisk, snapshot, [...tombstones]);
-      await writeJsonAtomic(this.manifestPath, merged);
-      // 墓碑与 manifest 必须同一次写入语义：先清掉已落地条目的墓碑，再写回。
-      for (const summary of merged.conversations) this.deletedIds.delete(summary.id);
-      await writeJsonAtomic(this.deletedPath, {
-        ids: Object.fromEntries(this.deletedIds),
-      }, false).catch(() => undefined);
-      this.manifest = merged;
-      this.resurrected.clear();
-    });
+    try {
+      await withFileLock(this.manifestLockPath, async () => {
+        const onDisk = await readJsonWithBackup<Manifest>(this.manifestPath);
+        const diskDeleted = await readJsonWithBackup<{ ids?: Record<string, number> }>(this.deletedPath);
+        // 必须是 Set：早先按时间戳做 Map 键，同一毫秒内删多条会互相覆盖。
+        const tombstones = new Set<string>();
+        for (const id of Object.keys(diskDeleted?.ids ?? {})) {
+          if (this.resurrected.has(id)) continue;
+          tombstones.add(id);
+        }
+        for (const id of this.deletedIds.keys()) tombstones.add(id);
+        const merged = mergeManifests(onDisk, snapshot, [...tombstones]);
+        await writeJsonAtomic(this.manifestPath, merged);
+        // 墓碑与 manifest 必须同一次写入语义：先清掉已落地条目的墓碑，再写回。
+        for (const summary of merged.conversations) this.deletedIds.delete(summary.id);
+        await writeJsonAtomic(this.deletedPath, {
+          ids: Object.fromEntries(this.deletedIds),
+        }, false).catch(() => undefined);
+        this.manifest = merged;
+        this.resurrected.clear();
+      }, { timeoutMs: 15_000 });
+    } catch (error) {
+      /*
+       * 拿不到锁**不是致命错误**，更不该弹窗。
+       *
+       * 常见成因：另一个 VS Code 窗口（另一个扩展宿主）正在写同一份 manifest，
+       * 或上一个宿主被强杀留下了锁文件。这时内存里的状态是对的，只是还没落盘 ——
+       * 稍后重试就能写进去；把它抛给界面只会让用户看到一个看不懂的弹窗
+       * （用户实况：macOS 上「弹出提示，拿不到文件锁」）。
+       */
+      if (!(error instanceof FileLockTimeoutError)) throw error;
+      for (const line of [
+        `[storage] manifest 暂时写不进去（${error.lockPath}）：另一窗口/宿主可能正在写，稍后自动重试`,
+      ]) storageDiagnostics.log?.(line);
+      this.scheduleManifestRetry();
+    }
+  }
+
+  /** 拿不到锁时的后台重试：不阻塞调用方，也不无限重试。 */
+  private manifestRetryTimer?: ReturnType<typeof setTimeout>;
+  private manifestRetryCount = 0;
+  private scheduleManifestRetry(): void {
+    if (this.manifestRetryTimer) return;
+    if (this.manifestRetryCount >= 3) {
+      storageDiagnostics.log?.('[storage] manifest 连续 3 次写不进去，请关掉多余的 VS Code 窗口后重试');
+      return;
+    }
+    this.manifestRetryCount += 1;
+    this.manifestRetryTimer = setTimeout(() => {
+      this.manifestRetryTimer = undefined;
+      void this.enqueueWrite(() => this.persistManifest()).catch(() => undefined);
+    }, 1_500 * this.manifestRetryCount);
+    // 不要让定时器拖住进程退出（重建索引也只是重试，不是必须完成的收尾）。
+    this.manifestRetryTimer.unref?.();
   }
 
   private enqueueWrite<T = void>(task: () => Promise<T>): Promise<T> {

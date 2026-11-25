@@ -8,7 +8,7 @@ import { ToolExecutor, disposeAllToolExecutors } from './agent/toolExecutor';
 import { CleanupScheduler } from './core/cleanupScheduler';
 import { getApiKey, storeApiKey } from './core/apiKeys';
 import { describePermissionScope, formatPermissionScope, profileFor, readLegacyConversationControls, readSettings } from './core/settings';
-import { ConversationStorage } from './core/storage';
+import { ConversationStorage, storageDiagnostics } from './core/storage';
 import { revertApprovalBridge, showApprovalBridge } from './core/vscodeApprovals';
 import { DeepSeekClient } from './providers/deepseekClient';
 import { formatProbeReport, probeEndpoint } from './providers/netProbe';
@@ -40,6 +40,13 @@ let activeStorage: ConversationStorage | undefined;
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel('HWChat', { log: true });
+  /*
+   * 存档层的「写不进去」只进输出面板，不弹窗。
+   *
+   * 用户实况（macOS）：「弹出提示，拿不到文件锁」。开两个窗口时这是正常竞争，
+   * 不该打断用户；真卡住了，输出面板里能看到具体是哪把锁。
+   */
+  storageDiagnostics.log = (line) => output.warn(line);
   const storage = new ConversationStorage(join(context.globalStorageUri.fsPath, 'history-v1'), {
     legacyControls: readLegacyConversationControls(),
   });

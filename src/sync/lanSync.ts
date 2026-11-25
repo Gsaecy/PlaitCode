@@ -19,10 +19,12 @@ import type { AddressInfo } from 'node:net';
 import { createHash, randomBytes } from 'node:crypto';
 import { createSocket, type Socket as UdpSocket } from 'node:dgram';
 import { hostname, networkInterfaces, platform as osPlatform } from 'node:os';
+import { readDeviceName } from './deviceInfo';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import {
   ALIGNMENT_FILE,
+  MAX_DIALOGUE_NOTES,
   MAX_GROUP_MESSAGES,
   MAX_MESSAGE_BYTES,
   MAX_NOTES,
@@ -30,6 +32,7 @@ import {
   SYNC_PROTOCOL_VERSION,
   buildLedger,
   describeSyncState,
+  deviceLabel,
   findDivergences,
   groupAgreement,
   makeGroupMessage,
@@ -38,6 +41,7 @@ import {
   makeRequirement,
   pairingMatches,
   parseSyncMessage,
+  questionOptions,
   renderGroupLine,
   renderGroupTranscript,
   renderLedger,
@@ -75,7 +79,13 @@ export interface LanSyncBridge {
   /** 本机这一轮的身份（名称、平台、项目、扩展版本）。 */
   peer(): SyncPeer;
   /** 收到对端需求时让面板开跑；返回 false 表示现在没法跑（面板在忙）。 */
-  runRequirement(requirement: SyncRequirement): Promise<boolean>;
+  /**
+   * 本机执行一条需求。
+   *
+   * `readOnly`：只读执行（能读能答、不能改文件）。项目不一致时用这一档 ——
+   * 既能照常回复，又不会去改另一个项目的代码。
+   */
+  runRequirement(requirement: SyncRequirement, options?: { readOnly?: boolean }): Promise<boolean>;
   /**
    * 收到对端的协作消息时交给本机 agent。
    *
@@ -140,11 +150,25 @@ export interface LanSyncBridge {
   /** 状态变化时刷新状态栏。 */
   onState?: () => void;
   /**
+   * 本机刚输入、还没判断完的一条群发言：面板要**立刻**把它画出来。
+   *
+   * 判断是不是任务要问一次模型（一两秒），如果等它回来再上屏，
+   * 用户发完话看着空荡荡的群会以为没发出去 —— 网络慢的那台尤其明显。
+   */
+  onGroupPending?(): void;
+  /**
+   * 另一台在群里说的、已被对方判定为「闲聊 / 问答」的一句话。
+   *
+   * 群里有两个 agent：甲方说「报数」，两台都该各自报自己的情况。
+   * 以前只有发消息那台在答，看起来就像对方根本没进群。
+   */
+  onRemoteGroupChat?(message: SyncGroupMessage): Promise<void> | void;
+  /**
    * 手机发来的一句话：走和群窗口完全相同的入口（判断「回答追问还是新需求」、广播、开跑）。
    *
    * 不在网络层重复实现这套判断 —— 两处判断迟早会不一致，那正是「手机说的和电脑说的不一样」的根因。
    */
-  onMobileMessage?(text: string): Promise<{ ok: boolean; message: string }>;
+  onMobileMessage?(text: string, assignee?: string): Promise<{ ok: boolean; message: string }>;
   /** 手机上是否允许批准工具授权（用户可在设置里关掉，关掉后手机只能看和说话）。 */
   canApproveFromPhone?(): boolean;
   /**
@@ -170,9 +194,12 @@ export interface LanSyncBridge {
    * 返回一句给人看的结果（手机上会显示）。
    */
   onRemoteControl?(control: {
-    action: 'preset' | 'steps' | 'stop' | 'state';
+    action: 'preset' | 'steps' | 'stop' | 'state' | 'project' | 'stopGroup';
     preset?: RemotePreset;
     steps?: number;
+    /** `project` 用：要切到的项目名与仓库地址（名字来自本机项目列表）。 */
+    project?: string;
+    repo?: string;
   }): Promise<{ ok: boolean; message: string }>;
   /** 向频道广播「本机当前的权限档位 / 步数 / 是否在跑」，手机据此显示真实状态。 */
   onBroadcastControl?(state: { preset: RemotePreset; steps: number; running: boolean }): void;
@@ -198,6 +225,14 @@ interface PersistedState {
   role?: 'hub' | 'peer';
   hub?: string;
   port?: number;
+  /**
+   * 本机选定的协作项目（文件夹名）与它的仓库地址。
+   *
+   * **必须落盘**：以前这两个只在内存里，`persist()` 不写、`load()` 也不读 ——
+   * 于是「换项目」看起来点了没反应（重载/重开窗口就回到默认）。
+   */
+  collabProject?: string;
+  collabRepo?: string;
   /**
    * 本机群的邀请码。
    *
@@ -404,6 +439,17 @@ export class LanSyncService implements Disposable {
   /** 本机参与协作的项目的仓库地址（项目唯一 ID）。 */
   private collabRepo = '';
   /**
+   * 刚发出去、还没判定完的一条群发言（只在本机显示，不广播）。
+   *
+   * 判断「这是闲聊还是任务」要问一次模型，通常一两秒。这段时间里用户的
+   * 话必须已经在群窗口里，否则会以为没发出去。
+   */
+  private pendingGroup?: { body: string; at: number };
+  /** 「发送中」的兜底计时器：中途抛错也不让它一直挂在群里。 */
+  private pendingTimer?: NodeJS.Timeout;
+  /** 最近若干条处置轨迹：谁发的、本机有没有作答。核对面板直接看这个。 */
+  private traces: string[] = [];
+  /**
    * UDP 发现端口（固定，不随 HTTP 端口变化）。
    * 可注入只是为了让测试与真实运行中的实例隔离；生产永远用 `DISCOVERY_PORT`。
    */
@@ -455,9 +501,13 @@ export class LanSyncService implements Disposable {
       this.lastHub = typeof parsed.hub === 'string' ? parsed.hub : '';
       this.lastPort = typeof parsed.port === 'number' && parsed.port > 0 ? parsed.port : 0;
     this.inviteCode = typeof parsed.inviteCode === 'string' ? parsed.inviteCode : '';
+    this.collabProject = typeof parsed.collabProject === 'string' ? parsed.collabProject.slice(0, 80) : '';
+    this.collabRepo = normalizeRepoUrl(typeof parsed.collabRepo === 'string' ? parsed.collabRepo : '');
     } catch {
       // 第一次运行没有文件，正常。
     }
+    // 读回来之后先自愈：历史版本可能把仓库地址存成了项目名。
+    this.repairCollabTarget();
     if (!this.code) {
       this.code = randomBytes(4).toString('hex').toUpperCase().replace(/(.{4})(?!$)/, '$1-');
       await this.persist();
@@ -476,6 +526,8 @@ export class LanSyncService implements Disposable {
       hub: this.lastHub,
       port: this.lastPort,
       ...(this.inviteCode ? { inviteCode: this.inviteCode } : {}),
+      ...(this.collabProject ? { collabProject: this.collabProject } : {}),
+      ...(this.collabRepo ? { collabRepo: this.collabRepo } : {}),
     };
     try {
       await mkdir(dirname(this.storagePath), { recursive: true });
@@ -559,7 +611,29 @@ export class LanSyncService implements Disposable {
 
   /** 本机身份（面板拼「按本机平台做等价实现」时用）。 */
   localPeer(): SyncPeer {
-    return this.bridge.peer();
+    const base = this.bridge.peer();
+    /*
+     * 群里说一句「用 xxx 项目」就能切项目，这一步必须**立刻**体现在对外身份上，
+     * 否则对端要等到下次改设置才发现项目变了。
+     */
+    return {
+      ...base,
+      ...(this.collabProject ? { project: this.collabProject } : {}),
+      ...(this.collabRepo ? { repo: this.collabRepo } : {}),
+      ...(this.ownHost() ? { host: this.ownHost() } : {}),
+    };
+  }
+
+  /**
+   * 本机局域网 IP（只用于「同名设备分不清」时显示）。
+   *
+   * 枚举网卡不便宜，缓存一次；地址变了（换 WiFi）由下次 reload 重新取，
+   * 这一项只影响显示，不影响任何连接逻辑。
+   */
+  private ownHostCache?: string;
+  private ownHost(): string {
+    if (this.ownHostCache === undefined) this.ownHostCache = lanAddresses()[0] ?? '';
+    return this.ownHostCache;
   }
 
   /**
@@ -577,7 +651,7 @@ export class LanSyncService implements Disposable {
       return;
     }
     if (message.kind === 'control') {
-      await this.ingestRelayControl(message);
+      await this.ingestRelayControl(message, 'relay');
       return;
     }
     /*
@@ -614,14 +688,78 @@ export class LanSyncService implements Disposable {
    * 只接受「允许手机批准授权」开启时的指令：这是同一条信任边界的延伸，
    * 关掉后手机只能看和说话，不能动电脑上的权限。
    */
-  private async ingestRelayControl(message: SyncControlMessage): Promise<void> {
+  private async ingestRelayControl(message: SyncControlMessage, via: 'lan' | 'relay' = 'lan'): Promise<void> {
     if (message.from.id === this.bridge.peer().id) return;
-    if (message.action === 'state') {
-      /* 手机在问「你现在是什么设置」：直接把真实状态广播回去。 */
-      if (this.bridge.canApproveFromPhone?.() ?? false) {
-        const result = await this.bridge.onRemoteControl?.({ action: 'state' });
-        if (result) this.bridge.log(`[relay] 已回复手机的状态查询：${result.message}`);
+    /*
+     * 两种来源，边界不同：
+     *
+     * - **同群的可信设备**（对方那台电脑）：可以让我切项目、可以问我的状态；
+     *   但**不能**改我的权限档位 / 步数 / 中止任务 —— 那是安全边界，只留给本机和手机授权。
+     * - **手机**：要 `canApproveFromPhone()` 才允许动权限。
+     *
+     * 以前这里一律要求"允许手机操作"，于是另一台电脑让我切项目永远被忽略 ——
+     * 用户看到的正是「切换无效」。
+     */
+    const fromTrustedDevice = this.approved.has(message.from.id);
+    if (message.action === 'project') {
+      if (!fromTrustedDevice) {
+        this.bridge.log(`[sync] 收到远程切项目，但来源设备未被信任，已忽略`, 'warn');
+        return;
       }
+      const apply = this.bridge.onRemoteControl;
+      if (!apply) return;
+      try {
+        const result = await apply({
+          action: 'project',
+          ...(message.project ? { project: message.project } : {}),
+          ...(message.repo ? { repo: message.repo } : {}),
+        });
+        this.bridge.log(`[sync] 远程切项目：${result.message}`);
+      } catch (error) {
+        this.bridge.log(`[sync] 远程切项目失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+      }
+      return;
+    }
+    if (message.action === 'state') {
+      /* 对方在问「你现在是什么设置」：直接把真实状态广播回去。 */
+      if (fromTrustedDevice || (this.bridge.canApproveFromPhone?.() ?? false)) {
+        const result = await this.bridge.onRemoteControl?.({ action: 'state' });
+        if (result) this.bridge.log(`[relay] 已回复状态查询：${result.message}`);
+      }
+      return;
+    }
+    if (message.action === 'stopGroup') {
+      /*
+       * 甲方在团队群点了「停止执行」：**群里每一台都要停**。
+       *
+       * 只认可信设备（同群已配对的那台）：这是"让我的 agent 停手"，
+       * 不是提权操作，所以不要求「允许手机操作」那道理边界；
+       * 但未配对的来源一律忽略，免得局域网里谁都能按停。
+       *
+       * 停完**不再补一条群消息**：这一轮被中止后，`postGroupOutcome` 会用
+       * 「【需要你决定】这台这一轮没跑完（被停止…）」把停在哪、怎么继续说清楚，
+       * 那是精确的一条；再补一条「已收到」只会把看板从「等你回复」拉回「进行中」。
+       */
+      /*
+       * 谁有资格按停：
+       *  - 局域网：必须是本群已配对的那台（`approved`，见 /pair 与自动记地址）；
+       *  - 中继：通道本身是设备令牌 + 加密的，另一台**电脑**可以直接按停；
+       *    手机（relayPage，平台字段过网后被归一成 linux，只能按版本/名字认）
+       *    要过「允许手机操作」那道开关，和改权限保持一致。
+       * 未配对的局域网来源一律忽略，免得同一个 WiFi 里谁都能按停。
+       */
+      const fromPhone = message.from.version === 'web' || message.from.name.includes('手机');
+      const stopTrusted = fromTrustedDevice
+        || (via === 'relay' && !fromPhone)
+        || (this.bridge.canApproveFromPhone?.() ?? false);
+      if (!stopTrusted) {
+        this.bridge.log('[sync] 收到群的停止执行，但来源设备未被信任，已忽略', 'warn');
+        return;
+      }
+      const result = await this.bridge.onRemoteControl?.({ action: 'stopGroup' });
+      if (!result) return;
+      this.bridge.log(`[sync] 群的停止执行：${result.message}`);
+      this.trace(`收到 ${message.from.name} 的停止执行：${result.message}`);
       return;
     }
     if (!(this.bridge.canApproveFromPhone?.() ?? false)) {
@@ -635,6 +773,8 @@ export class LanSyncService implements Disposable {
         action: message.action,
         ...(message.preset ? { preset: message.preset } : {}),
         ...(message.steps !== undefined ? { steps: message.steps } : {}),
+        ...(message.project ? { project: message.project } : {}),
+        ...(message.repo ? { repo: message.repo } : {}),
       });
       this.bridge.log(`[relay] 远程控制 ${message.action}：${result.message}`);
     } catch (error) {
@@ -927,6 +1067,47 @@ export class LanSyncService implements Disposable {
     return this.collabProject;
   }
 
+  /**
+   * 这个群在做的项目名 —— **对外唯一口径**。
+   *
+   * 以前「群里显示的」「agent 回复里标的」「需求带的」各用一套：
+   * 有的用 `collabProject`、有的用 `bridge.peer().project`（当前打开的文件夹），
+   * 于是群里写 personal-workstation、agent 却说 deepseek-hwchat。
+   * 现在只有这一个函数，全部调用它。
+   */
+  activeProjectName(): string {
+    return this.collabProject || this.bridge.peer().project || '';
+  }
+
+  /**
+   * 自愈存坏的项目选择。
+   *
+   * 真实坏数据：`github.com/gsaecy/plaitcode` 被当成项目名存了下来，
+   * 界面于是显示成仓库地址，看起来「切换错了」。这里把它还原成文件夹名；
+   * 还原不出来就清空，宁可回到默认，也不要显示一个不存在的项目。
+   */
+  private repairCollabTarget(): void {
+    const projects = this.bridge.localProjects?.() ?? [];
+    const repos = this.bridge.localProjectRepos?.() ?? [];
+    const asRepo = normalizeRepoUrl(this.collabProject);
+    if (asRepo) {
+      const index = repos.findIndex((item) => normalizeRepoUrl(item) === asRepo);
+      this.collabProject = index >= 0 ? projects[index] ?? '' : '';
+      if (!this.collabRepo) this.collabRepo = asRepo;
+      this.bridge.log(`[sync] 修正存坏的项目名：仓库 ${asRepo} → 「${this.collabProject || '（默认）'}」`);
+    }
+    // 有仓库但没名字：按仓库找回本机对应的文件夹。
+    if (!this.collabProject && this.collabRepo) {
+      const index = repos.findIndex((item) => normalizeRepoUrl(item) === this.collabRepo);
+      if (index >= 0) this.collabProject = projects[index] ?? '';
+    }
+    // 名字不在本机文件夹里：清掉，别让界面显示一个不存在的项目。
+    if (this.collabProject && projects.length && !projects.includes(this.collabProject)) {
+      this.bridge.log(`[sync] 项目「${this.collabProject}」不在本机工作区，已清空选择`, 'warn');
+      this.collabProject = '';
+    }
+  }
+
   /** 本机协作项目的仓库地址（项目唯一 ID）。 */
   currentRepo(): string {
     return this.collabRepo || (this.bridge.localRepo?.() ?? '');
@@ -936,15 +1117,67 @@ export class LanSyncService implements Disposable {
    * 选定本机参与协作的项目。
    *
    * `repo` 是项目唯一 ID（仓库地址）；`name` 只是本地文件夹名，仅用于展示。
+   *
+   * **必须容忍传进来的是仓库地址。** 用户实况：让 Windows 切项目，「切换到这个项目」
+   * 那个按钮传的是 `info.required`，而它是仓库地址 —— 结果项目名被设成了
+   * `github.com/gsaecy/plaitcode`，界面看起来就像"切错了项目"（原来是 deepseek-hwchat）。
+   * 所以这里统一解析：仓库地址 → 本机对应文件夹名；解析不出来就别拿它当名字。
    */
   async setCollabProject(name: string, repo = ''): Promise<void> {
-    this.collabProject = name.trim().slice(0, 80);
-    this.collabRepo = normalizeRepoUrl(repo);
+    const raw = (name ?? '').trim().slice(0, 200);
+    const projects = this.bridge.localProjects?.() ?? [];
+    const repos = this.bridge.localProjectRepos?.() ?? [];
+    let resolvedName = raw;
+    let resolvedRepo = normalizeRepoUrl(repo);
+    const asRepo = normalizeRepoUrl(raw);
+    if (asRepo) {
+      // 传进来的是仓库地址：换成本机那个文件夹的名字（同一个仓库可能叫别的名）。
+      const index = repos.findIndex((item) => normalizeRepoUrl(item) === asRepo);
+      if (index < 0 && this.currentRepo() !== asRepo) {
+        /*
+         * 本机没有这个仓库：**不能**把协作项目设成它。
+         *
+         * 否则这台只是"登记"了一个自己没有的项目，界面看起来切过去了，
+         * 实际没有任何目录能改 —— 那正是「切换错了」的体感。
+         */
+        this.bridge.log(`[sync] 本机没有仓库 ${asRepo}，不切换项目`, 'warn');
+        if (this.role !== 'off') {
+          await this.postGroup({
+            author: 'agent',
+            phase: 'analysis',
+            body: `本机没有 ${asRepo} 这个项目，所以没有切换。需要先把它拉下来（git clone），我才能在这个项目上干活。`,
+          }).catch(() => undefined);
+        }
+        return;
+      }
+      resolvedName = index >= 0 ? projects[index] ?? '' : '';
+      if (!resolvedRepo) resolvedRepo = asRepo;
+    }
+    if (resolvedName && projects.length && !projects.includes(resolvedName)) {
+      // 名字既不是本机文件夹、也不是仓库：不认，保留原来的选择，避免"切到不存在的项目"。
+      this.bridge.log(`[sync] 忽略无法识别的项目「${raw}」（本机没有这个文件夹）`, 'warn');
+      return;
+    }
+    this.collabProject = resolvedName.slice(0, 80);
+    this.collabRepo = resolvedRepo;
     await this.persist();
     this.bridge.log(
-      `[sync] 协作项目设为「${this.collabProject || '（默认）'}」${this.collabRepo ? `（仓库 ${this.collabRepo}）` : ''}`,
+      `[sync] 协作项目设为「${this.collabProject || '（本机当前文件夹）'}」${this.collabRepo ? `（仓库 ${this.collabRepo}）` : ''}`,
     );
     this.bridge.onState?.();
+    /*
+     * **切了项目就在群里说一句。**
+     *
+     * 用户的实况：让 Windows 切项目，「它没回应」—— 只在右侧弹了通知或干脆没声音，
+     * 群里的人根本不知道发生了什么。现在不管从哪个入口切的，群里都会有回执。
+     */
+    if (this.role !== 'off') {
+      await this.postGroup({
+        author: 'agent',
+        phase: 'analysis',
+        body: `这台已切到「${this.activeProjectName() || '本机当前文件夹'}」${this.currentRepo() ? `，项目 ID：${this.currentRepo()}` : '（该文件夹未绑定 GitHub 仓库）'}。`,
+      }).catch(() => undefined);
+    }
   }
 
   /**
@@ -963,9 +1196,205 @@ export class LanSyncService implements Disposable {
     return this.localProjects().includes(repoOrName);
   }
 
+  /** 群里最近一条需求的号（回执拿不到自己的需求号时用它兜底）。 */
+  latestRequirementId(): string {
+    return this.requirements[this.requirements.length - 1]?.id ?? '';
+  }
+
+  /** 群里最近一条需求的标题（团队任务窗口显示「在做什么」）。 */
+  latestRequirementTitle(): string {
+    const last = this.requirements[this.requirements.length - 1];
+    return last?.title ?? '';
+  }
+
   /** 本机工作区里的项目名（面板展示 / 选择用）。 */
   localProjects(): string[] {
     return this.bridge.localProjects?.() ?? [];
+  }
+
+  /**
+   * 立刻把「我刚发的话」画到群窗口里（不等判定）。
+   *
+   * 只是本机显示：对方看到的是这条话**判定完之后的正式消息**，
+   * 两条内容一样，所以不会出现「我这边一条、对面一条不一样」。
+   */
+  beginPendingGroup(body: string): void {
+    const text = (body ?? '').trim();
+    if (!text) return;
+    this.pendingGroup = { body: text, at: Date.now() };
+    if (this.pendingTimer) clearTimeout(this.pendingTimer);
+    this.pendingTimer = setTimeout(() => this.endPendingGroup(), 30_000);
+    this.pendingTimer.unref?.();
+    this.bridge.onGroupPending?.();
+  }
+
+  /** 判定结束 / 正式消息已经进群：把临时那条收掉。 */
+  endPendingGroup(): void {
+    if (!this.pendingGroup) return;
+    this.clearPendingGroup();
+    this.bridge.onGroupPending?.();
+  }
+
+  /** 只清状态、不通知界面（正式消息马上就会触发一次刷新）。 */
+  private clearPendingGroup(): void {
+    this.pendingGroup = undefined;
+    if (this.pendingTimer) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = undefined;
+    }
+  }
+
+  /** 本机每个项目的仓库地址（与 `localProjects()` 同序）。 */
+  localProjectRepos(): string[] {
+    return this.bridge.localProjectRepos?.() ?? [];
+  }
+
+  /**
+   * 探测每台设备：现在到底是谁、跑的是哪个版本、多久回。
+   *
+   * 这是「自查」的核心 —— 两台跑不同版本时行为必然不同，
+   * 以前只能靠猜「是不是没更新」，现在是直接问出来。
+   */
+  async probePeers(): Promise<PeerProbe[]> {
+    const targets = this.peerList().filter((entry) => entry.address);
+    return Promise.all(targets.map(async (entry): Promise<PeerProbe> => {
+      const started = Date.now();
+      try {
+        const text = await getRaw(entry.address, '/hwchat-sync/v1/ping', 3_000);
+        const parsed = JSON.parse(text) as { peer?: { version?: unknown }; protocol?: unknown };
+        return {
+          name: entry.peer.name,
+          address: entry.address,
+          ok: true,
+          ms: Date.now() - started,
+          version: typeof parsed.peer?.version === 'string' ? parsed.peer.version : '（旧版未上报）',
+          protocol: typeof parsed.protocol === 'number' ? parsed.protocol : 0,
+        };
+      } catch (error) {
+        return {
+          name: entry.peer.name,
+          address: entry.address,
+          ok: false,
+          ms: Date.now() - started,
+          version: '',
+          protocol: 0,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }));
+  }
+
+  /**
+   * 让群里**所有 agent** 停手（团队群窗口那颗「停止执行」）。
+   *
+   * 用户的要求：「团队群界面的停止执行，需要应用到群里的所有 agent，
+   * 而不是只应用到本设备的团队任务对话框」。以前那颗按钮只停本机，
+   * 另一台收到后毫无察觉，还在继续改文件 —— 甲方以为全都停了。
+   *
+   * 走 control 通道而不是群消息：群消息会被落成需求，
+   * 对端收到反而**再开跑一轮**，正好相反。
+   */
+  async broadcastStop(): Promise<{ ok: boolean; message: string }> {
+    const control: SyncControlMessage = {
+      kind: 'control',
+      id: `ctl-stopall-${this.bridge.peer().id.slice(0, 8)}-${Date.now().toString(36)}`,
+      from: this.localPeer(),
+      action: 'stopGroup',
+      at: Date.now(),
+    };
+    // 跨网那一路（中继）；没接中继时是空操作，不影响局域网。
+    void this.relayOut(control);
+    if (this.role === 'off') return { ok: true, message: '只有本机，已停。' };
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: control });
+    try {
+      if (this.role === 'hub') {
+        const targets = this.peerList().filter((entry) => entry.address);
+        const results = await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
+        const delivered = results.filter((result) => result.status === 'fulfilled').length;
+        if (!targets.length) return { ok: true, message: '只有本机在线，已停。' };
+        this.trace(`让 ${delivered}/${targets.length} 台设备停手`);
+        return {
+          ok: delivered > 0,
+          message: delivered === targets.length
+            ? `已通知群里 ${delivered} 台设备停手。`
+            : `已通知 ${delivered}/${targets.length} 台设备停手，其余没连上。`,
+        };
+      }
+      const response = await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', {
+        code: this.credential(),
+        port: this.port,
+        message: control,
+      }).catch(() => undefined);
+      this.trace(response?.ok ? '已让主机转发停止' : '停止指令没能交给主机');
+      return response?.ok
+        ? { ok: true, message: '已交给主机转发停止。' }
+        : { ok: false, message: '没连上主机，只有本机停了。' };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.bridge.log(`[sync] 广播停止失败：${reason}`, 'warn');
+      return { ok: false, message: `只有本机停了（通知失败：${reason}）。` };
+    }
+  }
+
+  /** 记一条处置轨迹（只留最近若干条，给核对面板看）。 */
+  trace(line: string): void {
+    this.traces = [...this.traces, `${new Date().toTimeString().slice(0, 8)} ${line}`].slice(-40);
+  }
+
+  /** 最近的处置轨迹：每条群消息到底被谁怎么处理了。 */
+  recentTraces(limit = 20): string[] {
+    return this.traces.slice(-Math.max(1, limit));
+  }
+
+  /**
+   * 让**另一台**设备切项目。
+   *
+   * 用户的需求：「我需要每个设备都能切换项目，而不是只能切换本设备的项目」。
+   * 走 control 通道直达那台设备，不动本机选择；对方收到后会自己切，
+   * 并在群里回执（所以发起方不用猜成没成）。
+   */
+  async requestProjectSwitch(
+    targetId: string,
+    project: string,
+    repo = '',
+  ): Promise<{ ok: boolean; message: string }> {
+    const text = (project ?? '').trim();
+    if (!targetId || !text) return { ok: false, message: '没指定设备或项目。' };
+    if (this.role === 'off') return { ok: false, message: '现在没有群，无法控制其它设备。' };
+    const control: SyncControlMessage = {
+      kind: 'control',
+      id: `ctl-project-${this.bridge.peer().id.slice(0, 8)}-${Date.now().toString(36)}`,
+      from: this.localPeer(),
+      action: 'project',
+      project: text,
+      ...(normalizeRepoUrl(repo) ? { repo: normalizeRepoUrl(repo) } : {}),
+      at: Date.now(),
+    };
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: control });
+    /*
+     * 局域网里可能有多台：找到那台的地址直接投递。
+     * 找不到地址就退回主机转发（从机只能经过主机）。
+     */
+    const entry = this.peerList().find((item) => item.peer.id === targetId && item.address);
+    try {
+      if (entry?.address) {
+        await postRaw(entry.address, '/hwchat-sync/v1/deliver', payload);
+        return { ok: true, message: `已让「${entry.peer.name}」切到「${text}」。` };
+      }
+      if (this.role === 'peer') {
+        await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', {
+          code: this.credential(),
+          port: this.port,
+          message: control,
+        });
+        return { ok: true, message: `已把「切到 ${text}」转给主机。` };
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.bridge.log(`[sync] 远程切项目失败：${reason}`, 'warn');
+      return { ok: false, message: `没能让那台切项目：${reason}` };
+    }
+    return { ok: false, message: '没有找到那台设备的地址。' };
   }
 
   /** 本机群聊的邀请码；不是主机时为空串。 */
@@ -1749,7 +2178,7 @@ export class LanSyncService implements Disposable {
     const existing = this.peers.get(peer.id);
     const address = hasPort ? `http://${ip}:${declaredPort}` : (existing?.address ?? '');
     const isNew = !existing;
-    this.peers.set(peer.id, { peer, address });
+    this.peers.set(peer.id, { peer: withHost(peer, ip), address });
     // 只学过地址就够放行了；第一次见面仍然要走 /pair 或用户点「允许」。
     if (!this.approved.has(peer.id)) this.approved.add(peer.id);
     await this.persist();
@@ -1777,11 +2206,29 @@ export class LanSyncService implements Disposable {
   }
 
   /** 对端设备清单（「同步核对」要让人看见到底连上了谁）。 */
-  remotePeers(): Array<{ name: string; platform: string; address: string }> {
+  remotePeers(): Array<{ id: string; name: string; platform: string; address: string; version: string; projects: string[]; projectRepos: string[] }> {
     return this.peerList().map((entry) => ({
+      id: entry.peer.id,
       name: entry.peer.name,
       platform: entry.peer.platform,
       address: entry.address,
+      version: entry.peer.version ?? '',
+      projects: entry.peer.projects ? [...entry.peer.projects] : [],
+      projectRepos: entry.peer.projectRepos ? [...entry.peer.projectRepos] : [],
+    }));
+  }
+
+  /** 某台对端设备的完整信息（项目名 / 仓库 / 账号）。 */
+  peerDetail(name: string): SyncPeer | undefined {
+    return this.peerList().find((entry) => entry.peer.name === name)?.peer;
+  }
+
+  /** 群内所有设备分别在做什么项目（用于「项目对不上」的提示）。 */
+  peerProjects(): Array<{ name: string; project: string; repo: string }> {
+    return this.peerList().map((entry) => ({
+      name: entry.peer.name,
+      project: entry.peer.project,
+      repo: entry.peer.repo ?? '',
     }));
   }
 
@@ -1803,7 +2250,7 @@ export class LanSyncService implements Disposable {
     };
     try {
       if (request.method === 'GET' && route === '/hwchat-sync/v1/ping') {
-        json(200, { ok: true, protocol: SYNC_PROTOCOL_VERSION, peer: this.bridge.peer(), role: this.role });
+        json(200, { ok: true, protocol: SYNC_PROTOCOL_VERSION, peer: this.localPeer(), role: this.role });
         return;
       }
       /*
@@ -1899,15 +2346,23 @@ export class LanSyncService implements Disposable {
           }
           const alreadyIn = this.peers.has(message.from.id);
           already = alreadyIn;
-          this.peers.set(message.from.id, { peer: message.from, address });
+          this.peers.set(message.from.id, { peer: withHost(message.from, ipOf(address)), address });
           if (alreadyIn) this.bridge.log(`[sync] ${message.from.name} 已在群里，重复加入不重复计数`);
           else this.bridge.log(`[sync] 设备加入：${message.from.name}（${message.from.project}）${address ? ` → ${address}` : ''}`);
+          /*
+           * 立刻刷新界面。
+           *
+           * 以前这里只改了内存里的 peers，没通知任何人 —— 于是**主机端**一直显示
+           * 「等对方加入」，直到对方先往群里说一句话才刷新。
+           * 加入方那边早就显示「2 台设备」，两台看起来完全不一致。
+           */
+          this.bridge.onState?.();
         }
         json(200, {
           ok: true,
           already,
           peers: this.peerList(),
-          hub: { peer: this.bridge.peer(), address: this.selfAddress(request.socket.remoteAddress) },
+          hub: { peer: this.localPeer(), address: this.selfAddress(request.socket.remoteAddress) },
         });
         return;
       }
@@ -2077,7 +2532,8 @@ export class LanSyncService implements Disposable {
         send(503, { ok: false, error: '本机还没准备好接收手机消息，请重试。' });
         return;
       }
-      const result = await this.bridge.onMobileMessage(text.slice(0, 4_000));
+      const assignee = typeof parsed.assignee === 'string' ? parsed.assignee.trim().slice(0, 64) : '';
+      const result = await this.bridge.onMobileMessage(text.slice(0, 4_000), assignee || undefined);
       send(result.ok ? 200 : 409, result);
       return;
     }
@@ -2124,6 +2580,25 @@ export class LanSyncService implements Disposable {
         // 本机执行（除发起方自己）。
         if (message.from.id !== this.bridge.peer().id) {
           /*
+           * 指派检查必须在项目门禁之前。
+           *
+           * 甲方在群里说「让 macos 那边 agent 做」，这条需求就只该那台执行。
+           * 以前这里没有这个判断，于是两台都跑同一份活 ——
+           * 用户的实况：「我让 macos 执行任务，Windows 这边也跑起来了」。
+           */
+          if (message.assignee && message.assignee !== this.localPeer().id) {
+            this.bridge.log(
+              `[sync] 需求 ${message.id} 指派给 ${message.assignee}，本机只记录不执行`,
+            );
+            void this.postGroup({
+              author: 'agent',
+              phase: 'progress',
+              body: `这条活由另一台执行，这台只记录、不动手。`,
+              requirementId: message.id,
+            }).catch(() => undefined);
+            return;
+          }
+          /*
            * 项目门禁：**按仓库地址判断**，文件夹名不算数。
            *
            * 用户要求：项目唯一 ID 就是 GitHub 仓库地址。同一个仓库在不同设备上
@@ -2134,17 +2609,27 @@ export class LanSyncService implements Disposable {
           const myRepo = this.currentRepo();
           const sameRepo = Boolean(theirRepo) && Boolean(myRepo) && theirRepo === myRepo;
           const required = theirRepo || message.project || message.from.project || '';
-          const local = this.collabProject || this.bridge.peer().project;
+          const local = this.activeProjectName();
           const mismatch = theirRepo
             ? !sameRepo && !this.hasProject(theirRepo)
             : Boolean(required) && Boolean(local) && required !== local && !this.hasProject(required);
           if (mismatch) {
+            /*
+             * 项目不一致**不再拒绝**，改成只读执行。
+             *
+             * 用户的要求：「不管是不是在一个项目，要都能回复」。以前这里直接 return，
+             * 群里只剩一句「项目不一致，所以我没有执行」—— 连「报数」这种不用改代码的
+             * 话也被挡住了。现在照常跑一轮，但收窄成只读：能读、能答、能查，不能写。
+             */
             const mine = this.bridge.localLogin?.() ?? '';
             const theirs = message.from.login ?? '';
-            this.bridge.log(
-              `[sync] 项目不一致（对方仓库「${theirRepo || required}」/ 本机「${myRepo || local}」），先追问，不执行需求 ${message.id}`,
-              'warn',
-            );
+            this.bridge.log(`[sync] 项目不一致（对方 ${theirRepo || required}），本轮按只读执行 ${message.id}`, 'warn');
+            void this.postGroup({
+              author: 'agent',
+              phase: 'progress',
+              body: `两台做的不是同一个项目（对方 ${theirRepo || required}，本机 ${myRepo || local}），这台会照常回答，但这一轮只读、不改文件。`,
+              requirementId: message.id,
+            }).catch(() => undefined);
             this.bridge.onProjectMismatch?.({
               required: theirRepo || required,
               local: myRepo || local,
@@ -2152,6 +2637,13 @@ export class LanSyncService implements Disposable {
               sameAccount: Boolean(mine) && mine === theirs,
               hasLocalCandidate: false,
             });
+            const readonlyOutcome = await this.runNewest(message, async (item) => this.bridge
+              .runRequirement(item, { readOnly: true })
+              .catch((error: unknown) => {
+                this.bridge.log(`[sync] 只读执行失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+                return false;
+              }));
+            if (readonlyOutcome === 'busy') this.bridge.log('[sync] 面板正忙，需求已记录，稍后可手动继续', 'warn');
             return;
           }
           const outcome = await this.runNewest(message, async (item) => this.bridge.runRequirement(item)
@@ -2171,6 +2663,11 @@ export class LanSyncService implements Disposable {
          */
         if (!this.group.some((item) => item.id === message.id)) {
           this.group = [...this.group, message].slice(-MAX_GROUP_MESSAGES);
+          if (message.from.id !== this.bridge.peer().id) {
+            this.trace(
+              `收到 ${message.from.name}：${message.author === 'user' ? '甲方' : '乙方'}·${message.phase}「${message.body.slice(0, 24)}」`,
+            );
+          }
           await this.persist();
           this.bridge.log(`[sync] 群消息：${renderGroupLine(message)}`);
           await this.bridge.onGroupMessage?.(message).catch(() => undefined);
@@ -2183,8 +2680,49 @@ export class LanSyncService implements Disposable {
            */
           if (message.author === 'user' && message.phase === 'answer' && message.from.id !== this.bridge.peer().id) {
             const requirement = this.requirementById(message.requirementId);
-            if (requirement && this.role !== 'off') {
+            /*
+             * 回答只回给**问话的那一台**（用户 2026-11-25：
+             * 「我回复的时候，agent 需要知道我在回复谁，只参考，不执行和自己无关的回复」）。
+             *
+             * 判据三层：消息自己的 `to` / 需求上的 `assignee` / 提问者的 id。
+             * 都不是本机 → 这一条对本机只是**参考**，记下来但不开跑。
+             */
+            const question = [...this.group].reverse()
+              .find((item) => item.requirementId === message.requirementId && item.phase === 'question');
+            const target = message.to || message.assignee || question?.from.id || requirement?.assignee || '';
+            if (target && target !== this.bridge.peer().id) {
+              this.trace(`甲方回答的是 ${target} 的追问，这台只参考不执行`);
+            } else if (requirement && this.role !== 'off') {
               await this.bridge.runRequirement(requirement).catch(() => false);
+            }
+          }
+          /*
+           * 甲方在群里问的一句（不是派活）：**两台 agent 都要答**。
+           *
+           * 以前只有发消息那台在答，另一台收到就只记下来 ——
+           * 用户看到的是「mac 说报数，Windows 的 agent 一声不响」，
+           * 像是对方根本没进群。报数这种事本来就该各报各的。
+           *
+           * 用发送方的判定结果（phase=analysis）当信号，接收方不用再问一次模型。
+           */
+          if (
+            message.author === 'user'
+            && message.phase === 'analysis'
+            && message.from.id !== this.bridge.peer().id
+          ) {
+            const chatHook = this.bridge.onRemoteGroupChat;
+            if (chatHook) {
+              /*
+               * **不等它答完**：答话要走一次模型，几秒到几十秒。
+               * 让 HTTP 响应干等着，对方那台发消息的人就会被自己的请求拖住。
+               */
+              void Promise.resolve(chatHook(message))
+                .then(() => this.trace(`已应答 ${message.from.name} 的提问`))
+                .catch((error: unknown) => {
+                  this.trace(`应答失败：${error instanceof Error ? error.message : String(error)}`);
+                });
+            } else {
+              this.trace('这台版本没有「对端提问也作答」的能力，只记录不回答');
             }
           }
         }
@@ -2198,7 +2736,20 @@ export class LanSyncService implements Disposable {
           this.notes = [...this.notes, message].slice(-MAX_NOTES);
           await this.persist();
           this.bridge.log(`[sync] 队友消息（${message.from.name}）：${message.body.slice(0, 80)}`);
-          if (message.from.id !== this.bridge.peer().id && shouldAutoRespond(message)) {
+          /*
+           * 轮次上限：两个 agent 会互相答，不加闸就会一直接龙（额度烧光、任务不前进）。
+           * 到上限就不再自动应答，把话抛回群里等甲方 —— 对话必须有终止条件。
+           */
+          const rounds = this.dialogueRounds(message.topic || '');
+          if (this.role !== 'off' && message.from.id !== this.bridge.peer().id && rounds > MAX_DIALOGUE_NOTES) {
+            this.trace(`agent 之间已来回 ${rounds} 轮，暂停自动应答`);
+            void this.postGroup({
+              author: 'agent',
+              phase: 'question',
+              body: `我和「${deviceLabel(message.from, this.peerList().map((entry) => entry.peer))}」已经来回 ${rounds} 条还没定下来，需要你定一句再继续。`,
+              options: ['继续让两台讨论', '只让一台做', '先停下'],
+            }).catch(() => undefined);
+          } else if (message.from.id !== this.bridge.peer().id && shouldAutoRespond(message)) {
             const accepted = await this.bridge.runNote?.(message).catch((error: unknown) => {
               this.bridge.log(`[sync] 交付队友消息失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
               return false;
@@ -2233,7 +2784,7 @@ export class LanSyncService implements Disposable {
     if (!rows.length) return;
     try {
       // 带名册进去，「哪台设备没有报告」才有依据（设备数不固定，不能靠平台枚举猜）
-      const roster = [this.bridge.peer(), ...this.peerList().map((entry) => entry.peer)];
+      const roster = [this.localPeer(), ...this.peerList().map((entry) => entry.peer)];
       await this.bridge.writeLedger(renderLedger(rows, Date.now(), roster));
     } catch (error) {
       this.bridge.log(`[sync] 写账本失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
@@ -2246,12 +2797,14 @@ export class LanSyncService implements Disposable {
    * 顺序很重要 —— 先本地开跑，用户立刻看到自己的设备动起来了；广播失败也只影响对端，
    * 不会让本机白等一次网络超时。
    */
-  async shareRequirement(text: string): Promise<{ ok: boolean; message: string; requirement?: SyncRequirement }> {
+  async shareRequirement(text: string, assignee = ''): Promise<{ ok: boolean; message: string; requirement?: SyncRequirement }> {
     // 用逻辑时钟而不是本机 Date.now()：多设备并发时才能排出全序。
-    const requirement = makeRequirement(this.bridge.peer(), text, this.nextClock());
+    const requirement = makeRequirement(this.localPeer(), text, this.nextClock());
     if (!requirement) return { ok: false, message: '需求内容为空。' };
+      // 只在指定了某台设备时才带 assignee：留空表示「谁都可以接」。
+      if (assignee) requirement.assignee = assignee;
       // 带上本机选中的项目：对方据此判断「是不是同一个项目」。
-      const project = this.collabProject || this.bridge.peer().project;
+      const project = this.activeProjectName();
       if (project) requirement.project = project;
       // 项目唯一 ID：仓库地址（文件夹名不参与判断）。
       const repo = this.currentRepo();
@@ -2322,7 +2875,17 @@ export class LanSyncService implements Disposable {
    * 对端 agent，由它判断要不要动手、要不要回。这也是「不要为了回应而改代码」的落点。
    */
   async shareNote(input: { body: string; topic?: string; replyTo?: string }): Promise<{ ok: boolean; message: string }> {
-    const note = makeNote(this.bridge.peer(), input);
+    /*
+     * 自动成线程：没指定 replyTo 时，接在「最近一条别人发来的消息」之后。
+     *
+     * 用户要的是「两个 agent 自己沟通」—— 线程靠模型自觉填 replyTo 是靠不住的，
+     * 这里按事实（最近一条对端消息）补上，界面才能画出「谁回谁」。
+     */
+    const lastOther = [...this.notes].reverse().find((item) => item.from.id !== this.localPeer().id);
+    const note = makeNote(this.localPeer(), {
+      ...input,
+      replyTo: input.replyTo || lastOther?.id || '',
+    });
     if (!note) return { ok: false, message: '消息内容为空。' };
     this.notes = [...this.notes, note].slice(-MAX_NOTES);
     await this.persist();
@@ -2364,6 +2927,10 @@ export class LanSyncService implements Disposable {
     requirementId?: string;
     assignee?: string;
     project?: string;
+    replyTo?: string;
+    to?: string;
+    options?: readonly string[];
+    meta?: import('./lanProtocol').GroupMessageMeta;
   }): Promise<{ ok: boolean; message: string; group?: SyncGroupMessage }> {
     /*
      * 关联需求：没指定就用最近的一条。
@@ -2374,13 +2941,23 @@ export class LanSyncService implements Disposable {
     const requirementId = input.requirementId
       || this.requirements[this.requirements.length - 1]?.id
       || '';
-    const group = makeGroupMessage(this.bridge.peer(), { ...input, requirementId });
+    const group = makeGroupMessage(this.localPeer(), { ...input, requirementId });
     if (!group) return { ok: false, message: '群消息内容为空。' };
     this.group = [...this.group, group].slice(-MAX_GROUP_MESSAGES);
+    this.trace(`本机发出：${input.author === 'user' ? '甲方' : '乙方'}·${input.phase}「${input.body.slice(0, 24)}」`);
+    // 正式那条已经进群了，临时回显就地消失（不额外刷一次界面）。
+    this.clearPendingGroup();
+    /*
+     * 先让界面动起来，再落盘。
+     *
+     * 以前是先 `await persist()`、再把整份群记录写一遍 markdown，最后才通知面板 ——
+     * 群消息越多写盘越久，Windows 上还要过一遍杀毒扫描，用户看到的就是「发完半天才出现」。
+     * 内存里已经 push 过了，界面读的就是这份数据；落盘紧跟其后，语义不变。
+     */
+    await this.bridge.onGroupMessage?.(group).catch(() => undefined);
     await this.persist();
     await this.refreshTranscript();
     void this.relayOut(group);
-    await this.bridge.onGroupMessage?.(group).catch(() => undefined);
     this.bridge.onState?.();
     if (this.role === 'off') return { ok: true, message: '已记入团队群（未启用局域网同步，没有发给队友）。', group };
 
@@ -2400,6 +2977,18 @@ export class LanSyncService implements Disposable {
   }
 
   /**
+   * 两个 agent 之间已经来回几轮（同一个主题、同一条需求）。
+   *
+   * 为什么要数：agent 之间能自由对话后，很容易「收到 → 回一句 → 对方再回」地接龙，
+   * 把额度烧光却没人推进任务。这里给出可数的轮次，超过上限就不再自动应答，
+   * 改成在群里把问题抛给甲方（有终止条件的对话才叫对话）。
+   */
+  dialogueRounds(topic = '', withinMs = 10 * 60_000): number {
+    const since = Date.now() - withinMs;
+    return this.notes.filter((note) => note.at >= since && (!topic || note.topic === topic)).length;
+  }
+
+  /**
    * 团队群窗口要显示的全部状态（一次取完，避免面板多次调用）。
    *
    * 面板据此渲染：成员、发言、以及「乙方正在等你回答」的那条追问 ——
@@ -2409,20 +2998,78 @@ export class LanSyncService implements Disposable {
     role: LanSyncRole;
     peers: SyncPeer[];
     messages: SyncGroupMessage[];
-    openQuestion?: { requirementId: string; body: string };
+    /**
+     * 两个 agent 之间的往来（`team_sync action=send/ask`）。
+     *
+     * 用户 2026-11-24：「没有实现两个 agent 在团队群自己沟通任务的功能，还是各干各的」。
+     * 这些消息以前只写进账本 / 日志，界面上看不到。现在一起交给面板，
+     * 按时间合进同一条时间线，并标出「回复的是哪一条」。
+     */
+    dialogue: { id: string; who: string; body: string; at: number; replyTo: string }[];
+    pending?: { body: string; time: string };
+    /**
+     * 「乙方在等你回答」那条追问：**必须带上是哪台在问**。
+     *
+     * 用户 2026-11-24：「这种等我回答的弹出提示，没写是哪个设备等我回答，
+     * 我直接回答会导致所有 agent 都收到消息」——所以这里带上问话设备的
+     * id 与统一标识，回答时按它定向回给那一台。
+     */
+    openQuestion?: {
+      requirementId: string;
+      body: string;
+      askerId: string;
+      askerLabel: string;
+      options: string[];
+    };
   } {
     const questionId = this.openQuestionRequirement();
     const question = questionId
       ? [...this.group].reverse().find((message) => message.requirementId === questionId && message.phase === 'question')
       : undefined;
+    const roster = [this.localPeer(), ...this.peerList().map((entry) => entry.peer)];
     return {
       role: this.role,
-      peers: [this.bridge.peer(), ...this.peerList().map((entry) => entry.peer)],
+      peers: [this.localPeer(), ...this.peerList().map((entry) => entry.peer)],
       messages: this.group,
+      dialogue: this.notes.slice(-40).map((note) => ({
+        id: note.id,
+        who: deviceLabel(note.from, roster),
+        body: note.body,
+        at: note.at,
+        replyTo: note.replyTo ?? '',
+      })),
+      ...(this.pendingGroup
+        ? { pending: { body: this.pendingGroup.body, time: new Date(this.pendingGroup.at).toTimeString().slice(0, 5) } }
+        : {}),
       ...(question && questionId
-        ? { openQuestion: { requirementId: questionId, body: question.body } }
+        ? {
+          openQuestion: {
+            requirementId: questionId,
+            body: question.body,
+            askerId: question.from.id,
+            askerLabel: deviceLabel(question.from, roster),
+            // 结构化选项优先；老消息没有这个字段时才从正文里抽。
+            options: question.options?.length ? [...question.options] : questionOptions(question.body),
+          },
+        }
         : {}),
     };
+  }
+
+  /**
+   * 当前追问是哪台设备问的（回答要定向回给它）。
+   *
+   * 以前甲方一回答就广播给群里所有 agent，两台都接着跑一遍 ——
+   * 而问题其实只是一台问的。
+   */
+  openQuestionTarget(): { requirementId: string; askerId: string; askerLabel: string } | undefined {
+    const questionId = this.openQuestionRequirement();
+    if (!questionId) return undefined;
+    const question = [...this.group].reverse()
+      .find((message) => message.requirementId === questionId && message.phase === 'question');
+    if (!question) return undefined;
+    const roster = [this.localPeer(), ...this.peerList().map((entry) => entry.peer)];
+    return { requirementId: questionId, askerId: question.from.id, askerLabel: deviceLabel(question.from, roster) };
   }
 
   /**
@@ -2476,7 +3123,7 @@ export class LanSyncService implements Disposable {
     files?: string[];
     note?: string;
   }): Promise<void> {
-    const report = makeReport(this.bridge.peer(), input);
+    const report = makeReport(this.localPeer(), input);
     const key = `${report.requirementId}\u0000${report.from.platform}\u0000${report.from.id}`;
     const index = this.reports.findIndex((item) => `${item.requirementId}\u0000${item.from.platform}\u0000${item.from.id}` === key);
     if (index >= 0) this.reports[index] = report;
@@ -2723,10 +3370,84 @@ function postRaw(address: string, path: string, payload: string): Promise<string
   });
 }
 
-/** 设备名：主机名 + 平台，例如「MacBook-Pro · macOS」。 */
+/**
+ * 一台设备的实时探测结果。
+ *
+ * `version` 是关键：两台跑不同版本时，行为会不一样（新版有的钩子旧版没有），
+ * 以前只能靠猜「是不是没更新」，现在是直接问出来。
+ */
+export interface PeerProbe {
+  name: string;
+  address: string;
+  ok: boolean;
+  ms: number;
+  version: string;
+  protocol: number;
+  error?: string;
+}
+
+function getRaw(address: string, path: string, timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let url: URL;
+    try {
+      url = new URL(path, address.startsWith('http') ? address : `http://${address}`);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: url.port || 80,
+      path: url.pathname,
+      method: 'GET',
+      timeout: timeoutMs,
+    }, (response) => {
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk: Buffer) => chunks.push(chunk));
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        if ((response.statusCode ?? 500) >= 400) reject(new Error(`HTTP ${response.statusCode}`));
+        else resolve(text);
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('超时')));
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+/** 从 `http://ip:port` 取 IP。 */
+function ipOf(address: string | undefined): string {
+  const match = /^https?:\/\/([^/:]+)/i.exec(address ?? '');
+  return match?.[1] ?? '';
+}
+
+/**
+ * 把 IP 记进设备身份。
+ *
+ * 只在**同名设备分不清**时显示（`deviceLabel` 判定重名才拼上去），
+ * 所以平时界面不会多出 IP，两台都叫 DESKTOP 时才会出现。
+ */
+function withHost(peer: SyncPeer, host: string): SyncPeer {
+  const clean = (host ?? '').trim();
+  return clean && clean !== peer.host ? { ...peer, host: clean } : peer;
+}
+
+/** 设备名：系统里用户看到的名字（`MagicBookV14`），显示时再拼系统类型。 */
 export function defaultDeviceName(): string {
-  const name = hostname().replace(/\.local$/i, '');
-  return `${name} · ${defaultPlatform()}`;
+  return readDeviceName();
+}
+
+/**
+ * 身份 id 的种子：**必须和升级前完全一致**。
+ *
+ * 升级前 `name` 是「主机名 · 平台」，id 由它散列而来；如果现在改用新的显示名，
+ * 两台设备的 id 会一起变，互相的信任名单（approved）立刻对不上 ——
+ * 表现就是「明明配过对，却进不了群」。所以 id 用这个固定的旧格式，显示用新名字。
+ */
+export function defaultDeviceSeed(): string {
+  const raw = hostname().replace(/\.local$/i, '');
+  return `${raw} · ${defaultPlatform()}`;
 }
 
 export function defaultPlatform(): SyncPlatform {

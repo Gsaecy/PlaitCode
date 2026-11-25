@@ -9,7 +9,7 @@
  * 一条任务的边界就是 `requirementId`：甲方那条 `requirement` 是任务本身，
  * 之后所有带同一个 id 的解析 / 追问 / 进度 / 结果都算它的过程。
  */
-import type { GroupPhase, SyncGroupMessage } from './lanProtocol';
+import { deviceLabel, groupRoster, type GroupPhase, type SyncGroupMessage } from './lanProtocol';
 
 /** 任务状态。`question` 单独拎出来，因为它卡在**甲方**身上，不是 agent 在忙。 */
 export type WorkTaskStatus = 'open' | 'running' | 'question' | 'blocked' | 'done';
@@ -57,6 +57,8 @@ function oneLine(text: string): string {
 export function buildTaskBoard(messages: readonly SyncGroupMessage[], limit = 50): WorkTask[] {
   const byId = new Map<string, WorkTask>();
   const ordered = [...messages].sort((left, right) => left.at - right.at);
+  /* ??????????????????????? IP? */
+  const roster = groupRoster(ordered);
 
   for (const message of ordered) {
     const id = message.requirementId || message.id;
@@ -70,7 +72,7 @@ export function buildTaskBoard(messages: readonly SyncGroupMessage[], limit = 50
         title: firstLine(message.body) || '(无标题)',
         project: '',
         assignee: '',
-        requester: message.from.name,
+        requester: deviceLabel(message.from, roster),
         status: 'open',
         createdAt: message.at,
         updatedAt: message.at,
@@ -105,7 +107,24 @@ export function buildTaskBoard(messages: readonly SyncGroupMessage[], limit = 50
     task.updatedAt = Math.max(task.updatedAt, message.at);
   }
 
-  const tasks = [...byId.values()].sort((left, right) => right.updatedAt - left.updatedAt);
+  /*
+   * 判断「过期」用**最新一条消息的时间**，不用本机时钟。
+   *
+   * 两个理由：看板是从群消息推导的，两台设备必须得出同一张看板；用各自的 Date.now()
+   * 会让时钟快的那台先把卡片删掉，两边看到的不一样。用消息流自身的时间就完全确定。
+   */
+  const newestAt = ordered.reduce((latest, item) => Math.max(latest, item.at), 0);
+  const reference = Math.max(newestAt, 0);
+  const tasks = [...byId.values()]
+    /*
+     * 过期的「待接」不再显示。
+     *
+     * 一条卡如果既没人接、也没有任何回复（旧版本需求号对不上时就是这样），
+     * 它会永远停在待接，把看板撑成一堆假待办。超过 TTL 就从看板移除 ——
+     * 群记录不受影响，历史仍然完整。
+     */
+    .filter((task) => task.status !== 'open' || reference - task.createdAt < OPEN_TASK_TTL_MS)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
   return limit > 0 ? tasks.slice(0, limit) : tasks;
 }
 
@@ -119,6 +138,16 @@ export const TASK_STATUS_LABEL: Record<WorkTaskStatus, string> = {
   open: '待接',
   done: '已完成',
 };
+
+/**
+ * 一条没被任何人接的「待接」最多挂多久。
+ *
+ * 用户实况：「任务看板，已经回复的消息或者完成的消息的待接需要消失」——
+ * 除了让回复能正确挂回任务，还要处理**历史脏数据**：旧版本发出去的甲方消息
+ * 与 agent 回复的需求号对不上，那条卡永远等不到回复，就永远停在「待接」。
+ * 超过这个时长的待接视为过期，直接从看板移除（群记录里仍然是完整的）。
+ */
+const OPEN_TASK_TTL_MS = 10 * 60 * 1000;
 
 /** 按状态分组，空组不返回。 */
 export function groupTasksByStatus(tasks: readonly WorkTask[]): Array<{ status: WorkTaskStatus; tasks: WorkTask[] }> {

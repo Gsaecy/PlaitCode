@@ -19,7 +19,7 @@ import { ALIGNMENT_FILE, type SyncPeer } from './lanProtocol';
 
 /** 团队群记录文件（与对齐账本并列，一个记状态、一个记过程）。 */
 const TRANSCRIPT_FILE = 'docs/TEAM-CHAT.md';
-import { LanSyncService, defaultDeviceName, defaultPlatform, lanAddresses, parseInviteText, peerIdFor, type LanSyncBridge } from './lanSync';
+import { LanSyncService, defaultDeviceName, defaultDeviceSeed, defaultPlatform, lanAddresses, parseInviteText, peerIdFor, type LanSyncBridge } from './lanSync';
 import { normalizeRepoUrl } from './projectRef';
 import { GroupPanel } from '../views/groupPanel';
 import { MobilePanel } from '../views/mobilePanel';
@@ -38,10 +38,12 @@ export interface LanSetupOptions {
     setLanSync(service: LanSyncService | undefined): void;
     /** 停掉当前正在跑的一轮（有更新的用户消息时用）。 */
     stop?(): void;
-    runSyncRequirement(requirement: import('./lanProtocol').SyncRequirement): Promise<boolean>;
+    runSyncRequirement(requirement: import('./lanProtocol').SyncRequirement, options?: { readOnly?: boolean }): Promise<boolean>;
     runSyncNote(note: import('./lanProtocol').SyncNote): Promise<boolean>;
     /** 群窗口里发一句话（需求或回答），由面板决定走哪条路径。 */
     sendGroupMessage(text: string, assignee?: { id: string; name: string }): Promise<void>;
+    /** 另一台在群里的问句：本机也答一句（群里两个 agent 各报各的）。 */
+    answerRemoteGroupChat(body: string): Promise<void>;
     /** 中继上收到甲方需求：开跑但不再广播；跑没跑起来都要回执。 */
     runRelayedUserRequirement(
       text: string,
@@ -54,6 +56,8 @@ export interface LanSetupOptions {
       preset?: import('./lanProtocol').RemotePreset;
       steps?: number;
     }): Promise<{ ok: boolean; message: string }>;
+    /** 停掉「群里的那轮活」（团队任务对话），不受用户当前看的是哪条对话影响。 */
+    stopTeamTask(): Promise<{ ok: boolean; message: string }>;
     /** 手机界面上要显示的「真实生效值」，不是手机自己猜的。 */
     remoteControlState(): Promise<{
       preset: import('./lanProtocol').RemotePreset;
@@ -74,15 +78,31 @@ export function localPeer(input: {
   deviceName: string;
   version: string;
   project: string;
+  /**
+   * 下面这些以前**被这个工厂丢掉了**：调用方明明传了，函数签名里没有，
+   * 于是对端永远收不到 `projects` / `projectRepos` / `login` ——
+   * 表现就是「192.168.0.8 还没有上报它的项目列表」永远成立，
+   * 「同一个 GitHub 账号」的判断也永远是空。
+   */
+  repo?: string;
+  login?: string;
+  projects?: readonly string[];
+  projectRepos?: readonly string[];
 }): SyncPeer {
   const platform = defaultPlatform();
-  const name = input.deviceName.trim() || defaultDeviceName();
+  const custom = input.deviceName.trim();
+  const name = custom || defaultDeviceName();
   return {
-    id: peerIdFor(`${name}:${platform}`),
+    // id 用**旧格式的种子**，升级不换身份；名字变了只是显示变了。
+    id: peerIdFor(`${custom || defaultDeviceSeed()}:${platform}`),
     name,
     platform,
     project: input.project,
     version: input.version,
+    ...(input.repo ? { repo: input.repo } : {}),
+    ...(input.login ? { login: input.login } : {}),
+    ...(input.projects?.length ? { projects: [...input.projects] } : {}),
+    ...(input.projectRepos?.length ? { projectRepos: [...input.projectRepos] } : {}),
   };
 }
 
@@ -165,6 +185,23 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       return '';
     }
   };
+  /**
+   * 默认协作项目：**当前正在编辑的文件所在文件夹**。
+   *
+   * 多根工作区里 `workspaceFolders[0]` 往往是列表里的第一个，
+   * 和用户「我正在做哪个项目」没关系 —— 那正是两台默认到不同项目的原因。
+   */
+  const activeFolder = (): { name: string; path: string } | undefined => {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (!folders.length) return undefined;
+    const active = vscode.window.activeTextEditor?.document.uri.fsPath;
+    if (active) {
+      const hit = folders.find((folder) => active.startsWith(folder.uri.fsPath));
+      if (hit) return { name: basename(hit.uri.fsPath), path: hit.uri.fsPath };
+    }
+    const first = folders[0];
+    return first ? { name: basename(first.uri.fsPath), path: first.uri.fsPath } : undefined;
+  };
   /** 本机每个项目的仓库地址（与 projects() 同序）。 */
   const projectRepos = (): string[] => {
     const folders = vscode.workspace.workspaceFolders ?? [];
@@ -173,24 +210,24 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
 
   const bridge: LanSyncBridge = {
     peer: () => {
-      const root = workspaceRoot();
       const folders = vscode.workspace.workspaceFolders ?? [];
-      const folder = collabProjectName
+      const picked = collabProjectName
         ? folders.find((item) => basename(item.uri.fsPath) === collabProjectName)
-        : folders[0];
-      const repoNow = folder ? repoOfFolder(folder.uri.fsPath) : '';
+        : undefined;
+      // 没手动选就报「当前正在编辑的项目」，两台才不会默认各指向列表第一个。
+      const name = picked ? basename(picked.uri.fsPath) : activeFolder()?.name;
+      const repoNow = picked ? repoOfFolder(picked.uri.fsPath) : repoOfFolder(activeFolder()?.path ?? '');
       return localPeer({
         deviceName,
         version: options.version,
-        project: collabProjectName || (root ? basename(root) : 'workspace'),
+        project: name || 'workspace',
         ...(repoNow ? { repo: repoNow } : {}),
         ...(githubLogin ? { login: githubLogin } : {}),
         ...(projects().length ? { projects: projects() } : {}),
         ...(projectRepos().filter(Boolean).length ? { projectRepos: projectRepos().filter(Boolean) } : {}),
       });
     },
-    runRequirement: (requirement) => chat.runSyncRequirement(requirement),
-    runNote: (note) => chat.runSyncNote(note),
+    runRequirement: (requirement, runOptions) => chat.runSyncRequirement(requirement, runOptions),    runNote: (note) => chat.runSyncNote(note),
     /**
      * 陌生设备想连进来：一个弹窗、两个按钮，这就是全部的「安全确认」。
      *
@@ -246,6 +283,18 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
           });
       }
     },
+    /** 刚输入、还没判定完的那句话：先画出来，不等模型。 */
+    onGroupPending: () => {
+      void groupPanel?.refresh().catch(() => undefined);
+    },
+    /**
+     * 另一台在群里问了一句（不是派活）：本机 agent 也要答。
+     *
+     * 群里两个 agent，甲方说「报数」，两台各自报自己的情况才算都在场。
+     */
+    onRemoteGroupChat: async (message) => {
+      await chat.answerRemoteGroupChat(message.body);
+    },
     /** 本机工作区里的项目名：面板用来展示和选择。 */
     localProjects: () => projects(),
     localProjectRepos: () => projectRepos(),
@@ -253,8 +302,10 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       const folders = vscode.workspace.workspaceFolders ?? [];
       const picked = collabProjectName
         ? folders.find((folder) => basename(folder.uri.fsPath) === collabProjectName)
-        : folders[0];
-      return picked ? repoOfFolder(picked.uri.fsPath) : '';
+        : undefined;
+      // 没手动选就用「当前正在编辑的项目」，而不是列表里的第一个。
+      const target = picked ? picked.uri.fsPath : activeFolder()?.path;
+      return target ? repoOfFolder(target) : '';
     },
     /** 本机 GitHub 登录名（拿不到就是空串，不阻塞协作）。 */
     localLogin: () => githubLogin,
@@ -282,8 +333,9 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         )
         .then(async (choice) => {
           if (choice === '切换到这个项目') {
+            // 传仓库地址；`setCollabProject` 会换成本机对应的文件夹名（不认就直接拒绝）。
             await service.setCollabProject(info.required);
-            void vscode.window.showInformationMessage(`已切到「${info.required}」。请让对方重发一次需求。`);
+            void vscode.window.showInformationMessage(`已按「${info.required}」处理。请让对方重发一次需求。`);
           } else if (choice === '告诉我怎么拉取') {
             const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
             void vscode.window.showInformationMessage(
@@ -395,6 +447,29 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         service.broadcastControl(await chat.remoteControlState());
         return { ok: true, message: '已把当前设置同步给手机' };
       }
+      /*
+       * 另一台设备让我切项目。
+       *
+       * `setCollabProject` 自己会校验（本机没有这个项目就拒绝）并往群里回执，
+       * 所以发起方一定能看到结果。
+       */
+      if (control.action === 'project') {
+        if (!control.project) return { ok: false, message: '没有说明要切到哪个项目' };
+        const before = service.activeProjectName();
+        await service.setCollabProject(control.project, control.repo ?? '');
+        const after = service.activeProjectName();
+        output.info(`[sync] 远程切项目：${before || '（默认）'} → ${after || '（默认）'}`);
+        return after && after !== before
+          ? { ok: true, message: `已切到「${after}」` }
+          : { ok: false, message: `没有切换（本机没有「${control.project}」这个项目）` };
+      }
+      /*
+       * 甲方在团队群点了「停止执行」：本机这一轮立刻停。
+       *
+       * 只停**群里的那轮活**（团队任务对话），不动用户自己开的其它对话 ——
+       * 群窗口那颗按钮的语义是「群里的任务停」，不是「把我所有对话都掐掉」。
+       */
+      if (control.action === 'stopGroup') return chat.stopTeamTask();
       const result = await chat.applyRemoteControl({
         action: control.action,
         ...(control.preset ? { preset: control.preset } : {}),
@@ -491,10 +566,29 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
    * 发消息复用 `chat.send()` —— 它已经知道「这是回答追问还是新需求」，
    * 群窗口不重复实现那套判断。
    */
+  /**
+   * 团队群窗口的「停止执行」：**群里所有 agent 一起停**。
+   *
+   * 用户的要求：「团队群界面的停止执行，需要应用到群里的所有 agent，
+   * 而不是只应用到本设备的团队任务对话框」。
+   *
+   * 顺序：先停本机（按下去立刻有反应），再广播 `stopGroup`；
+   * 对端收到各自停手，并在群里回一句「已收到停止执行」，
+   * 甲方据此知道哪台真停了，不用猜。
+   */
+  async function groupStopAll(): Promise<{ ok: boolean; message: string }> {
+    const local = await chat.stopTeamTask();
+    const fan = await service.broadcastStop();
+    const message = `${local.ok ? '本机已停' : local.message}；${fan.message}`;
+    // 群窗口是 webview，日志在输出面板里看不见 —— 用状态栏给一次即时确认。
+    vscode.window.setStatusBarMessage(`停止执行：${message}`, 5_000);
+    return { ok: local.ok || fan.ok, message };
+  }
+
   const groupPanel = new GroupPanel(context.extensionUri, service, {
     send: (text, assignee) => chat.sendGroupMessage(text, assignee),
     log: (line) => output.info(line),
-    control: (action) => chat.applyRemoteControl({ action }),
+    control: () => groupStopAll(),
     relay: () => {
       const state = relay?.status();
       return state
@@ -704,16 +798,28 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       status.show();
     }
   };
-  bridge.onState = refreshStatus;
+  /*
+   * 状态变了就顺手刷新群窗口。
+   *
+   * 群窗口的成员数、项目、邀请码都是状态的一部分：只在收到消息时刷新，
+   * 就会出现「对方已加入，主机端还写着等对方加入」。窗口没开时 refresh 直接返回。
+   */
+  bridge.onState = () => {
+    refreshStatus();
+    void groupPanel.refresh().catch(() => undefined);
+  };
 
   /**
    * 「同步核对」：把这一台设备看到的真相列成一屏。
    *
    * 用户遇到的困境不是同步坏了，而是**没法判断哪一边说的是真的**：
    * 一边说已同步、一边说没收到。所以这里只列可核对的事实 —— 连上了谁、
-   * 几条被服务器确认、几条发不出去、最后一条错误是什么。
+   * **对方跑的是哪个版本**、几条被服务器确认、几条发不出去、最后一条错误是什么。
+   *
+   * 「版本」这一栏是后来补的：两台跑不同版本时行为必然不同，
+   * 之前只能靠猜「是不是没更新」，现在直接问出来。
    */
-  const syncCheckReport = (): string[] => {
+  const syncCheckReport = async (): Promise<string[]> => {
     const now = new Date();
     const pad = (value: number): string => String(value).padStart(2, '0');
     const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
@@ -725,6 +831,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       '===== HWChat 同步核对 =====',
       `时间：${stamp}`,
       `本机：${deviceName || bridge.peer().name} · ${lanAddresses().join(' / ') || '（未发现局域网地址）'}`,
+      `本机版本：${options.version}`,
       '',
       '[局域网]',
     ];
@@ -736,6 +843,34 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     if (invite) lines.push(`邀请码：${invite} · 邀请串 ${service.currentInviteText()}`);
     lines.push(`对端设备：${peers.length} 台`);
     for (const item of peers) lines.push(`  - ${item.name} · ${item.platform}${item.address ? ` · ${item.address}` : ''}`);
+
+    /*
+     * 现场问一遍对方：你是谁、跑哪个版本、多久回。
+     * 这一栏能直接终结「是不是没更新」这类争论。
+     */
+    lines.push('', '[对方此刻在跑什么]（现场探测，不是缓存）');
+    if (!peers.length) {
+      lines.push('  （没有对端可探测）');
+    } else {
+      const probes = await service.probePeers().catch(() => []);
+      if (!probes.length) lines.push('  （对方没有登记地址，无法探测）');
+      for (const probe of probes) {
+        if (!probe.ok) {
+          lines.push(`  ✗ ${probe.name} · ${probe.address} 连不上（${probe.error ?? '无响应'}）`);
+          continue;
+        }
+        const same = probe.version === options.version;
+        lines.push(
+          `  ${same ? '✓' : '⚠'} ${probe.name} · 版本 ${probe.version} · 协议 v${probe.protocol} · ${probe.ms}ms${same ? '' : ' ← 和本机版本不同'}`,
+        );
+      }
+    }
+
+    lines.push('', '[最近处置]（每条群消息到底被谁怎么处理了，最新在下）');
+    const traces = service.recentTraces(20);
+    if (!traces.length) lines.push('  （还没有记录：在群里发一句话再看）');
+    for (const line of traces) lines.push(`  ${line}`);
+
     lines.push('', '[中继]（跨网才需要）');
     if (!relayState) {
       lines.push('状态：没有连接');
@@ -993,7 +1128,7 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       if (choice === '断开连接') await vscode.commands.executeCommand('hwchat.lanSync.disconnect');
     }),
     vscode.commands.registerCommand('hwchat.sync.check', async () => {
-      const lines = syncCheckReport();
+      const lines = await syncCheckReport();
       for (const line of lines) output.info(line);
       output.show(true);
       try {
@@ -1036,6 +1171,57 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
       void vscode.window.showInformationMessage(
         `已把「${picked.label}」设为协作项目。请让对方也选同一个仓库。`,
       );
+    }),
+    /*
+     * 让**某一台**设备切项目（包括对方那台）。
+     *
+     * 用户的需求：「我需要每个设备都能切换项目，而不是只能切换本设备的项目」。
+     * 先选设备，再选那台设备自己的项目（列表来自它广播的 projects/projectRepos）。
+     */
+    vscode.commands.registerCommand('hwchat.lanSync.switchPeerProject', async () => {
+      const peers = service.remotePeers();
+      const localName = service.activeProjectName() || '本机';
+      const targets = [
+        { id: 'local', name: `${localName}（本机）`, isLocal: true, projects: service.localProjects(), repos: service.localProjectRepos() },
+        ...peers.map((peer) => ({ id: peer.id, name: peer.name, isLocal: false, projects: peer.projects ?? [], repos: peer.projectRepos ?? [] })),
+      ];
+      const device = targets.length > 1
+        ? await vscode.window.showQuickPick(
+          targets.map((item) => ({
+            label: item.name,
+            description: item.isLocal ? '改这一台' : '远程让那台切换',
+            detail: item.projects.length ? item.projects.join('、') : '（对方还没有上报项目列表）',
+            target: item,
+          })),
+          { title: '切换哪台设备的项目', placeHolder: '可以改本机，也可以改另一台' },
+        )
+        : { target: targets[0] };
+      if (!device?.target) return;
+      const target = device.target;
+      if (!target.projects.length) {
+        void vscode.window.showWarningMessage(
+          target.isLocal
+            ? '本机没有打开任何项目文件夹。'
+            : `「${target.name}」还没有上报它的项目列表（可能是旧版本，或刚连上）。让它那台重载一次 VS Code 再试。`,
+        );
+        return;
+      }
+      const projectItems = target.projects.map((name: string, index: number) => {
+        const repo: string = target.repos[index] ?? '';
+        return { label: name, description: repo || '未绑定 GitHub 仓库', repo };
+      });
+      const picked = await vscode.window.showQuickPick(projectItems, {
+        title: `让「${target.name}」切到哪个项目`,
+        placeHolder: '选它自己的一个项目',
+      });
+      if (!picked) return;
+      if (target.isLocal) {
+        await service.setCollabProject(picked.label, picked.repo ?? '');
+        return;
+      }
+      const result = await service.requestProjectSwitch(target.id, picked.label, picked.repo ?? '');
+      if (result.ok) void vscode.window.showInformationMessage(result.message);
+      else void vscode.window.showWarningMessage(result.message);
     }),
     vscode.commands.registerCommand('hwchat.lanSync.openGroup', async () => {
       await groupPanel.open();

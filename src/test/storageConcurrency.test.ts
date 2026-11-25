@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { ConversationStorage, mergeManifests } from '../core/storage';
-import { tryFileLock, withFileLock } from '../core/fileLock';
+import { FileLockTimeoutError, tryFileLock, withFileLock } from '../core/fileLock';
 import { MANIFEST_VERSION } from '../core/storage';
 
 const summary = (id: string, updatedAt: number) => ({
@@ -128,6 +128,57 @@ test('文件锁：陈旧锁（进程崩溃留下）可以被接管', async () =>
     const handle = await tryFileLock(lock, { timeoutMs: 200, staleMs: 1_000 });
     assert.ok(handle, '陈旧锁必须能被接管，否则一次崩溃会永久卡住所有写入');
     await handle!();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('文件锁：持锁进程已死 → 立刻接管（不必等 stale）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hwchat-deadpid-'));
+  const lock = join(root, 'x.lock');
+  try {
+    /*
+     * 用户实况（macOS 2026-11-25）：扩展被强杀 / 重载窗口后锁文件还在，
+     * mtime 是刚才 → 旧的实现要等满 30 秒，而拿锁超时才 5 秒，
+     * 结果必然抛「拿不到文件锁」弹给用户。
+     * 现在按锁里的 pid 判活：pid 不存在就立刻接管。
+     */
+    const deadPid = 2_147_483_646; // 不可能存在的 pid
+    await writeFile(lock, `${deadPid}:${Date.now()}:abc`, 'utf8');
+    const handle = await tryFileLock(lock, { timeoutMs: 300, staleMs: 60_000 });
+    assert.ok(handle, '死进程留下的锁必须立刻接管');
+    await handle!();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('文件锁：持锁进程活着 → 不许抢（哪怕 mtime 很旧）', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hwchat-livepid-'));
+  const lock = join(root, 'x.lock');
+  try {
+    // 用本进程的 pid：一定活着。
+    await writeFile(lock, `${process.pid}:${Date.now()}:mine`, 'utf8');
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    await utimes(lock, old, old);
+    const handle = await tryFileLock(lock, { timeoutMs: 200, staleMs: 1_000 });
+    assert.equal(handle, undefined, '活着就不能抢，否则两个宿主会同时写 manifest');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('拿不到锁不弹给界面：类型可区分，且不会冒成未处理异常', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'hwchat-locktype-'));
+  const lock = join(root, 'x.lock');
+  try {
+    await writeFile(lock, `${process.pid}:${Date.now()}:mine`, 'utf8');
+    await assert.rejects(
+      withFileLock(lock, async () => undefined, { timeoutMs: 100 }),
+      (error: unknown) => error instanceof FileLockTimeoutError && error.lockPath === lock,
+      '要抛专门的类型，调用方才能「稍后重试」而不是弹窗',
+    );
+    assert.equal(new FileLockTimeoutError(lock).name, 'FileLockTimeoutError');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

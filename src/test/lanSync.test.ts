@@ -131,7 +131,7 @@ test('账本渲染：表格 + 差异小节，竖线不会把表格拆坏', () =>
   assert.match(markdown, /# 跨平台对齐账本/);
   assert.match(markdown, /支持 \\\| 竖线标题/, '单元格里的竖线要转义');
   assert.match(markdown, /## 需要对齐的差异/);
-  assert.match(markdown, /macOS 已跳过/);
+  assert.match(markdown, /macOS · MacBook 已跳过/);
   assert.match(markdown, /做不了/);
 });
 
@@ -183,7 +183,7 @@ test('群记录：按需求分组、标出甲乙方、不塞工具流水', () =>
   const markdown = renderGroupTranscript(messages, 100);
   assert.match(markdown, /# 团队群记录/);
   assert.match(markdown, /甲方/);
-  assert.match(markdown, /乙方（产品经理）/);
+  assert.match(markdown, /乙方/, '群记录要标出甲乙方');
   assert.match(markdown, /追问/);
   assert.match(markdown, /设置页加个深色开关/);
   assert.match(markdown, /需求 r/, '按需求分组');
@@ -260,7 +260,7 @@ test('分歧：设备数量不固定——三台里一台没报告时，只有�
 
   const withRoster = findDivergences(rows, [win, mac, third]);
   assert.deepEqual(withRoster[0]!.missingOn.map((party) => party.id), ['p-linux']);
-  assert.equal(withRoster[0]!.missingOn[0]!.label, 'Server · Linux');
+  assert.equal(withRoster[0]!.missingOn[0]!.label, 'Linux · Server');
 });
 
 test('账本 Markdown：一行一台设备，不是固定三列平台', () => {
@@ -272,7 +272,7 @@ test('账本 Markdown：一行一台设备，不是固定三列平台', () => {
   ]));
   assert.match(markdown, /\| 需求 \| 发起 \| 执行设备 \| 状态 \| 说明 \| 更新 \|/);
   assert.equal((markdown.match(/\| 已完成 \|/g) ?? []).length, 2, '两台 Windows 各占一行');
-  assert.match(markdown, /PC2 · Windows/);
+  assert.match(markdown, /Windows · PC2/);
 });
 test('群状态 N 台设备：A 追问后 B 发解析，不能把 A 的追问盖掉', () => {
   const id = 'req-n';

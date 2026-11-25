@@ -1,10 +1,14 @@
 # 跨平台对齐账本
 
 > 由 HWChat 同步自动维护。**每台设备只补自己那一行**，不要重写整张表。
-> 上次更新：2026-11-24 09:41
+> 上次更新：2026-11-24 23:44
 
 ## 需求对照
 
 | 需求 | 发起 | 执行设备 | 状态 | 说明 | 更新 |
 |---|---|---|---|---|---|
-| agent报数 | MagicBookV14 · win32 | — | 没有报告 | — | — |
+| 核对当前项目的数据同步功能，我需要让instindex工作台软件的AI助手添加的AI（API和选择服务商决定）、便签、日程、项目（包括项目下面的内容）、邮箱、订阅等等适合这种跟随账号走的软件的数据，要跟着服务器同步，可以设置未VIP功能，… | Windows · MAGICBOOKV14 | Windows · MAGICBOOKV14 | 已完成 | ### 我的理解 队友说 macOS 侧七类数据同步已完成，载荷版本 2；它要求 Windows 回报载荷版本，并警告 Windows 若未升级就登录推数据，会覆盖 Mac 已上传的便签和项目。本轮需要回答版本号，并在 Windows 端把同步行为对齐。 **回它的版本号：Windows 载荷版本 `v = 3`**，集合一致：邮箱、订阅源、AI 服务商、便签、日程、项目、项目文档；版本号只写入、不校验，不会阻塞互通。消息已送达 1/1 台设备。 **它担心的覆盖，本机确实存在；我已改掉** `mail/sync.rs` 推送的是本机全量快照。原来只有“本机七类全空”才跳过上传；本机只要有一条邮箱，一推就会把云端便签和项目整份覆盖。现在两条推送路径（1.5 秒去抖推送、登录首推）都先取云端，按合并规则并入本机，再打包上传。 **另外补了三处行为差距** \| 改动 \| 文件 \| 位置 \| \|（12 个文件） | 11-24 23:43 |
+| 核对当前项目的数据同步功能，我需要让instindex工作台软件的AI助手添加的AI（API和选择服务商决定）、便签、日程、项目（包括项目下面的内容）、邮箱、订阅等等适合这种跟随账号走的软件的数据，要跟着服务器同步，可以设置未VIP功能，… | Windows · MAGICBOOKV14 | macOS · 郭宏宇的Mac mini | 已完成 | ### 我的理解 队友说明 Windows 端的 `cargo test` 仍然起不来（缺少运行时 DLL，是老问题，不是这次改动引入的），改用「建临时库，再从同步源码原样抽出合并语句执行，共 18 条断言全过」作为替代验证。这只是汇报和收口方式，**本机不需要改任何代码**，我核对了本机状态，并把“我认可这套收口”发给它。 **本机核对（只读）：** 上次补的推送前合并逻辑在官网版和 App Store 版都在——`macOS官网版本/app/src-tauri/src/mail/sync.rs` 和 `macOS App Store版本/…/sync.rs` 各 3 处命中（第 569、617、680 行）。所以它说的那个「任一台推一次就能覆盖另一台」的风险,我这边已经堵住了。 **发给队友的一条消息（replyTo `rmwvccc9b16wykn`）里说清三件事，都只讲用户能感知的 | 11-24 23:44 |
+| 报数 | Windows · MAGICBOOKV14 | macOS · 郭宏宇的Mac mini | 已完成 | ### 我的理解 你说“报数”。这条只需要汇报，不改任何文件。我把 macOS 这台的项目、仓库、未提交改动和同步功能进度完整报了数。 **macOS 这台的报数（只读核实，零改动）：** \| 项 \| 值 \| \|---\|---\| \| 项目 \| Personal-Workstation-OS \| \| 目录 \| `/Users/guohongyu/AI projects/personal workstation`（工作区仅 1 个根） \| \| 仓库 \| `github.com/Gsaecy/Personal-Workstation-OS`（fetch 与 push 同址） \| \| 分支 / 提交 \| `main`，本地与 `origin/main` 同为 `22049631e0a`，领先/落后 `0/0` \| \| 未提交 \| **24 项**：2 个 macOS 目录各 8 个改动文件 + 各 | 11-24 23:16 |
+| 报数 | Windows · MAGICBOOKV14 | Windows · MAGICBOOKV14 | 已完成 | 报数属于点名，只回答不改文件。我核对本机身份后发到群里。 已绑定，本机身份核对完毕。发到群里。 ### 我的理解 甲方点名报数，只回答不改文件。本轮工作区零改动。‍‍‍‌⁠‌‌‍‌​​‌‌​⁠​‌​⁠​​​⁠​​​⁠​​​⁠​‍‌​‌‍ **Windows 这台（MAGICBOOKV14）报数** \| 项 \| 值 \| \|---\|---\| \| 项目 \| Personal-Workstation-OS \| \| 本机目录 \| `d:\AI projects\Personal-Workstation-OS` \| \| 仓库绑定 \| 已绑定 `github.com/Gsaecy/Personal-Workstation-OS`（origin fetch/push 均指向它） \| \| 分支 \| main \| \| 最新提交 \| `d99bfd8` 示例/演示数据真正从库里清掉 + 同步不再静默覆盖云端 \| | 11-24 23:17 |
+| 你绑定了仓库没？仓库地址https://github.com/Gsaecy/Personal-Workstation-OS ，请绑定 | Windows · MAGICBOOKV14 | macOS · 郭宏宇的Mac mini | 已完成 | ### 我的理解 你问 macOS 这台有没有绑定 `https://github.com/Gsaecy/Personal-Workstation-OS`。这只需要回答，不需要修改文件。结论：**早已绑好，不用再绑。** **核实依据（只读检查，未改动文件）：** \| 项 \| 结果 \| \|---\|---\| \| 工作区里的根目录 \| 只有 1 个：`/Users/guohongyu/AI projects/personal workstation` \| \| 远端 fetch 地址 \| `https://github.com/Gsaecy/Personal-Workstation-OS.git` \| \| 远端 push 地址 \| 同上，是同一个地址 \| \| 当前分支 \| `main`，与 `origin/main` 一致，领先/落后均为 `0 / 0` \| \| 本地与远端提交 \| 双方都是 ` | 11-24 23:14 |

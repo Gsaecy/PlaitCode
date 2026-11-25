@@ -84,3 +84,35 @@ export function sameProject(
   if (leftRepo && rightRepo) return leftRepo === rightRepo;
   return Boolean(left.project) && left.project === right.project;
 }
+
+/**
+ * 「这个群里的项目对不上」要提示的那句话；对得上就返回空串。
+ *
+ * 关键：**只在真的对不上时才说**。以前这里拿「本机的仓库地址」直接和
+ * 「对方的项目名」比，同一个项目也会被报成不一致 —— 群里明明两边仓库相同，
+ * 顶上却挂着一条红字，把真正的差异也一起带偏了。
+ */
+export function projectMismatchText(
+  mine: { repo?: string; project?: string },
+  others: readonly { name: string; repo?: string; project?: string }[],
+): string {
+  const mineRepo = normalizeRepoUrl(mine.repo ?? '');
+  const mismatched = others.filter((item) => {
+    const theirRepo = normalizeRepoUrl(item.repo ?? '');
+    /*
+     * 只有**同一口径**才敢下结论：
+     *  - 两边都有仓库地址 → 比仓库地址；
+     *  - 两边都没有 → 比文件夹名；
+     *  - 只有一边有 → 说的是两回事（地址 vs 名字），宁可不说，也不能报假警。
+     */
+    if (mineRepo && theirRepo) return mineRepo !== theirRepo;
+    if (!mineRepo && !theirRepo) return Boolean(item.project) && Boolean(mine.project) && item.project !== mine.project;
+    return false;
+  });
+  if (!mismatched.length) return '';
+  const mineLabel = mineRepo || mine.project || '（未选）';
+  const theirs = mismatched
+    .map((item) => `${item.name} 在做 ${normalizeRepoUrl(item.repo ?? '') || item.project || '（未选）'}`)
+    .join('；');
+  return `本机 ${mineLabel}；${theirs}`;
+}

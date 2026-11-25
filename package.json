@@ -2,7 +2,7 @@
   "name": "hwchat",
   "displayName": "HWChat",
   "description": "A secure coding agent for VS Code with DeepSeek: approval-controlled workspace tools, plan-tracking task lists, copyable local/server commands and durable local history.",
-  "version": "0.7.1",
+  "version": "0.10.5",
   "publisher": "honor-world",
   "license": "MIT",
   "icon": "resources/logo.png",
@@ -195,6 +195,10 @@
       {
         "command": "hwchat.lanSync.pickProject",
         "title": "HWChat: 选择参与协作的项目"
+      },
+      {
+        "command": "hwchat.lanSync.switchPeerProject",
+        "title": "HWChat: 切换项目（可选任意一台设备）"
       },
       {
         "command": "hwchat.lanSync.diagnose",
@@ -814,6 +818,7 @@
     "@types/vscode": "^1.106.0",
     "@vscode/vsce": "4.0.0",
     "esbuild": "^0.28.0",
+    "jsdom": "^31.0.1",
     "typescript": "^5.7.0"
   },
   "dependencies": {

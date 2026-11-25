@@ -47,8 +47,13 @@ test('boundary: workspace.findFiles is only called by the search scheduler entry
 });
 
 test('boundary: child processes are only spawned by the command executor', async () => {
+  /*
+   * `sync/deviceInfo.ts` 是**唯一的例外**：它要读「用户在系统设置里看到的那台设备名」
+   * （macOS 只有 `scutil --get ComputerName` 拿得到）。
+   * 约束仍然是硬的：只读、固定参数、无 shell、1.5s 超时、结果只用于显示。
+   */
   assert.deepEqual(await filesMatching(/\bspawn\s*\(/), ['agent/toolExecutor.ts']);
-  assert.deepEqual(await filesMatching(/from 'node:child_process'/), ['agent/toolExecutor.ts']);
+  assert.deepEqual(await filesMatching(/from 'node:child_process'/), ['agent/toolExecutor.ts', 'sync/deviceInfo.ts']);
 });
 
 test('boundary: recursive file watching stays confined to the skill registry', async () => {

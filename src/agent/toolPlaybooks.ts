@@ -28,7 +28,8 @@ export type ToolPlaybookKind =
   | 'git-write'
   | 'test-run'
   | 'release'
-  | 'sensitive-config';
+  | 'sensitive-config'
+  | 'sync-readonly';
 
 export interface ToolPlaybook {
   kind: ToolPlaybookKind;
@@ -60,6 +61,15 @@ export interface ToolPlaybook {
 const ALWAYS_ALLOWED: readonly string[] = [
   // 元工具
   'update_todos', 'ask_user_choice', 'load_skill', 'search_conversation_history',
+  /*
+   * 团队沟通：**任何一轮都必须能说话**。
+   *
+   * 用户实况（2026-11-25）：macOS 那台在「项目不一致 → 只读执行」里跑，
+   * 工具被收窄成这份白名单，而 `team_sync` 不在里面 ——
+   * agent 只能说「这次会话里没有可用的群消息工具，解析/确认/结果都发不到团队群」。
+   * 沟通不是写操作，不该被工具收窄剥夺。
+   */
+  'team_sync',
   // 只读
   'list_workspace_roots', 'list_directory', 'list_files', 'search_files', 'read_file',
   'open_file', 'get_diagnostics',
@@ -69,6 +79,27 @@ const ALWAYS_ALLOWED: readonly string[] = [
 
 /** 写意图：出现这些词就说明用户要动文件，此时不缩写工具。 */
 const WRITE_INTENT = /(?:改|修|加|删|写|创建|新建|重命名|替换|实现|重构|生成文件|保存到|落盘)|\b(?:fix|add|remove|delete|write|create|rename|replace|refactor|implement|edit)\b/i;
+
+/**
+ * 只读执行：**唯一一个连写意图都不能撤销收窄**的任务类型。
+ *
+ * 用在哪：群里来的任务，但两台设备做的不是同一个项目。
+ *
+ * 用户的要求是「不管是不是一个项目，都要能回复」——所以不能像以前那样直接拒绝、
+ * 只丢一句「项目不一致」。但也不能让它去改另一个项目的代码。
+ *
+ * 折中就是这一档：**能读、能答、能查，不能写**。留 `narrowWrites: false`，
+ * 意味着即使这句话里出现「改」「修」这类写意图，收窄依然生效 —— 这是安全阀，
+ * 不能被提示词或用户措辞绕过去。
+ */
+export const SYNC_READ_ONLY_PLAYBOOK: ToolPlaybook = {
+  kind: 'sync-readonly',
+  preferred: [],
+  blocked: ['write_file', 'delete_file', 'apply_patch', 'run_command', 'run_in_terminal'],
+  allowed: [...ALWAYS_ALLOWED],
+  directive: '本轮是**只读**：可以读代码、回答、给依据，但绝不修改任何文件、不执行会改文件的命令。',
+  narrowWrites: false,
+};
 
 export function hasWriteIntent(text: string | undefined): boolean {
   const value = String(text ?? '');

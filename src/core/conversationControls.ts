@@ -74,6 +74,26 @@ export function resolveNewConversationControls(draft?: ConversationControlSource
 }
 
 /**
+ * 「团队任务」对话框的初始运行时设置。
+ *
+ * 与普通新对话**不同**，是**用户明确要求**的（2026-11-24）：
+ * 「团队群消息里面的任务，请使用和普通对话框不一样的对话框，使用『团队任务对话框』，
+ *   这种对话框默认使用自动权限、无限步数，完全访问的权限需要在群里回复然后用户回复授权。」
+ *
+ * 所以：
+ * - 权限 = `autopilot`（自动执行普通操作，**不是**完全访问）；
+ * - 步数 = `0`（工具条上的「无限制」）；
+ * - `full`（完全访问）**不在这里**：它必须由 agent 在群里说明、甲方回复授权后才生效，
+ *   见 `chatPanel` 里的群授权分支。这样既不用每条消息点一次，也不会一上来就是最高权限。
+ */
+export const TEAM_TASK_CONTROLS: Readonly<ConversationControls> = Object.freeze({
+  permissionPreset: 'autopilot',
+  agentMaxSteps: 0,
+  reasoningEffort: DEFAULT_REASONING_EFFORT,
+  internetReference: false,
+});
+
+/**
  * 存档里是不是一个可用的步数。
  *
  * `0` 是**合法的「无限制」**（工具条上的第四档），负数与非数字仍然是脏值。

@@ -10,7 +10,7 @@ import { isInsideWorkspace, normalizeFileReference, revealTargetFor } from '../a
 import { STRICT_PRESET, clampPreset, loadPolicy, modelAllowed } from '../core/policy';
 import { embedMentionedImages, rehostWebviewImageUrls, resolveLocalImage, rewriteMarkdownImagePaths } from '../agent/markdownImages';
 import { imageCapabilityPrompt, looksLikeImageRequest } from '../agent/imageRequest';
-import { blockedToolReason, detectPlaybooks, detectTestCommand, hasWriteIntent, narrowToolNames, type ToolPlaybook } from '../agent/toolPlaybooks';
+import { SYNC_READ_ONLY_PLAYBOOK, blockedToolReason, detectPlaybooks, detectTestCommand, hasWriteIntent, narrowToolNames, type ToolPlaybook } from '../agent/toolPlaybooks';
 import { BRIDGED_TOOL_PREFIX, trimToolSurface, wantsBridgedTools } from '../agent/toolSurface';
 import { findRemoteImages, resolveRemoteImages } from '../agent/remoteImages';
 import { chooseReferenceMatch } from '../agent/fileReferenceResolve';
@@ -30,7 +30,7 @@ import { gitWriteAuthorization } from '../agent/conversationScope';
 import { VERSION_RULE_PROMPT, argumentsMentionVersionBump, versionBumpAuthorization } from '../agent/releasePolicy';
 import { TODO_LIST_PROMPT } from '../agent/todoPrompt';
 import { teamSyncToolDefinition } from '../sync/lanTool';
-import { TEAM_GROUP_PROMPT } from '../sync/lanProtocol';
+import { TEAM_GROUP_PROMPT, deviceLabel } from '../sync/lanProtocol';
 import { droppedCompletedTodos, hasTodoReplanIntent, splitTodoScope } from '../agent/todoScope';
 import { COMMAND_BLOCK_PROMPT } from '../agent/commandPrompt';
 import { NOTICE_PROMPT } from '../agent/noticePrompt';
@@ -107,7 +107,7 @@ function defaultSaveDirectory(): string {
   const first = vscode.workspace.workspaceFolders?.[0];
   return first ? first.uri.fsPath : homedir();
 }
-import { NEW_CONVERSATION_CONTROLS, controlChangeScope, isReasoningEffort, presetChangeScope, resolveConversationControls, resolveNewConversationControls, type ConversationControls } from '../core/conversationControls';
+import { NEW_CONVERSATION_CONTROLS, TEAM_TASK_CONTROLS, controlChangeScope, isReasoningEffort, presetChangeScope, resolveConversationControls, resolveNewConversationControls, type ConversationControls } from '../core/conversationControls';
 import { PERMISSION_PRESET_IDS, permissionPresetDetail, permissionPresetDetails } from '../core/permissions';
 import { currentLanguage, messageScriptTag, t, tt, type Language } from '../core/i18n';
 import { isConversationMode, modePromptInstruction, resolveActiveMode, resolveConversationMode } from '../core/modes';
@@ -237,6 +237,12 @@ interface SendOptions {
   /** 来自同步需求时记下需求号，运行结束时据此回报进度。 */
   syncRequirementId?: string;
   /**
+   * 只读执行（不给写工具）。
+   *
+   * 用在哪：群里来的任务但两台项目不一致 —— 要能回答，但不能改另一个项目的代码。
+   */
+  syncReadOnly?: boolean;
+  /**
    * 这一轮的结局回执（只给 `origin === 'sync'` 用）。
    *
    * 手机那头看不见电脑上的弹窗：没同意数据流向、没配 API Key、被策略拦下，
@@ -310,6 +316,14 @@ interface ConversationRun {
    * 这是「两边一起执行、并且能核对做没做齐」的闭环。
    */
   syncRequirementId?: string;
+  /**
+   * 这一轮是不是「群里的活」（群窗口发的需求 / 对端发来的需求 / 团队任务对话）。
+   *
+   * 为什么不只看 `syncRequirementId`：中途暂停、续跑、对话轮换之后那个字段会丢，
+   * 一旦丢了就整段跳过回执 —— 用户看到的就是「跑完了群里一句话也没有」。
+   * 这个标记在起跑时按来源一次性定下来，不再依赖任何会丢的 id。
+   */
+  groupRun?: boolean;
   toolContentOffsets: Map<string, number>;
   checkpointTail: Promise<void>;
   lastCheckpointByMessage: Map<string, number>;
@@ -620,6 +634,23 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
   private localOnlyNoticeShown = false;
   /** 等待用户在面板里点「允许一次 / 拒绝」的工具授权。 */
   private readonly pendingApprovals = new Map<string, PendingApproval>();
+  /** 群里发出去的授权请求 → 对应的审批结算函数（群里回一句就点掉）。 */
+  private readonly groupApprovals = new Map<string, (allowed: boolean) => void>();
+  /**
+   * 群里每条需求的开始时间。
+   *
+   * 回执里带上真实耗时 —— 用户反馈「macOS 回复很快，Windows 慢很多」，
+   * 有了这个数字就不用再靠感觉判断是谁慢、慢在哪一节（模型往返 vs 执行）。
+   */
+  private readonly syncRunStarted = new Map<string, number>();
+  /**
+   * 群里等着的「选择」。
+   *
+   * 团队任务的决策卡改到群里问（选项 + 编号），甲方回「1」「2」或选项名就结算。
+   */
+  private readonly groupDecisions = new Map<string, { options: string[]; resolve: (chosenIndex: number, custom?: string) => void }>();
+  /** 冷启动时用标题认「团队任务」对话（还没走 findTeamConversation 的时候）。 */
+  private readonly teamConversationTitles = new Set<string>();
   private readonly pendingDecisions = new Map<string, PendingDecision>();
   private decisionSequence = 0;
   /**
@@ -915,6 +946,23 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
    */
   setLanSync(service: import('../sync/lanSync').LanSyncService | undefined): void {
     this.lanSync = service;
+    /*
+     * 关掉协作 = 没有团队群了：把「团队任务」对话收起来。
+     *
+     * 用户要求「没有团队群时候隐藏」。这里用归档（可恢复）而不是删除 ——
+     * 万一还在跑的东西需要回看，不至于把历史弄丢。
+     */
+    if (!service) void this.hideTeamConversation();
+  }
+
+  /** 把「团队任务」对话归档，让它从对话列表里消失（可恢复）。 */
+  private async hideTeamConversation(): Promise<void> {
+    const teamId = await this.findTeamConversation().catch(() => undefined);
+    if (!teamId) return;
+    if (this.activeConversationId === teamId) this.setActiveConversation(undefined);
+    await this.storage.setArchived(teamId, true).catch(() => undefined);
+    this.groupConversationId = undefined;
+    this.log('[sync] 团队群已关闭：把「团队任务」对话收起');
   }
 
   /** 面板是否正忙（同步消息进来自动开跑之前先问一次）。 */
@@ -928,7 +976,10 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
    * 返回 false 表示这次没跑（面板在忙 / 没有可用会话）—— 服务会记下这条需求，
    * 用户之后仍能在账本和 `team_sync status` 里看到，不会凭空消失。
    */
-  async runSyncRequirement(requirement: import('../sync/lanProtocol').SyncRequirement): Promise<boolean> {
+  async runSyncRequirement(
+    requirement: import('../sync/lanProtocol').SyncRequirement,
+    options: { readOnly?: boolean } = {},
+  ): Promise<boolean> {
     if (!this.lanSync || this.syncBusy()) return false;
     const { requirementPromptForLocal, renderGroupLine } = await import('../sync/lanProtocol.js');
     /*
@@ -936,13 +987,71 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
      *
      * 没有这段，两边会向甲方提同样的问题，或者队友已经确认过的结论本机又推翻一次。
      */
-    const groupLines = this.lanSync.recentGroup(10).map((message) => renderGroupLine(message));
-    const prompt = requirementPromptForLocal(requirement, this.lanSync.localPeer(), groupLines);
+    const groupLines = this.lanSync.recentGroup(10).map((message) => renderGroupLine(
+      message,
+      [this.lanSync!.localPeer(), ...this.lanSync!.groupState().peers],
+      this.lanSync!.localPeer().id,
+    ));
+    const prompt = requirementPromptForLocal(requirement, this.lanSync.localPeer(), groupLines, {
+      projectRoot: this.localProjectRoot(requirement.project),
+      projectName: this.lanSync.activeProjectName(),
+      peers: this.lanSync.groupState().peers.filter((peer) => peer.id !== this.lanSync!.localPeer().id),
+      ...(options.readOnly ? { readOnly: true } : {}),
+    });
+    /*
+     * 群里标一下「这条活属于哪个项目」。
+     *
+     * 用户要求执行过程做项目标记：两个项目交替发任务时，
+     * 只看对话标题分不清哪条是哪个项目的，容易改错地方。
+     */
+    await this.lanSync.postGroup({
+      author: 'agent',
+      phase: 'progress',
+      body: `【项目 ${requirement.project || this.lanSync.activeProjectName() || '（未命名）'}】这台开始${options.readOnly ? '只读处理' : '执行'}：${requirement.title}`,
+      requirementId: requirement.id,
+    }).catch(() => undefined);
+    // 记下这一轮的开始时间：回执里给出真实耗时，用来对比两台快慢（别再靠感觉）。
+    this.syncRunStarted.set(requirement.id, Date.now());
     await this.send(prompt, undefined, undefined, undefined, undefined, undefined, {
       origin: 'sync',
       syncRequirementId: requirement.id,
+      ...(options.readOnly ? { syncReadOnly: true } : {}),
     });
     return true;
+  }
+
+  /**
+   * 从这句话里认出「派给哪台设备」（界面上没选的时候用）。
+   *
+   * 判定用 `assignIntent.ts`：既有设备线索（mac / 苹果 / Windows / 设备名）
+   * 又有指派词（让 / 交给 / 由 / 那边 …）才算，唯一命中才返回。
+   */
+  private async resolveAssignee(text: string): Promise<string> {
+    if (!this.lanSync) return '';
+    const { resolveAssigneeFromText } = await import('../sync/assignIntent.js');
+    const peers = this.lanSync.groupState().peers;
+    const hit = resolveAssigneeFromText(
+      text,
+      peers.map((peer) => ({ id: peer.id, name: peer.name, platform: peer.platform })),
+    );
+    if (!hit) return '';
+    this.log(`[sync] 从这句话认出指派给「${hit.name}」`);
+    return hit.id;
+  }
+
+  /** 任务所属项目在本机的目录（找不到就退回当前项目，绝不猜别的项目）。 */
+  private localProjectRoot(projectName?: string): string {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (!folders.length) return '';
+    const hit = projectName
+      ? folders.find((folder) => basename(folder.uri.fsPath).toLowerCase() === projectName.toLowerCase())
+      : undefined;
+    if (hit) return hit.uri.fsPath;
+    if (projectName) return '';
+    const activePath = vscode.window.activeTextEditor?.document.uri.fsPath ?? '';
+    return folders.find((folder) => activePath.startsWith(folder.uri.fsPath))?.uri.fsPath
+      ?? folders[0]?.uri.fsPath
+      ?? '';
   }
 
   /**
@@ -957,6 +1066,263 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     const prompt = notePromptForLocal(note, this.lanSync.localPeer());
     await this.send(prompt, undefined, undefined, undefined, undefined, undefined, { origin: 'sync' });
     return true;
+  }
+
+  /**
+   * 群里转来的活固定用这同一条对话。
+   *
+   * 找不到就建一条叫「团队群」的，并把它记下来；下一次直接复用。
+   * 这样既不会每来一条消息就冒出一张新对话，权限也只需要在这一条上设一次。
+   */
+  private groupConversationId: string | undefined;
+  /** 「群里的活在哪条对话里跑」只提示一次，不刷屏。 */
+  private groupChatAnnounced = false;
+
+  /**
+   * 团队任务对话过大：归档旧的，带着交接摘要开一条新的。
+   *
+   * 「过大」的代价是真实的（用户实况：Windows 近 10 分钟 vs mac 12 秒）：
+   * 一条对话堆到几十万字符后，模型每一步都要重读，慢得不成样子。
+   * 换新对话**不影响权限**：新对话仍按 `TEAM_TASK_CONTROLS`（自动权限 + 无限步数）初始化；
+   * 群里授权过的「完全访问」需要重新授权 —— 这一点在交接摘要里写明。
+   */
+  private async rotateTeamConversation(previous: { id: string; messageCount?: number; totalTokens?: number }): Promise<void> {
+    try {
+      const title = this.lanSync?.latestRequirementTitle() ?? '';
+      const project = this.lanSync?.activeProjectName() ?? '';
+      const now = new Date().toTimeString().slice(0, 5);
+      // 把上一轮的结论写进旧对话末尾，人翻历史时能看懂为什么换了一条。
+      await this.storage.appendMessage(previous.id, {
+        role: 'assistant',
+        content: [
+          `【这一条对话太长了（${previous.messageCount ?? '?'} 条消息 / 约 ${previous.totalTokens ?? 0} tokens），已换一条新的继续】`,
+          '原因：历史越长每一步越慢。',
+          `交接：项目 ${project || '（未命名）'}，最近任务「${title || '（无）'}」，${now} 换新。`,
+          '新对话从「自动权限 + 无限步数」开始；如果之前群里授权过完全访问，需要重新授权一次。',
+        ].join('\n'),
+      }).catch(() => undefined);
+      await this.storage.setArchived(previous.id, true).catch(() => undefined);
+      this.teamConversationTitles.delete(previous.id);
+      this.log(`[sync] 团队任务对话过大，已归档 ${previous.id} 并换新`);
+    } catch (error) {
+      this.log(`[sync] 轮换团队任务对话失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** 这条对话是不是「团队任务」对话（只读执行窗口）。 */
+  private isTeamConversation(id: string | undefined): boolean {
+    if (!id) return false;
+    if (this.groupConversationId) return this.groupConversationId === id;
+    // 冷启动时还没解析过：按标题认一次，避免第一条消息就漏过去。
+    return this.teamConversationTitles.has(id);
+  }
+
+  /** 在团队任务对话里发东西 = 干扰，直接拒绝并说明指令从哪来。 */
+  private async rejectTeamInput(): Promise<void> {
+    this.log('[sync] 忽略「团队任务」对话里的输入（指令只从团队群下达）');
+    await this.post({
+      type: 'toast',
+      tone: 'neutral',
+      text: tt('sync.teamTaskReadOnly'),
+    }).catch(() => undefined);
+  }
+
+  /**
+   * 团队任务对话的最大体量。
+   *
+   * 用户实况（2026-11-24）：mac 12 秒答完，Windows 花近 10 分钟确认一件小事。
+   * 查下来不是"读项目慢"，而是我把所有群任务都固定堆进同一条对话 ——
+   * Windows 那条堆到 19 条消息 / 544KB（≈27 万字符），模型**每一步都要重读一遍**，
+   * mac 那条只有 4k tokens。同样的活，一头是几秒，一头是几百秒。
+   *
+   * 所以：超过这个体量就换一条新的，只带一段交接摘要（项目、上一轮结论、改过什么）。
+   * 权限不用重设 —— 新对话仍然按 `TEAM_TASK_CONTROLS` 初始化。
+   */
+  private static readonly TEAM_CONVERSATION_MAX_MESSAGES = 24;
+  private static readonly TEAM_CONVERSATION_MAX_TOKENS = 40_000;
+
+  /** 这条团队任务对话是不是太大了，该换一条。 */
+  private teamConversationTooLarge(summary: { messageCount?: number; totalTokens?: number } | undefined): boolean {
+    if (!summary) return false;
+    const messages = summary.messageCount ?? 0;
+    const tokens = summary.totalTokens ?? 0;
+    return messages >= ChatPanel.TEAM_CONVERSATION_MAX_MESSAGES
+      || tokens >= ChatPanel.TEAM_CONVERSATION_MAX_TOKENS;
+  }
+
+  /**
+   * 找「团队任务」对话框，**不创建**。
+   *
+   * 授权必须只作用于已经存在的团队任务对话：以前这里直接走 `ensureGroupConversation()`，
+   * 甲方在群里随便回一句「同意」，就会凭空建出一条自动权限的对话 —— 权限从零泄漏。
+   */
+  private async findTeamConversation(): Promise<string | undefined> {
+    const title = tt('sync.teamTaskTitle');
+    const existing = (await this.storage.listConversations().catch(() => []))
+      .find((item) => item.title === title && !item.archived);
+    if (!existing) return undefined;
+    this.groupConversationId = existing.id;
+    this.teamConversationTitles.add(existing.id);
+    return existing.id;
+  }
+
+  private async ensureGroupConversation(): Promise<string | undefined> {
+    /*
+     * **没有团队群就没有这条对话**。
+     *
+     * 用户要求：「团队任务对话框，没有团队群时候隐藏，有团队群的时候才显示，不新建对话框。」
+     * 所以先看协作是否真的开着；没开就什么也不建，避免历史里多出一条空对话。
+     */
+    if (!this.lanSync || this.lanSync.state().role === 'off') return undefined;
+    if (this.groupConversationId) {
+      const alive = await this.storage.getConversation(this.groupConversationId).catch(() => undefined);
+      /*
+       * 太大了就换一条新的 —— 否则每一步都要重读整段历史，一台几秒、一台几百秒。
+       * 换之前留一段交接摘要，人还能看懂上一轮做到哪。
+       */
+      if (alive && this.teamConversationTooLarge(alive)) {
+        await this.rotateTeamConversation(alive);
+      } else if (alive) {
+        return this.groupConversationId;
+      }
+      this.groupConversationId = undefined;
+    }
+    const title = tt('sync.teamTaskTitle');
+    // 关群时是「归档」隐藏，重新开群就复用同一条（不新建、历史连续）。
+    const existing = (await this.storage.listConversations().catch(() => []))
+      .find((item) => item.title === title);
+    if (existing) {
+      if (existing.archived) await this.storage.setArchived(existing.id, false).catch(() => undefined);
+      this.groupConversationId = existing.id;
+      this.teamConversationTitles.add(existing.id);
+      return existing.id;
+    }
+    const settings = readSettings();
+    const created = await this.storage
+      .createConversation(title, settings.model, resolveActiveMode({ defaultMode: settings.defaultMode }))
+      .catch(() => undefined);
+    if (!created) return undefined;
+    this.groupConversationId = created.id;
+    this.teamConversationTitles.add(created.id);
+    /*
+     * 「团队任务」对话框用自己的初始设置（自动权限 + 无限步数）。
+     *
+     * 普通新对话从最严格的「每次询问」开始是有意的安全设计；但群里来的活
+     * 每条都要点一遍授权，等于没法用。所以这一类对话框单独一套默认值 ——
+     * 完全访问仍然不在这里，必须群里授权后才放开。
+     */
+    await this.storage.updateConversation(created.id, { ...TEAM_TASK_CONTROLS }).catch(() => undefined);
+    this.log(`[sync] 群里的活统一记在对话「${title}」里（${created.id}，自动权限 · 无限步数）`);
+    if (!this.groupChatAnnounced) {
+      this.groupChatAnnounced = true;
+      await this.post({
+        type: 'toast',
+        tone: 'neutral',
+        text: tt('sync.groupChatHint', { title }),
+      }).catch(() => undefined);
+    }
+    return created.id;
+  }
+
+  /**
+   * 群里授权「完全访问」。
+   *
+   * 甲方在群里回一句授权的话（「授权」「同意完全访问」…），这条才把
+   * 团队任务对话框放宽到 `full`。授权是有记号的：只有最近一条群消息是
+   * 权限申请时才算，避免甲方说别的被理解成放权。
+   */
+  private async authoriseFullAccess(): Promise<boolean> {
+    if (!this.lanSync) return false;
+    /*
+     * 只放宽**已经存在**的团队任务对话，绝不顺手建一条。
+     *
+     * 否则甲方在群里随便说一句「同意」，就会凭空出现一条自动权限对话。
+     */
+    const teamId = await this.findTeamConversation();
+    if (!teamId) return false;
+    await this.storage.updateConversation(teamId, { permissionPreset: 'full' });
+    this.log(`[sync] 按群里授权把「团队任务」对话放宽为完全访问（${teamId}，只影响这一条）`);
+    await this.lanSync.postGroup({
+      author: 'agent',
+      phase: 'analysis',
+      body: tt('sync.fullAccessGranted'),
+    }).catch(() => undefined);
+    return true;
+  }
+
+  /**
+   * 在群里直接答一句（不跑工具、不动文件），并带上本机的项目事实。
+   *
+   * 本机自己发的话、以及**另一台发来的话**都走这里 ——
+   * 群里有两个 agent，甲方说「报数」，两台都该各自报自己的情况，
+   * 而不是只有发消息那台在自言自语。
+   */
+  private async answerInGroup(message: string, recent: readonly string[]): Promise<void> {
+    const { answerGroupChat } = await import('../sync/groupIntent.js');
+    const local = this.lanSync?.localPeer();
+    if (!this.lanSync || !local) return;
+    /*
+     * 项目路径要跟着「当前项目」走，不能写死工作区第一个文件夹：
+     * 多根工作区里那个通常是列表里的第一个，和用户在做的事无关。
+     */
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    const activePath = vscode.window.activeTextEditor?.document.uri.fsPath ?? '';
+    const projectPath =
+      folders.find((folder) => basename(folder.uri.fsPath) === local.project)?.uri.fsPath
+      ?? folders.find((folder) => activePath.startsWith(folder.uri.fsPath))?.uri.fsPath
+      ?? folders[0]?.uri.fsPath
+      ?? '';
+    const controller = new AbortController();
+    try {
+      const answer = await answerGroupChat(
+        this.client,
+        readSettings(),
+        message,
+        controller.signal,
+        recent,
+        local.name,
+        {
+          projectName: local.project,
+          projectRepo: this.lanSync.currentRepo(),
+          projectPath,
+          members: [local.name, ...this.lanSync.remotePeers().map((item) => item.name)],
+        },
+      );
+      await this.lanSync.postGroup({ author: 'agent', phase: 'analysis', body: answer });
+    } finally {
+      this.lanSync.endPendingGroup();
+    }
+  }
+
+  /**
+   * 另一台在群里说了一句话（已被对方判定为「闲聊 / 问答」）。
+   *
+   * 本机也要接一句：群里两个 agent，各报各的情况才算都在场。
+   * 顺手处理「换项目」—— 对方切了项目，本机有这个项目就一起切过去。
+   */
+  async answerRemoteGroupChat(body: string): Promise<void> {
+    if (!this.lanSync) return;
+    const text = (body ?? '').trim();
+    if (!text) return;
+    const { resolveProjectFromText } = await import('../sync/projectIntent.js');
+    const repos = this.lanSync.localProjectRepos();
+    const wanted = resolveProjectFromText(
+      text,
+      this.lanSync.localProjects().map((name, index) => ({ name, repo: repos[index] || '' })),
+    );
+    if (wanted) {
+      await this.lanSync.setCollabProject(wanted.name, wanted.repo);
+      await this.lanSync.postGroup({
+        author: 'agent',
+        phase: 'analysis',
+        body: `这台也切到「${wanted.name}」了，项目 ID：${wanted.repo || '（该文件夹未绑定 GitHub 仓库）'}。`,
+      });
+      return;
+    }
+    const recentGroupLines = this.lanSync.recentGroup(6);
+    const recentRoster = recentGroupLines.map((item) => item.from);
+    const recent = recentGroupLines.map((item) => `${deviceLabel(item.from, recentRoster)}：${item.body}`);
+    await this.answerInGroup(text, recent);
   }
 
   /**
@@ -1027,21 +1393,126 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
 
   /** 跑一轮同步需求之后回报进度：对方的账本靠这条更新。 */
   private async reportSyncOutcome(run: ConversationRun, outcome: TodoRunOutcome): Promise<void> {
-    const requirementId = run.syncRequirementId;
-    if (!this.lanSync || !requirementId) return;
+    if (!this.lanSync) return;
+    /*
+     * 需求号可能为空：中途暂停、续跑、或 agent 自己换了会话时，
+     * `run.syncRequirementId` 会丢。那就退回「群里最近一条需求」——
+     * 用户的实况是「Windows 执行后没有回复我消息」，正是因为这里拿不到号就整段跳过了。
+     */
+    const requirementId = run.syncRequirementId || this.lanSync.latestRequirementId();
+    /**
+     * 这一轮是不是跑在「团队任务」对话里：是就一定得回群。
+     *
+     * 判据用**起跑时记下的** `groupRun`，不再只看 `groupConversationId`：
+     * 重载后还没解析出那条对话、或者对话轮换过，`groupConversationId` 会是空的，
+     * 于是明明跑的是群里的活却不回执 —— 用户看到「跑完群里一句话没有」。
+     */
+    const isGroupRun = run.groupRun === true
+      || (Boolean(this.groupConversationId) && run.conversationId === this.groupConversationId);
     const files = [...new Set(run.globalTools.flatMap((tool) => tool.changedFiles ?? []))].slice(0, 40);
-    const status = outcome === 'completed' ? 'done' : 'in_progress';
     const lastText = [...run.responses.values()]
       .map((response) => response.content.trim())
       .filter(Boolean)
       .slice(-1)[0] ?? '';
-    await this.lanSync.report({
-      requirementId,
-      status,
-      summary: lastText.replace(/\s+/g, ' ').slice(0, 400),
-      files,
-      note: outcome === 'completed' ? '' : '本端这一轮没有跑完（被停止或出错），可以接着做。',
-    }).catch(() => undefined);
+    if (requirementId) {
+      const status = outcome === 'completed' ? 'done' : 'in_progress';
+      await this.lanSync.report({
+        requirementId,
+        status,
+        summary: lastText.replace(/\s+/g, ' ').slice(0, 400),
+        files,
+        note: outcome === 'completed' ? '' : '本端这一轮没有跑完（被停止或出错），可以接着做。',
+      }).catch(() => undefined);
+    }
+    /*
+     * **跑完必须回群里说一句**，不能只写账本。
+     *
+     * 用户的实况：改完权限后任务自己接着跑，跑完了群里什么也没有，
+     * 只能自己去翻对话才知道做完了。以前这里靠模型自觉调 team_sync 回报，
+     * 一旦它没调（或者中途被暂停/续跑），群里就静悄悄的。
+     */
+    if (requirementId || isGroupRun) {
+      await this.postGroupOutcome(requirementId, outcome, lastText, files).catch(() => undefined);
+    }
+  }
+
+  /** 群里回报这一轮的结果（确定性，不依赖模型是否调用了 team_sync）。 */
+  private async postGroupOutcome(
+    requirementId: string,
+    outcome: TodoRunOutcome,
+    lastText: string,
+    files: readonly string[],
+  ): Promise<void> {
+    if (!this.lanSync) return;
+    // 号为空时先解析成「群里最近一条需求」，否则去重会失效、每轮都重复发。
+    const id = requirementId || this.lanSync.latestRequirementId();
+    const selfId = this.lanSync.localPeer().id;
+    const already = Boolean(id) && this.lanSync.recentGroup(40).some(
+      (item) => item.requirementId === id
+        && item.author === 'agent'
+        && item.from.id === selfId
+        && (item.phase === 'result' || item.phase === 'blocked'),
+    );
+    if (already) return;
+    const requirement = this.lanSync.requirementById(id);
+    const project = requirement?.project || this.lanSync.activeProjectName() || '';
+    const done = outcome === 'completed';
+    /*
+     * 真实耗时：给「哪台慢」一个可核对的数字。
+     * 没有开始时间（旧记录 / 续跑）时不显示，绝不编一个。
+     */
+    const startedAt = this.syncRunStarted.get(id);
+    this.syncRunStarted.delete(id);
+    const elapsed = startedAt ? Math.max(0, Math.round((Date.now() - startedAt) / 1000)) : undefined;
+    const took = elapsed === undefined ? '' : `，用时 ${elapsed}s`;
+    /*
+     * 没跑完 → 不是一句「可以接着做」，而是**在群里把话说到能继续**。
+     *
+     * 用户要求：「任务没执行完，agent 停止了（阶段性的，或者任何其他问题），
+     * 都需要在团队群里说明，或者讨论（和别的 agent 或者用户讨论）得到解答，
+     * 下阶段任务再继续」。
+     *
+     * 所以用 phase=question 发出去（不是 progress）：
+     *   1. 群里会把它算成「等你回复」，甲方下一句话就接在这条需求上继续；
+     *   2. 另一台 agent 也在群里，它能看到并回答／接走。
+     */
+    if (!done) {
+      /*
+       * **正文只用 agent 自己说的话**（用户 2026-11-24：
+       * 「我看到的是程序或者提示词设置好的程序，而不是 agent 的智能输出」）。
+       *
+       * 项目 / 用时 / 改动文件 / 被停止 —— 这些机器可读的信息放进 `meta`，
+       * 由界面渲染成小标签；选项放进 `options`，由界面画成按钮。
+       * 只有 agent 什么都没说（空回复、一步没跑）时才用一句兜底。
+       */
+      const body = lastText.trim()
+        || '这一轮没有产生结论：我还需要一点信息才能继续。';
+      await this.lanSync.postGroup({
+        author: 'agent',
+        phase: 'question',
+        body,
+        requirementId: id,
+        options: ['接着做', '换个做法', '让另一台先做'],
+        meta: {
+          ...(project ? { project } : {}),
+          ...(elapsed !== undefined ? { seconds: elapsed } : {}),
+          ...(files.length ? { files: [...files] } : {}),
+          stopped: true,
+        },
+      });
+      return;
+    }
+    await this.lanSync.postGroup({
+      author: 'agent',
+      phase: 'result',
+      body: lastText.trim() || '这一轮做完了。',
+      requirementId: id,
+      meta: {
+        ...(project ? { project } : {}),
+        ...(elapsed !== undefined ? { seconds: elapsed } : {}),
+        ...(files.length ? { files: [...files] } : {}),
+      },
+    });
   }
 
   /**
@@ -1437,6 +1908,22 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     if (killed) this.log(`[stop] 已立即终止 ${killed} 个子进程`);
   }
 
+  /**
+   * 停掉**群里的那轮活**（团队任务对话），而不是用户此刻正在翻的任意对话。
+   *
+   * 团队群窗口的「停止执行」点的是群；如果它按 `activeConversationId` 去停，
+   * 用户正好翻着另一条对话时就什么也停不掉 —— 界面上按了没反应。
+   */
+  async stopTeamTask(): Promise<{ ok: boolean; message: string }> {
+    const teamId = this.groupConversationId ?? await this.findTeamConversation().catch(() => undefined);
+    const run = this.runFor(teamId);
+    if (!run) return { ok: false, message: '这台没有正在执行的团队任务' };
+    const killed = this.toolExecutor.killRunProcesses(run.controller.signal);
+    run.controller.abort();
+    if (killed) this.log(`[stop] 已立即终止 ${killed} 个子进程`);
+    return { ok: true, message: '这台已停止执行' };
+  }
+
   dispose(): void {
     for (const run of this.runs.values()) run.controller.abort();
     // 关窗口前把还没落盘的任务记忆写掉：这是下一轮的记忆，不能只停在去抖计时器里。
@@ -1556,6 +2043,17 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
           if (this.activeConversationId) await this.continueFromConversation(this.activeConversationId);
           break;
         case 'send':
+          /*
+           * 「团队任务」对话**不接受任何输入**。
+           *
+           * 用户要求：「删掉不只是 UI 层面，还是功能层面，避免再出现干扰的情况」——
+           * 这类对话的指令只从团队群来，在它自己的输入框里发东西会造成两处指令打架
+           * （一条来自群、一条来自对话框，权限/项目/需求号全对不上）。
+           */
+          if (this.isTeamConversation(this.activeConversationId)) {
+            await this.rejectTeamInput();
+            break;
+          }
           if (this.isViewingRunningConversation()) {
             await this.queueRunningMessage(message.text);
           } else {
@@ -1571,6 +2069,19 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
           }
           break;
         case 'stop':
+          /*
+           * 团队任务窗口的「停止执行」和团队群那颗按钮是同一件事：
+           * 群里的活停，**群里每一台都停**。只停本机的话，
+           * 另一台还在改文件，甲方以为全停了。
+           */
+          if (this.isTeamConversation(this.activeConversationId) && this.lanSync) {
+            const fan = this.lanSync;
+            void this.stopTeamTask().then((local) => {
+              this.log(`[stop] ${local.message}`);
+              return fan.broadcastStop();
+            }).then((result) => this.log(`[stop] ${result.message}`)).catch(() => undefined);
+            break;
+          }
           this.stop();
           break;
         case 'beginEditTaskMessage':
@@ -1686,12 +2197,16 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
           await this.openQuickLaunchDetail();
           break;
         case 'setPermissionPreset':
+          // 团队任务对话的权限由「群里授权」决定，不接受界面改（避免两个来源打架）。
+          if (this.isTeamConversation(this.activeConversationId)) { await this.rejectTeamInput(); break; }
           await this.setPermissionPreset(message.permissionPreset);
           break;
         case 'setAgentMaxSteps':
+          if (this.isTeamConversation(this.activeConversationId)) { await this.rejectTeamInput(); break; }
           await this.setAgentMaxSteps(message.agentMaxSteps);
           break;
         case 'setReasoningEffort':
+          if (this.isTeamConversation(this.activeConversationId)) { await this.rejectTeamInput(); break; }
           await this.setReasoningEffort(message.reasoningEffort);
           break;
         case 'setInternetReference':
@@ -1984,6 +2499,16 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     options?: SendOptions,
   ): Promise<void> {
     let content = text.trim();
+    /*
+     * 最后一道闸：从界面来的输入不能进「团队任务」对话。
+     *
+     * handler 里已经拦了一次，这里再拦一次是因为还有别的入口（续跑、队列、快捷键…）：
+     * 用户要求「功能层面也不要接受输入」，只靠 UI 隐藏不够。
+     */
+    if (!options?.origin && this.isTeamConversation(this.activeConversationId)) {
+      await this.rejectTeamInput();
+      return;
+    }
     const sendKey = this.activeConversationId ?? 'draft';
     if (!content && !this.pendingAttachments.length && !this.pendingContext) {
       return;
@@ -1993,11 +2518,48 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       await this.rejectSend(content, messageKey, vars);
       options?.onOutcome?.({ ok: false, reasonKey: messageKey, ...(vars ? { vars } : {}) });
     };
+    /*
+     * 群里发的消息**永远不能被这条锁吞掉**。
+     *
+     * 用户实况：「Windows 的团队任务对话框正在执行任务的时候，Windows 的团队群输入框的
+     * 消息就发不出去，被吞掉了」。原因：`send()` 会一直等到整轮跑完才释放 `pendingSends`，
+     * 而群消息和普通消息共用同一把锁（key = 当前对话）—— 任务跑多久，群就被堵多久，
+     * 而且是在**发到群之前**就被判忙返回，所以群里什么都看不到。
+     *
+     * 现在：群消息遇到忙 → 按既有规则「只执行最新的」，停掉当前这一轮腾出位置，
+     * 再照常把这条发进群并开跑；实在腾不出来的话，也至少发进群并说明，绝不静默丢弃。
+     */
+    const isGroupSend = options?.origin === 'group';
     if (this.pendingSends.has(sendKey)) {
-      // 连点/连按回车：界面那边已经画过乐观气泡了，这里给它一个回执让它退场。
-      await this.post({ type: 'sendRejected', text: content });
-      options?.onOutcome?.({ ok: false, reasonKey: 'notice.busyRejected' });
-      return;
+      if (!isGroupSend) {
+        // 连点/连按回车：界面那边已经画过乐观气泡了，这里给它一个回执让它退场。
+        await this.post({ type: 'sendRejected', text: content });
+        options?.onOutcome?.({ ok: false, reasonKey: 'notice.busyRejected' });
+        return;
+      }
+      try {
+        this.stop();
+      } catch { /* 停不下来也继续，下面还有兜底 */ }
+      // 给刚被停的那一轮一点时间收尾并把锁释放掉。
+      for (let wait = 0; wait < 20 && this.pendingSends.has(sendKey); wait += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (this.pendingSends.has(sendKey)) {
+        // 还是拿不到：至少让这条消息出现在群里，并说明会接着做，绝不静默丢弃。
+        this.log('[sync] 面板仍忙，群消息先记为需求，等这一轮结束再执行');
+        await this.lanSync?.postGroup({
+          author: 'user',
+          phase: 'requirement',
+          body: content,
+        }).catch(() => undefined);
+        await this.lanSync?.postGroup({
+          author: 'agent',
+          phase: 'progress',
+          body: '这条已经记进群里了。当前还有一轮在收尾，结束后我立刻接着做这条。',
+        }).catch(() => undefined);
+        this.lanSync?.endPendingGroup();
+        return;
+      }
     }
     this.pendingSends.add(sendKey);
     // 在外层声明：finally 里要用它来解除「创建中」保护。
@@ -2047,49 +2609,148 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
            *
            * 以前一律当成任务：群里说「报数」，右侧对话框就开跑一轮，还什么都不做。
            */
-          const { classifyGroupIntent, answerGroupChat } = await import('../sync/groupIntent.js');
-          const recentGroup = this.lanSync.recentGroup(6).map((item) => `${item.from.name}：${item.body}`);
-          const controller = new AbortController();
-          const verdict = await classifyGroupIntent(
-            this.client,
-            readSettings(),
-            content,
-            controller.signal,
-            recentGroup,
-          );
-          this.log(`[sync] 群消息判定：${verdict.intent}（${verdict.reason}）← ${content.slice(0, 40)}`);
-          if (verdict.intent === 'chat') {
-            // 先把用户这句记进群（否则群窗口里看不到自己说的话）。
-            await this.lanSync.postGroup({ author: 'user', phase: 'analysis', body: content });
-            const answer = await answerGroupChat(
-              this.client,
-              readSettings(),
-              content,
-              controller.signal,
-              recentGroup,
-              this.lanSync.localPeer().name,
-            );
-            await this.lanSync.postGroup({ author: 'agent', phase: 'analysis', body: answer });
+          const { resolveProjectFromText } = await import('../sync/projectIntent.js');
+          /*
+           * 群里回「1」「2」或选项名 → 结算团队任务等着的「选择」。
+           *
+           * 团队任务窗口里不再弹决策卡，选择一律在群里完成。
+           */
+          if (this.settleGroupDecision(content)) {
+            await this.lanSync.postGroup({ author: 'user', phase: 'answer', body: content });
+            this.lanSync.endPendingGroup();
             return;
           }
+          /*
+           * 群里回「授权 / 拒绝」→ 结算正在等的那张审批卡。
+           *
+           * 这是 OpenClaw 那种模式的关键：授权也在群里完成，
+           * 不用切回对话框点按钮。处理掉了就不再当普通群消息往下走。
+           */
+          if (this.settleGroupApproval(content)) {
+            await this.lanSync.postGroup({ author: 'user', phase: 'answer', body: content });
+            this.lanSync.endPendingGroup();
+            return;
+          }
+          /*
+           * 群里授权「完全访问」：必须在分类之前处理。
+           *
+           * 「授权」两个字会被当成闲聊，永远到不了执行层 ——
+           * 而团队任务对话框默认只到「自动权限」，需要完全访问时就得靠这一句。
+           * 只有上一条群消息确实是权限申请时才认，避免别的对话被误放权。
+           */
+          if (/\b(授权|同意|允许|批准)\b|authori[sz]e|grant/i.test(content)) {
+            const lastAgentQuestion = [...this.lanSync.recentGroup(8)]
+              .reverse()
+              .find((item) => item.author === 'agent' && item.phase === 'question');
+            if (lastAgentQuestion?.body.includes('权限申请')) {
+              await this.lanSync.postGroup({ author: 'user', phase: 'answer', body: content });
+              await this.authoriseFullAccess();
+              this.lanSync.endPendingGroup();
+              return;
+            }
+          }
+          /*
+           * 先把这句话画到群里，再去判断它是什么。
+           *
+           * 判断要问一次模型（一两秒），网络慢的那台更久 —— 等它回来才上屏，
+           * 用户看到的是「发完消息群里空着」，还以为没发出去。
+           */
+          this.lanSync.beginPendingGroup(content);
+          const recentMessages = this.lanSync.recentGroup(6);
+          const recentRoster = recentMessages.map((item) => item.from);
+          const recentGroup = recentMessages.map((item) => `${deviceLabel(item.from, recentRoster)}：${item.body}`);
+          /*
+           * 「用 xxx 项目」这类话直接执行，不必先分类。
+           *
+           * 用户要的是**在群里说一句就能切项目**，而不是先去菜单里选。
+           */
+          const repos = this.lanSync.localProjectRepos();
+          const wantedProject = resolveProjectFromText(
+            content,
+            this.lanSync.localProjects().map((name, index) => ({
+              name,
+              repo: repos[index] || '',
+            })),
+          );
+          if (wantedProject) {
+            await this.lanSync.setCollabProject(wantedProject.name, wantedProject.repo);
+            await this.lanSync.postGroup({ author: 'user', phase: 'analysis', body: content });
+            const repo = wantedProject.repo || '（该文件夹未绑定 GitHub 仓库）';
+            await this.lanSync.postGroup({
+              author: 'agent',
+              phase: 'analysis',
+              body: `这台已切到「${wantedProject.name}」，项目 ID：${repo}。另一台如果本地也有这个项目会自动跟过来；没有的话它会说明。`,
+            });
+            this.lanSync.endPendingGroup();
+            return;
+          }
+          /*
+           * **不再分流。**
+           *
+           * 以前这里先问一次 16-token 的分类模型：判 CHAT 就只能无工具干答，
+           * 判 TASK 才进完整 agent 循环。同一条消息能力差一个量级，
+           * 而分流是一次极短的调用决定的 —— 那正是「有时聪明、有时笨」的来源。
+           *
+           * 参考 CowAgent（Agent Harness）的做法：通道只负责收发，
+           * **Agent Core 自己决定**这句话该回、该问、还是该做。
+           * 所以这里一律落成需求、进同一条持久会话跑一轮 agent，
+           * 「只是问一句」由提示词里的第一条规则约束（简短回答 + 给依据）。
+           *
+           * 代价是每条消息都走完整轮次，更慢更耗 token —— 用户已明确接受（要聪明优先）。
+           */
+          this.lanSync.beginPendingGroup(content);
           const { requirementPromptForLocal, renderGroupLine } = await import('../sync/lanProtocol.js');
-          const openRequirement = this.lanSync.openQuestionRequirement();
-          if (openRequirement) {
-            void this.lanSync.postGroup({
+          const open = this.lanSync.openQuestionTarget();
+          if (open) {
+            /*
+             * 回答**只回给问话的那一台**。
+             *
+             * 用户实况：「我直接回答会导致所有 agent 都收到消息」。追问本来就是
+             * 某一台提的，另一台没有在等这条回答 —— 它再跑一轮就是重复劳动。
+             * 所以这一条带上 `assignee`，并且**本机不是问话方时不再自己开跑**。
+             */
+            await this.lanSync.postGroup({
               author: 'user',
               phase: 'answer',
               body: content,
-              requirementId: openRequirement,
+              requirementId: open.requirementId,
+              assignee: open.askerId,
+              // 只有提问那台要处理这条回答；其余设备收到后只当参考。
+              to: open.askerId,
             }).catch(() => undefined);
+            if (open.askerId !== this.lanSync.localPeer().id) {
+              this.lanSync.endPendingGroup();
+              await this.post({
+                type: 'toast',
+                tone: 'neutral',
+                text: `已把回答送回提问的「${open.askerLabel}」，这台不重复执行。`,
+              }).catch(() => undefined);
+              return;
+            }
           } else {
-            const assignee = options?.assignee?.trim() ?? '';
-            void this.lanSync.postGroup({
+            /*
+             * 指派对象：界面上选了就以界面为准；没选就看**这句话本身**。
+             *
+             * 用户实况：他在群里写「macos 那边 agent，需要检查…」，
+             * 下拉框没动，于是两台都跑起来了。现在先把话里的指派认出来。
+             */
+            const explicit = options?.assignee?.trim() ?? '';
+            const assignee = explicit || (await this.resolveAssignee(content));
+            /*
+             * **先建需求，再发群消息。**
+             *
+             * 顺序反了就会出现「看板显示待接、未指派，而两台都回复了」：
+             * `postGroup` 在需求还不存在时拿不到需求号，只好退回消息自己的 id，
+             * 于是甲方那条和 agent 的回复挂在两个不同的号上，看板永远配不上对。
+             */
+            const shared = await this.lanSync.shareRequirement(content, assignee).catch(() => undefined);
+            await this.lanSync.postGroup({
               author: 'user',
               phase: 'requirement',
               body: content,
               ...(assignee ? { assignee } : {}),
+              ...(shared?.requirement ? { requirementId: shared.requirement.id } : {}),
             }).catch(() => undefined);
-            const shared = await this.lanSync.shareRequirement(content).catch(() => undefined);
             if (shared) {
               this.log(`[sync] 广播需求：${shared.message}`);
               /*
@@ -2117,12 +2778,21 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
              * 而不是像以前那样只在右侧对话框自己说。
              */
             if (shared?.requirement) {
-              const groupLines = this.lanSync.recentGroup(10).map((message) => renderGroupLine(message));
+              const groupLines = this.lanSync.recentGroup(10).map((message) => renderGroupLine(
+                message,
+                [this.lanSync!.localPeer(), ...this.lanSync!.groupState().peers],
+                this.lanSync!.localPeer().id,
+              ));
               content = requirementPromptForLocal(
                 shared.requirement,
                 this.lanSync.localPeer(),
                 groupLines,
-                { fromSelf: true },
+                {
+                  fromSelf: true,
+                  projectRoot: this.localProjectRoot(shared.requirement.project),
+                  projectName: this.lanSync.activeProjectName(),
+                  peers: this.lanSync.groupState().peers.filter((peer) => peer.id !== this.lanSync!.localPeer().id),
+                },
               );
               options = { ...options, origin: 'sync', syncRequirementId: shared.requirement.id };
             }
@@ -2149,6 +2819,24 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         ?? (policyLoad.error ? { version: 1 as const, permissionPreset: STRICT_PRESET } : undefined);
       if (policyLoad.error) this.log(`[policy] ${policyLoad.error}（按最严格处理）`);
       let conversationId = this.activeConversationId;
+      /*
+       * 从群里（另一台 / 手机）转来的需求：固定落进同一个「团队群」对话。
+       *
+       * 以前 `conversationId` 跟着"当前打开的是哪条"走：用户没开着对话时，
+       * 每来一条消息就 `createConversation` 一张新卡片 —— 用户的实况是
+       * 「收到一个消息就新建一个对话框」，每张新对话都是默认权限档，
+       * 于是每条消息都要重新点一遍授权，整条链路就卡在那里。
+       *
+       * 现在：群里的活都在一条固定对话里累积（上下文也在），权限也在那一条上设一次。
+       */
+      if (options?.origin === 'sync') {
+        /*
+         * 只在真的拿到团队任务对话时才覆盖；拿不到（协作已关）就保持原来的选择。
+         * 否则会把 `conversationId` 清成 undefined，接着又新建一条对话 —— 正是要修的问题。
+         */
+        const teamId = await this.ensureGroupConversation();
+        if (teamId) conversationId = teamId;
+      }
       const existingConversation = conversationId ? await this.storage.getConversation(conversationId) : undefined;
       // 权限预设 / 最大步骤 / 思考深度取「这条对话自己的值」，全局设置只作为新对话的默认值。
       // 以前这三项直接写全局设置：多线程对话里在 A 放宽权限，正在跑的 B 会跟着放宽。
@@ -2228,6 +2916,15 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         return;
       }
       let createdConversationId: string | undefined;
+      /*
+       * 群里的活：把界面切到那条「团队群」对话。
+       *
+       * 不切的话，任务在后台跑、授权卡在一条用户没打开的对话里 ——
+       * 用户看到的就是「卡住了」。切过去才能看见进度、点授权。
+       */
+      if (options?.origin === 'sync' && conversationId && this.activeConversationId !== conversationId) {
+        this.setActiveConversation(conversationId);
+      }
       if (!conversationId) {
         conversationId = (await this.storage.createConversation(tt('common.newChat'), settings.model, mode)).id;
         createdConversationId = conversationId;
@@ -2374,11 +3071,18 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
        * 工作方式，中途抽走会让它下一轮突然找不到。
        */
       const bridgedRequested = wantsBridgedTools(content) || (this.bridgedToolUsage.get(conversationId)?.size ?? 0) > 0;
-      const toolAllowList = playbooks.length
-        ? narrowToolNames(allToolNames, playbooks, writingRequested)
+      /*
+       * 只读档（`SYNC_READ_ONLY_PLAYBOOK`）一旦命中，**写意图也不能撤销收窄** ——
+       * 这是代码保证，不是提示词约定：清单里没有写工具，模型连选的机会都没有。
+       */
+      const effectivePlaybooks = options?.syncReadOnly
+        ? [...playbooks.filter((item) => item.kind !== 'sync-readonly'), SYNC_READ_ONLY_PLAYBOOK]
+        : playbooks;
+      const toolAllowList = effectivePlaybooks.length
+        ? narrowToolNames(allToolNames, effectivePlaybooks, writingRequested)
         : trimToolSurface(allToolNames, { bridgedRequested });
-      if (playbooks.length) {
-        this.log(`[playbook] ${playbooks.map((item) => item.kind).join('+')}｜工具 ${allToolNames.length} → ${toolAllowList?.length ?? allToolNames.length}（写意图：${writingRequested}）`);
+      if (effectivePlaybooks.length) {
+        this.log(`[playbook] ${effectivePlaybooks.map((item) => item.kind).join('+')}｜工具 ${allToolNames.length} → ${toolAllowList?.length ?? allToolNames.length}（写意图：${writingRequested}）`);
       } else if (toolAllowList) {
         this.log(`[tools] 工具 ${allToolNames.length} → ${toolAllowList.length}（未请求扩展能力，隐去桥接工具）`);
       }
@@ -2430,6 +3134,9 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         globalTools: [],
         // 来自对端的需求才记需求号：普通用户消息不需要回报进度。
         ...(options?.syncRequirementId ? { syncRequirementId: options.syncRequirementId } : {}),
+        // 「群里的活」在起跑时定下来：不依赖任何之后可能丢掉的 id。
+        ...((options?.origin === 'group' || options?.origin === 'sync' || options?.syncRequirementId
+          || this.isTeamConversation(conversationId)) ? { groupRun: true } : {}),
         toolContentOffsets: new Map(),
         checkpointTail: Promise.resolve(),
         lastCheckpointByMessage: new Map(),
@@ -2513,7 +3220,7 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
           ].filter((tool): tool is NonNullable<typeof tool> => Boolean(tool)),
           executeExtraTool: async (call) => {
             // 本轮任务类型已经指定了首选工具：模型凭记忆调了别的，直接拒并指出正确工具。
-            const blockedByPlaybook = blockedToolReason(call.function.name, playbooks, writingRequested);
+            const blockedByPlaybook = blockedToolReason(call.function.name, effectivePlaybooks, writingRequested);
             if (blockedByPlaybook) {
               return { result: { status: 'denied', summary: tt('tool.playbookBlocked'), content: blockedByPlaybook, approval: 'not-required' } };
             }
@@ -2800,8 +3507,17 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
        * 准备阶段的异常（建对话失败、写盘失败……）以前会直接抛给消息处理层，
        * 界面那边已经画出的乐观气泡就永远挂在列表上，看起来像「发出去了但没回复」。
        * 这里补一条拒绝回执，再把错误抛出去照常上报。
+       *
+       * **但群 / 对端来的消息不能塞回主对话的输入框**：
+       * 用户实况是「我在团队群按 Enter，编辑好的消息出现在本地 agent 输入框里」——
+       * 因为群消息也走了这条回执，而主对话的 webview 会把 text 当成待发送草稿。
+       * 那两个来源本来就没有"主对话草稿"这回事，只能记日志。
        */
-      await this.post({ type: 'sendRejected', text: content }).catch(() => undefined);
+      const fromGroup = options?.origin === 'group' || options?.origin === 'sync';
+      this.log(`[send] 发送失败（origin=${options?.origin ?? 'user'}）：${error instanceof Error ? error.message : String(error)}`);
+      if (!fromGroup) {
+        await this.post({ type: 'sendRejected', text: content }).catch(() => undefined);
+      }
       throw error;
     } finally {
       this.pendingSends.delete(sendKey);
@@ -3682,6 +4398,10 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       ? await this.storage.getMessages(conversation.id, { limit: 80 })
       : { messages: [], hasMore: false };
     const settings = readSettings();
+    // 冷启动时按标题认一次「团队任务」对话，别让第一条输入漏进只读窗口。
+    if (conversation && conversation.title === tt('sync.teamTaskTitle')) {
+      this.teamConversationTitles.add(conversation.id);
+    }
     const activeProfile = profileFor(settings, conversation?.apiProfileId);
     // 工具条上的权限 / 步骤 / 思考深度显示的是**这条对话**的值，不是全局设置。
     const controls = this.currentControls(conversation);
@@ -3795,6 +4515,21 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     await this.post({
       type: 'state',
       state,
+      /*
+       * 「团队任务」对话是**只读**的执行窗口：指令一律来自团队群。
+       * 界面据此收掉输入框与权限/步数控件，只留「停止执行」。
+       */
+      teamTask: this.isTeamConversation(this.activeConversationId),
+      /*
+       * 团队任务窗口要显示的三样：当前项目、这一轮在做什么、（停止按钮在界面里）。
+       * 任务简介取最近一条群里需求的首行 —— 那才是"正在执行"的东西。
+       */
+      teamTaskInfo: this.isTeamConversation(this.activeConversationId)
+        ? {
+          project: this.lanSync?.activeProjectName() || '',
+          task: (this.lanSync?.latestRequirementTitle() ?? ''),
+        }
+        : undefined,
       streamingConversationId: this.isViewingRunningConversation() ? this.activeConversationId : undefined,
     });
     if (apiKeyConfigured) void this.ensureModelsFresh(activeProfile.id);
@@ -6483,10 +7218,35 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
       const onAbort = (): void => finish(-1);
       run.controller.signal.addEventListener('abort', onAbort, { once: true });
       this.pendingDecisions.set(requestId, { conversationId: run.conversationId, runId: run.runId, request: view, resolve: finish });
-      void this.post({ type: 'decisionRequest', request: view });
-      // 用户正在看别的对话时提醒一句，避免这条线程无声地卡在等决策上。
-      if (this.activeConversationId !== run.conversationId) {
-        void this.post({ type: 'toast', tone: 'warning', text: tt('decision.otherConversation') });
+      /*
+       * 团队任务的「选择」必须走团队群。
+       *
+       * 用户要求：「团队任务对话框里面的选择、决策、授权，都需要通过团队群来」——
+       * 这个窗口是只读执行窗口，卡片留在这里就没人会去点（而且和群里的指令打架）。
+       * 所以：群里发一条带选项的追问，窗口里不弹卡；甲方在群里回「1」「2」或选项名即生效。
+       */
+      const teamRun = this.isTeamConversation(run.conversationId);
+      if (teamRun && this.lanSync) {
+        const lines = [`【需要你选】${request.question}`, request.why ? `为什么：${request.why}` : ''];
+        request.options.forEach((option, index) => {
+          lines.push(`${index + 1}. ${option.title}`);
+          if (option.achieves) lines.push(`   能做到：${option.achieves}`);
+          if (option.cost) lines.push(`   代价：${option.cost}`);
+        });
+        lines.push('在群里回数字（如「1」）或选项名字即可；也可以直接说你想怎么做。');
+        void this.lanSync.postGroup({
+          author: 'agent',
+          phase: 'question',
+          body: lines.filter(Boolean).join('\n'),
+          requirementId: run.syncRequirementId ?? '',
+        }).catch(() => undefined);
+        this.groupDecisions.set(requestId, { options: request.options.map((option) => option.title), resolve: finish });
+      } else {
+        void this.post({ type: 'decisionRequest', request: view });
+        // 用户正在看别的对话时提醒一句，避免这条线程无声地卡在等决策上。
+        if (this.activeConversationId !== run.conversationId) {
+          void this.post({ type: 'toast', tone: 'warning', text: tt('decision.otherConversation') });
+        }
       }
     });
 
@@ -6724,6 +7484,10 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         if (settled) return;
         settled = true;
         this.pendingApprovals.delete(requestId);
+        // 群里那张卡也一并撤掉，免得下次「授权」点到已经结束的卡。
+        for (const [key, settle] of [...this.groupApprovals.entries()]) {
+          if (settle === finish) this.groupApprovals.delete(key);
+        }
         run.controller.signal.removeEventListener('abort', onAbort);
         // 顺手撤掉手机上那张卡：桌面已经处理完了，手机再点也没意义。
         this.lanSync?.resolveApproval(requestId, false);
@@ -6737,15 +7501,122 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         request: { requestId, conversationId: run.conversationId, title, summary, detail, risk },
         resolve: finish,
       });
-      void this.post({
-        type: 'approvalRequest',
-        request: { requestId, conversationId: run.conversationId, title, summary, detail, risk },
-      });
+      const teamRun = this.isTeamConversation(run.conversationId);
+      /*
+       * 团队任务的授权也走群：群里出现【权限申请】，窗口里**不弹卡**。
+       * 用户要求：选择 / 决策 / 授权都要通过团队群。
+       */
+      if (teamRun && this.lanSync) {
+        void this.lanSync.postGroup({
+          author: 'agent',
+          phase: 'question',
+          body: [
+            '【权限申请】这一步需要你授权才能继续：',
+            title,
+            summary,
+            detail ? `说明：${detail}` : '',
+            '在群里回一句「授权」就等于允许这一次；回「拒绝」我就停下。',
+          ].filter(Boolean).join('\n'),
+          requirementId: run.syncRequirementId ?? '',
+        }).catch(() => undefined);
+        this.groupApprovals.set(`team:${requestId}`, finish);
+      } else {
+        void this.post({
+          type: 'approvalRequest',
+          request: { requestId, conversationId: run.conversationId, title, summary, detail, risk },
+        });
+        /*
+         * 需要授权时**也在群里说一声**。
+         *
+         * 用户的要求（参考 OpenClaw）：agent 回答问题、执行任务、需要授权，
+         * 都应该在群里讲清楚 —— 而不是卡在一个没人看的对话框里等。
+         * 群里回一句「授权」就等于点了允许（见群分支里的授权处理）。
+         */
+        if (run.syncRequirementId && this.lanSync) {
+          const groupId = `approval:${requestId}`;
+          void this.lanSync.postGroup({
+            author: 'agent',
+            phase: 'question',
+            body: [
+              '【权限申请】这一步需要你授权才能继续：',
+              title,
+              summary,
+              detail ? `说明：${detail}` : '',
+              '在群里回一句「授权」就等于允许这一次；回「拒绝」我就停下。',
+            ].filter(Boolean).join('\n'),
+            requirementId: run.syncRequirementId,
+          }).catch(() => undefined);
+          // 记下这条群消息对应哪张审批卡，群里回话时用它结算。
+          this.groupApprovals.set(groupId, finish);
+        }
+      }
       // 用户正看着别的对话时提示一句，避免这条线程无声地卡在授权上。
       if (this.activeConversationId !== run.conversationId) {
         void this.post({ type: 'toast', tone: 'warning', text: tt('approval.otherConversation') });
       }
     });
+  }
+
+  /**
+   * 群里回复数字 / 选项名 → 结算团队任务等着的「选择」。
+   *
+   * 返回 true 表示这句话是在回答选择，不应再当普通群消息处理。
+   */
+  private settleGroupDecision(text: string): boolean {
+    if (!this.groupDecisions.size) return false;
+    const value = (text ?? '').trim();
+    if (!value) return false;
+    const entries = [...this.groupDecisions.entries()];
+    const last = entries[entries.length - 1];
+    if (!last) return false;
+    const [requestId, decision] = last;
+    // 1) 纯数字：取第 n 个选项。
+    const digits = value.match(/^(?:选|选择|选项)?\s*([1-9])\s*$/);
+    if (digits) {
+      const index = Number(digits[1]) - 1;
+      if (index >= 0 && index < decision.options.length) {
+        this.groupDecisions.delete(requestId);
+        decision.resolve(index);
+        return true;
+      }
+    }
+    // 2) 选项名字：完全包含即算选中。
+    const hit = decision.options.findIndex((option) => option && value.includes(option));
+    if (hit >= 0) {
+      this.groupDecisions.delete(requestId);
+      decision.resolve(hit);
+      return true;
+    }
+    /*
+     * 3) 都不匹配：当成「你自己说怎么做」，按自定义方案交给 agent。
+     *    但只在明显是在回答（很短）时才这样，避免把一句新需求当成选择答案。
+     */
+    if (value.length <= 60) {
+      this.groupDecisions.delete(requestId);
+      decision.resolve(-1, value);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 群里回复「授权 / 拒绝」→ 结算对应的审批卡。
+   *
+   * 返回 true 表示这句话是处理审批的，不该再当普通群消息往下走。
+   */
+  private settleGroupApproval(text: string): boolean {
+    if (!this.groupApprovals.size) return false;
+    const allow = /授权|同意|允许|批准|authori[sz]e|grant|allow/i.test(text);
+    const deny = /拒绝|不同意|deny|reject/i.test(text);
+    if (!allow && !deny) return false;
+    // 只结算**最近一张**卡：群里连点两句「授权」不该把未来的卡一起放掉。
+    const entries = [...this.groupApprovals.entries()];
+    const last = entries[entries.length - 1];
+    if (!last) return false;
+    const [, settle] = last;
+    this.groupApprovals.delete(last[0]);
+    settle(allow);
+    return true;
   }
 
   /** 同 `settleDecisionsFor`：只结算这一轮自己的审批卡片。 */
@@ -6959,6 +7830,21 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
             </div>
           </div>
         </form>
+        <!--
+          团队任务窗口：不提供输入框，只显示「当前项目 + 任务简介 + 停止」。
+          指令一律来自团队群（宿主侧也有拦截，不只是隐藏界面）。
+        -->
+        <div id="teamTaskBar" class="team-task-bar" hidden>
+          <div class="tt-line">
+            <span class="tt-label">项目</span>
+            <span class="tt-project" id="teamTaskProject"></span>
+          </div>
+          <div class="tt-line">
+            <span class="tt-label">任务</span>
+            <span class="tt-task" id="teamTaskTitle"></span>
+          </div>
+          <button id="teamTaskStop" class="stop-button" type="button" title="${t(lang, 'chat.stop')}">${t(lang, 'teamTask.stopLabel')}</button>
+        </div>
       </footer>
     </main>
   </div>

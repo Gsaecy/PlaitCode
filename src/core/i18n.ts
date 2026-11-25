@@ -648,8 +648,26 @@ const DICTIONARY: Record<string, Entry> = {
   'settings.collab.ledger': { zh: '打开对齐账本', en: 'Open alignment ledger' },
   'settings.collab.state': { zh: '当前状态：{state}', en: 'State: {state}' },
   'settings.collab.stateOff': { zh: '未连接', en: 'Not connected' },
-  'sync.localOnlyNotice': {
-    zh: '这条只发给了本机 agent（主对话是「你和一个 agent」的频道）。需要频道里的其它设备一起做，请在「团队群」窗口里发。',
+  'sync.groupChatTitle': { zh: '团队群', en: 'Team group' },
+  'sync.teamTaskTitle': { zh: '团队任务', en: 'Team task' },
+  'teamTask.stopLabel': { zh: '停止执行', en: 'Stop' },
+  'sync.teamTaskReadOnly': {
+    zh: '「团队任务」窗口只负责执行：指令请在团队群发。',
+    en: 'The "Team task" window only executes work — send instructions in the team group.',
+  },
+  'sync.groupChatHint': {
+    zh: '群里的活会记在「{title}」这条对话里跑，它默认是自动权限 + 无限步数。需要完全访问时，agent 会在群里说明，你回一句「授权」就放开。',
+    en: 'Work from the group runs in the "{title}" conversation, which defaults to automatic permissions and unlimited steps. If full access is needed the agent says so in the group — reply "authorize" to grant it.',
+  },
+  'sync.fullAccessGranted': {
+    zh: '收到授权：这条「团队任务」对话已放开为完全访问。',
+    en: 'Authorized: the "Team task" conversation now has full access.',
+  },
+  'sync.fullAccessRequest': {
+    zh: '【权限申请】这一步需要「完全访问」才能继续。请在群里回一句「授权」，我就放开这一条对话的权限。',
+    en: '[Permission request] This step needs full access. Reply "authorize" in the group and I will grant it for this conversation.',
+  },
+  'sync.localOnlyNotice': {    zh: '这条只发给了本机 agent（主对话是「你和一个 agent」的频道）。需要频道里的其它设备一起做，请在「团队群」窗口里发。',
     en: 'This went to the local agent only — the main chat is a one-agent channel. To have other devices in the channel do it too, send it in the team group window.',
   },
   'sync.assignedElsewhere': {

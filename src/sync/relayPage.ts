@@ -139,6 +139,21 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
   var devices = [], chosen = '';
 
   function el(tag, cls, text) { var n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; }
+  /*
+   * 身份标识：系统类型 · 设备名（两台同名时带 IP）。
+   *
+   * 服务器发来的 name 历史上可能已带「· win32 / · darwin」（旧版本写进名字里的），
+   * 这里先剥掉再按统一格式拼，手机和电脑上看到的写法才一致。
+   */
+  function deviceLabelOf(peer) {
+    if (!peer) return '乙方';
+    var raw = String(peer.name || '').trim();
+    var name = raw.replace(/\\s*[·•]\\s*(win32|windows|darwin|macos|osx|linux|android|web)\\s*$/i, '').trim() || raw;
+    if (peer.version === 'web' || /浏览器/.test(name)) return '手机 · 浏览器';
+    var os = peer.platform === 'darwin' ? 'macOS' : (peer.platform === 'win32' ? 'Windows' : 'Linux');
+    var base = name ? os + ' · ' + name : os;
+    return peer.host && peer.duplicated ? base + ' @' + peer.host : base;
+  }
   function say(text) { main.innerHTML = ''; var box = el('div', 'empty', text); main.appendChild(box); }
 
   function b64(bytes) { var s = ''; var view = new Uint8Array(bytes); for (var i = 0; i < view.length; i += 1) s += String.fromCharCode(view[i]); return btoa(s); }
@@ -306,7 +321,7 @@ export function renderRelayMobilePage(options: { relayHost: string; sessionAuth?
       var bubble = el('div', 'bubble');
       var line = el('div', 'meta-line');
       line.appendChild(el('span', 'tag ' + message.phase, PHASES[message.phase] || message.phase));
-      var who = mine ? '你' : ((message.from && message.from.name) || '乙方');
+      var who = mine ? '你' : deviceLabelOf(message.from);
       var time = new Date(message.at || Date.now());
       line.appendChild(el('span', null, who + ' · ' + ('0' + time.getHours()).slice(-2) + ':' + ('0' + time.getMinutes()).slice(-2)));
       bubble.appendChild(line);

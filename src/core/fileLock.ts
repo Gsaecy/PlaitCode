@@ -21,8 +21,38 @@ export interface LockOptions {
   staleMs?: number;
 }
 
-const DEFAULT_TIMEOUT_MS = 5_000;
-const DEFAULT_STALE_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 15_000;
+/**
+ * 陈旧阈值。
+ *
+ * 临界区只有「读一次 + 两次原子写」，正常是几十毫秒；以前给 30 秒，
+ * 意味着扩展被强杀（macOS 上重载窗口很常见）之后留下的锁要等半分钟才能接管，
+ * 而拿锁超时是 5 秒 —— 于是必然抛「拿不到文件锁」。
+ * 现在主要靠 **pid 判活**（见下），mtime 只作兜底。
+ */
+const DEFAULT_STALE_MS = 10_000;
+
+/**
+ * 锁的持有者进程还活着吗。
+ *
+ * 锁文件内容是 `pid:timestamp:random`。同机判活用 `process.kill(pid, 0)`：
+ * - 抛 `ESRCH` → 进程已不存在 → 锁是崩溃残留，可以立刻接管；
+ * - 抛 `EPERM` → 进程存在但没权限发信号 → 仍然算活着；
+ * - 解析不出 pid（旧格式/被改写）→ 不知道，交给 mtime 判断。
+ *
+ * 为什么必须这么做：扩展被强杀 / 重载窗口之后锁文件还在，
+ * 只看 mtime 要等满 staleMs，用户看到的就是「拿不到文件锁」的弹窗。
+ */
+function holderAlive(token: string): boolean | undefined {
+  const pid = Number.parseInt(String(token).split(':')[0] ?? '', 10);
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -59,7 +89,36 @@ export async function tryFileLock(lockPath: string, options: LockOptions = {}): 
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      // 陈旧锁：进程崩了但文件还在。接管它，否则会永久卡死。
+      /*
+       * 占着锁的那个进程还在不在。
+       *
+       * 以前这里只比 mtime：进程崩了（扩展被强杀、重载窗口）留下的锁，
+       * 在 staleMs 到期前谁也拿不到 —— 用户看到「拿不到文件锁」。
+       * 现在先看 pid：死了就立刻接管，不管它多新。
+       */
+      let alive: boolean | undefined;
+      try {
+        const content = await readFile(lockPath, 'utf8');
+        alive = holderAlive(content);
+        if (alive === false) {
+          await unlink(lockPath).catch(() => undefined);
+          continue;
+        }
+      } catch {
+        // 读不到（刚好被释放 / 权限）→ 继续按 mtime 判断
+      }
+      /*
+       * pid 明确活着 → **绝不接管**，哪怕 mtime 很旧。
+       *
+       * 只看 mtime 的旧行为在这里是危险的：一个健康但写得慢的宿主，
+       * 锁会被另一个窗口抢走，两个宿主同时写 manifest —— 会话从索引里消失。
+       */
+      if (alive === true) {
+        if (Date.now() >= deadline) return undefined;
+        await sleep(20 + Math.random() * 30);
+        continue;
+      }
+      // 判不出 pid（旧格式锁）时才退回 mtime：陈旧就接管，否则等。
       try {
         const info = await stat(lockPath);
         if (Date.now() - info.mtimeMs > staleMs) {
@@ -75,10 +134,25 @@ export async function tryFileLock(lockPath: string, options: LockOptions = {}): 
   }
 }
 
+/**
+ * 拿不到锁。
+ *
+ * 单独一个类型，是为了让调用方能区分「暂时被别人占着」和「真的出错（磁盘满/权限）」：
+ * 前者应该稍后重试，**不该弹给用户**（用户看到的就是「拿不到文件锁」的弹窗）。
+ */
+export class FileLockTimeoutError extends Error {
+  readonly lockPath: string;
+  constructor(lockPath: string) {
+    super(`拿不到文件锁：${lockPath}`);
+    this.name = 'FileLockTimeoutError';
+    this.lockPath = lockPath;
+  }
+}
+
 /** 拿锁执行；拿不到就抛错（用于「必须串行」的写路径）。 */
 export async function withFileLock<T>(lockPath: string, task: () => Promise<T>, options: LockOptions = {}): Promise<T> {
   const release = await tryFileLock(lockPath, options);
-  if (!release) throw new Error(`拿不到文件锁：${lockPath}`);
+  if (!release) throw new FileLockTimeoutError(lockPath);
   try {
     return await task();
   } finally {

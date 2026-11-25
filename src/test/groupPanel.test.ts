@@ -118,8 +118,9 @@ test('群窗口有「由谁执行」和「停止执行」', () => {
 test('选中的设备掉线后退回「所有人」，不会发出没人接的需求', () => {
   const index = GROUP.indexOf('function renderAssign(');
   assert.ok(index > 0);
-  const body = GROUP.slice(index, index + 900);
-  assert.match(body, /chips\.some\(\(item\) => item\.id === assignee\.id\)/, '要校验选中项还在不在');
+  const body = GROUP.slice(index, index + 1_600);
+  assert.match(body, /chips\.some\(/, '要校验选中项还在不在');
+  assert.match(body, /assignee = null/, '掉线了就退回所有人');
 });
 
 test('结果与未执行保留换行（压成一行会把文件清单挤成不可读长句）', () => {

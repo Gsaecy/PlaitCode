@@ -5017,6 +5017,8 @@
   }
 
   elements.stopButton.addEventListener('click', () => post('stop'));
+  // 团队任务状态条上的「停止执行」：和输入框里的停止是同一个动作。
+  document.getElementById('teamTaskStop')?.addEventListener('click', () => post('stop'));
   // 按钮在 <summary> 里面：不阻止默认行为的话，点按钮会顺带把清单折叠起来。
   // preventDefault 拦掉 <details> 的切换，stopPropagation 让内层点击不再冒泡到 summary。
   const bindSummaryAction = (id, type) => {
@@ -5510,6 +5512,28 @@
     switch (message.type) {
       case 'state': {
         const previousConversationId = state.conversation?.id;
+        /*
+         * 「团队任务」对话是只读执行窗口：只留「停止执行」，输入框和权限/步数全收掉。
+         * 指令一律来自团队群（功能层面也由宿主拒绝输入）。
+         */
+        document.body.classList.toggle('team-task', message.teamTask === true);
+        /*
+         * 团队任务窗口：显示「项目 + 任务简介 + 停止」，不显示输入框。
+         * 这两行数据由宿主给（项目来自协作状态，任务来自群里最近一条需求）。
+         */
+        const ttBar = document.getElementById('teamTaskBar');
+        if (ttBar) {
+          if (message.teamTask === true) {
+            const info = message.teamTaskInfo || {};
+            const projectNode = document.getElementById('teamTaskProject');
+            const taskNode = document.getElementById('teamTaskTitle');
+            if (projectNode) projectNode.textContent = info.project || '（未选项目）';
+            if (taskNode) taskNode.textContent = info.task || '（暂无任务，等团队群下达）';
+            ttBar.hidden = false;
+          } else {
+            ttBar.hidden = true;
+          }
+        }
         // 切对话之前先把 A 的输入存进 A 的草稿槽，否则它会跟着人跑到 B 的输入框里。
         if (previousConversationId !== message.state?.conversation?.id) saveDraft(previousConversationId);
         // 编辑框属于那条消息，切到别的对话就收掉：草稿留着也没地方保存回去。

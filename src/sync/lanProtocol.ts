@@ -16,6 +16,8 @@
  * 所有网络输入都当作不可信数据：`parseSyncMessage` 做形状校验与长度截断。
  */
 
+import { normalizeRepoUrl } from './projectRef';
+
 export const SYNC_PROTOCOL_VERSION = 1;
 /** 单条消息上限（字节）：需求正文最多几千字，这个值足够，同时挡住畸形转发。 */
 export const MAX_MESSAGE_BYTES = 80 * 1024;
@@ -31,6 +33,12 @@ export const MAX_NOTE_BODY_CHARS = 2_000;
 export const MAX_TOPIC_CHARS = 60;
 /** 协作消息在本地保留多少条（用于面板回看与 `team_sync` 的 status）。 */
 export const MAX_NOTES = 120;
+/**
+ * agent 之间自动应答的轮次上限（同一主题、10 分钟内）。
+ *
+ * 到顶就停下、把问题抛回群里等甲方 —— 「不达目标不罢休」不等于「无限接龙」。
+ */
+export const MAX_DIALOGUE_NOTES = 6;
 export const ALIGNMENT_FILE = 'docs/PLATFORM-ALIGNMENT.md';
 
 export type SyncPlatform = 'win32' | 'darwin' | 'linux';
@@ -62,6 +70,13 @@ export interface SyncPeer {
   projects?: string[];
   /** 本机每个项目对应的仓库地址（与 `projects` 同序）。 */
   projectRepos?: string[];
+  /**
+   * 这台设备在局域网里的地址（IP，不带端口）。
+   *
+   * 只在**同名设备分不清**时显示（用户 2026-11-24：「如果系统类型+设备名称
+   * 无法区分，最好带上 IP 地址」）。两台都叫 `DESKTOP` 的 Windows 靠它区分。
+   */
+  host?: string;
   /** 扩展版本，便于排查「两边行为不一致是不是版本不同」。 */
   version: string;
 }
@@ -81,6 +96,13 @@ export interface SyncRequirement {
   project?: string;
   /** 发起方项目的仓库地址（项目唯一 ID）。有它就以它为准，文件夹名不参与判断。 */
   repo?: string;
+  /**
+   * 这条需求只让哪一台设备执行（设备 id）。
+   *
+   * 甲方在群里说「让 macos 那边做」时就填上，别的设备收到后**不执行**，
+   * 只记录。以前没有这个字段，两台都会各跑一遍同一份活。
+   */
+  assignee?: string;
 }
 
 /** 一条进度报告。 */
@@ -158,9 +180,13 @@ export interface SyncControlMessage {
    * 手机第一次连上时发一次，电脑随后广播自己的真实状态。
    * 没有它，手机只能显示自己点过什么，和电脑实际设置可能不一致。
    */
-  action: 'preset' | 'steps' | 'stop' | 'state';
+  action: 'preset' | 'steps' | 'stop' | 'state' | 'project' | 'stopGroup';
   preset?: RemotePreset;
   steps?: number;
+  /** `project` 用：让对端切到哪个项目（名字来自对端自己的项目列表）。 */
+  project?: string;
+  /** `project` 用：该项目的仓库地址（项目唯一 ID）。 */
+  repo?: string;
   /** 只有 `state` 用：电脑上是否正在执行任务。 */
   running?: boolean;
   at: number;
@@ -206,7 +232,49 @@ export interface SyncGroupMessage {
   assignee?: string;
   /** 这条需求针对的项目（仓库目录名）。换台电脑路径不同，靠它对齐。 */
   project?: string;
+  /**
+   * 这条消息**说给谁听**（设备 id）。
+   *
+   * 用户 2026-11-25：「agent 需要知道对方身份、用户身份，
+   * 哪些是说给它听的，哪些不是」。留空 = 所有人（正常群聊）。
+   * 甲方的回答会填成提问那台 —— 另一台收到只参考、不执行。
+   */
+  to?: string;
+  /**
+   * 这条消息**回复的是哪一条**（消息 id）。
+   *
+   * 两个 agent 真对话靠它成线程：界面能画出「A 问 → B 答」，而不是一堆并列的发言。
+   * 留空表示不是回复。
+   */
+  replyTo?: string;
+  /**
+   * 可点的答案（追问用）。
+   *
+   * 以前把选项写进正文（`要我接着做 / 换个做法 / 让另一台先做`），界面再拿正则去猜。
+   * 现在由发消息的一端直接给数组，界面照它画按钮 —— 正文只放人话。
+   */
+  options?: string[];
+  /**
+   * 结构化信息：项目、用时、改了哪些文件、是不是被停止。
+   *
+   * 这些以前也是拼进正文的（`【项目 X】这台做完了，用时 12s。改动文件：…`），
+   * 看着就像程序在说话。现在拆出来，由界面渲染成小标签。
+   */
+  meta?: GroupMessageMeta;
 }
+
+/** 一条群消息附带的机器可读信息（**不写进正文**）。 */
+export interface GroupMessageMeta {
+  project?: string;
+  /** 这一轮用了多少秒。 */
+  seconds?: number;
+  /** 这一轮真正改过的文件（最多几条，界面折叠显示）。 */
+  files?: string[];
+  /** 这一轮是被停止 / 出错结束的，不是正常做完。 */
+  stopped?: boolean;
+}
+
+const META_FILE_LIMIT = 20;
 
 const PHASES: ReadonlySet<string> = new Set(['requirement', 'analysis', 'question', 'answer', 'confirm', 'progress', 'result', 'blocked']);
 export const MAX_GROUP_MESSAGES = 400;
@@ -223,6 +291,14 @@ export function makeGroupMessage(
     assignee?: string;
     /** 针对哪个项目（留空 = 用发送方当前项目）。 */
     project?: string;
+    /** 回复哪一条（消息 id）。 */
+    replyTo?: string;
+    /** 说给哪台听（设备 id）；留空 = 所有人。 */
+    to?: string;
+    /** 可点的答案（追问用）。 */
+    options?: readonly string[];
+    /** 结构化信息（项目 / 用时 / 改动文件 / 是否被停止）。 */
+    meta?: GroupMessageMeta;
   },
   now = Date.now(),
   seed = `${from.id}:${now}`,
@@ -230,6 +306,11 @@ export function makeGroupMessage(
   const body = clipMultiline(input.body, MAX_GROUP_BODY_CHARS);
   if (!body) return undefined;
   const id = makeRequirementId(now, seed);
+  const options = (input.options ?? [])
+    .map((item) => clip(item, 60))
+    .filter(Boolean)
+    .slice(0, 5);
+  const meta = normalizeMeta(input.meta);
   return {
     kind: 'group',
     id,
@@ -241,6 +322,30 @@ export function makeGroupMessage(
     at: now,
     ...(clip(input.assignee, 64) ? { assignee: clip(input.assignee, 64) } : {}),
     ...(clip(input.project, 80) ? { project: clip(input.project, 80) } : {}),
+    ...(clip(input.replyTo, 64) ? { replyTo: clip(input.replyTo, 64) } : {}),
+    ...(clip(input.to, 64) ? { to: clip(input.to, 64) } : {}),
+    ...(options.length ? { options } : {}),
+    ...(meta ? { meta } : {}),
+  };
+}
+
+/** 结构化信息只留认识的字段；空对象当作没有。 */
+function normalizeMeta(value: GroupMessageMeta | undefined): GroupMessageMeta | undefined {
+  if (!value) return undefined;
+  const project = clip(value.project, 80);
+  const seconds = typeof value.seconds === 'number' && Number.isFinite(value.seconds) && value.seconds >= 0
+    ? Math.round(value.seconds)
+    : undefined;
+  const files = Array.isArray(value.files)
+    ? value.files.map((item) => clip(item, 300)).filter(Boolean).slice(0, META_FILE_LIMIT)
+    : [];
+  const stopped = value.stopped === true;
+  if (!project && seconds === undefined && !files.length && !stopped) return undefined;
+  return {
+    ...(project ? { project } : {}),
+    ...(seconds !== undefined ? { seconds } : {}),
+    ...(files.length ? { files } : {}),
+    ...(stopped ? { stopped } : {}),
   };
 }
 
@@ -256,10 +361,20 @@ const PHASE_LABEL: Record<GroupPhase, string> = {
   blocked: '未执行',
 };
 
-/** 群消息的说话人标签：`Windows · 乙方（产品经理）` / `用户 · 甲方`。 */
-export function groupSpeaker(message: SyncGroupMessage): string {
-  if (message.author === 'user') return `${message.from.name} · 甲方`;
-  return `${platformLabel(message.from.platform)} · 乙方（产品经理）`;
+/**
+ * 群消息的说话人标签：`Windows · MagicBookV14 · 乙方` / `macOS · MacBook-Pro · 甲方`。
+ *
+ * 身份统一到 `deviceLabel()` 一处：系统类型 + 设备名（用户 2026-11-24 要求）。
+ * 以前这里写 `${from.name} · 甲方` / `${platformLabel} · 乙方（产品经理）`，
+ * 同一条消息里一台显示「Windows」、另一台显示「MagicBookV14 · win32」——
+ * 看不出谁是谁，两台都是 Windows 时更分不清。
+ */
+export function groupSpeaker(
+  message: SyncGroupMessage,
+  roster?: readonly SyncPeer[],
+): string {
+  const who = deviceLabel(message.from, roster);
+  return `${who} · ${message.author === 'user' ? '甲方' : '乙方'}`;
 }
 
 /**
@@ -331,7 +446,17 @@ export function groupAgreement(messages: readonly SyncGroupMessage[], requiremen
 export function answersOpenQuestion(messages: readonly SyncGroupMessage[], requirementId: string): boolean {
   return groupAgreement(messages, requirementId) === 'awaiting-user';
 }
+/** 群消息里出现过的所有发送方（去重）——身份标签消歧要用到名册。 */
+export function groupRoster(messages: readonly SyncGroupMessage[]): SyncPeer[] {
+  const seen = new Map<string, SyncPeer>();
+  for (const message of messages) {
+    if (message.from?.id && !seen.has(message.from.id)) seen.set(message.from.id, message.from);
+  }
+  return [...seen.values()];
+}
+
 export function renderGroupTranscript(messages: readonly SyncGroupMessage[], now = Date.now()): string {
+  const roster = groupRoster(messages);
   const lines = [
     '# 团队群记录',
     '',
@@ -351,15 +476,73 @@ export function renderGroupTranscript(messages: readonly SyncGroupMessage[], now
       lastRequirement = message.requirementId;
       lines.push('', `## 需求 ${message.requirementId.slice(0, 12)}`, '');
     }
-    lines.push(`**${groupSpeaker(message)}** ${time} · ${PHASE_LABEL[message.phase]}：${clip(message.body, 600)}`);
+    lines.push(`**${groupSpeaker(message, roster)}** ${time} · ${PHASE_LABEL[message.phase]}：${clip(message.body, 600)}`);
     lines.push('');
   }
   return `${lines.join('\n')}\n`;
 }
 
 /** 群消息的一行摘要（通知 / 状态里用）。 */
-export function renderGroupLine(message: SyncGroupMessage): string {
-  return `${groupSpeaker(message)} · ${PHASE_LABEL[message.phase]}：${clip(message.body, 160)}`;
+export function renderGroupLine(
+  message: SyncGroupMessage,
+  roster?: readonly SyncPeer[],
+  localId = '',
+): string {
+  /*
+   * 标出「说给谁」：agent 要能分清哪些是给它听的。
+   * 用户 2026-11-25：「哪些是说给它听的，哪些不是」。
+   */
+  const target = !message.to
+    ? ''
+    : message.to === localId
+      ? '（说给本机）'
+      : `（说给 ${deviceLabel(roster?.find((peer) => peer.id === message.to) ?? { id: message.to }, roster)}）`;
+  return `${groupSpeaker(message, roster)}${target} · ${PHASE_LABEL[message.phase]}：${clip(message.body, 160)}`;
+}
+
+const OPTION_LINE = /^\s*(?:\d+[.、)）]|[A-Da-d][.、)）]|[-*·])\s*(.{2,60})$/;
+
+/** 选项文字收干净：去掉结尾的追问语、引号、多余标点。 */
+function cleanOption(text: string): string {
+  const first = text.split(/[，,。；;]/)[0] ?? '';
+  return first.replace(/^[\s「『"']+|[\s」』"'：:]+$/g, '').trim();
+}
+
+/**
+ * 从追问正文里抽出**可点的选项**。
+ *
+ * 用户 2026-11-24：「这种弹出提示却没有勾选选项 + 自定义回答，很不合理」。
+ * agent 的追问本来就是「二选一/三选一」，让甲方手打整句既慢又容易答偏。
+ *
+ * 认两种写法：
+ *  1. 编号或项目符号行：`1. 跟随系统` / `A) 手动选` / `- 先做导出`；
+ *  2. 最后一行里用 `/` 分隔的短选项：`请回一句就继续：要我接着做 / 换个做法 / 让另一台先做`。
+ * 抽不出来就返回空数组（界面只留自定义输入，不硬编一个假选项）。
+ */
+export function questionOptions(body: string): string[] {
+  const text = (body ?? '').trim();
+  if (!text) return [];
+  const out: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const match = OPTION_LINE.exec(line.trim());
+    if (match?.[1]) {
+      const option = cleanOption(match[1]);
+      if (option.length >= 2) out.push(option);
+    }
+  }
+  if (!out.length) {
+    const lastLine = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(-1)[0] ?? '';
+    // 只看**最后一个**冒号后面那段：前面可以是「项目：xxx 停在这里：…」。
+    const at = Math.max(lastLine.lastIndexOf('：'), lastLine.lastIndexOf(':'));
+    const tail = at >= 0 ? lastLine.slice(at + 1).trim() : '';
+    if (tail.includes('/')) {
+      for (const part of tail.split('/')) {
+        const option = cleanOption(part);
+        if (option.length >= 2) out.push(option);
+      }
+    }
+  }
+  return [...new Set(out)].slice(0, 5);
 }
 
 const STATUSES: ReadonlySet<string> = new Set(['planned', 'in_progress', 'done', 'skipped']);
@@ -389,6 +572,63 @@ export function platformLabel(platform: SyncPlatform): string {
     case 'darwin': return 'macOS';
     default: return 'Linux';
   }
+}
+
+/**
+ * 剔除设备名里已经写死的系统类型。
+ *
+ * 旧版本的 `name` 是「主机名 · win32 / · darwin」（见 `defaultDeviceName`），
+ * 界面有的地方又单独加了系统类型，于是同一条消息出现过
+ * 「Windows · 乙方（产品经理）」和「MagicBookV14 · win32 · 甲方」两种写法。
+ */
+const TRAILING_PLATFORM = /\s*[·•]\s*(win32|windows|darwin|macos|osx|linux|android|web)\s*$/i;
+const LEADING_PHONE = /^手机\s*[·•]\s*/;
+
+/** 纯设备名：去掉系统类型后缀（`MagicBookV14 · win32` → `MagicBookV14`）。 */
+export function deviceName(raw: string | undefined): string {
+  const text = (raw ?? '').trim();
+  if (!text) return '';
+  const stripped = text.replace(TRAILING_PLATFORM, '').trim();
+  return (stripped || text).replace(LEADING_PHONE, '').trim();
+}
+
+/**
+ * 群里的身份标识：**系统类型 · 设备名**（`Windows · MagicBookV14`）。
+ *
+ * 用户 2026-11-24：「不同设备的 agent 和用户，显示身份标识需要统一…
+ * 全部规范为系统类型 + 设备名称。目前只是因为我两个设备分别是 Windows 和 macOS，
+ * 如果别的用户都用 Windows，或者都用 macOS 设备，怎么区分呢？」
+ * 并且：「如果系统类型+设备名称无法区分，最好带上 IP 地址」。
+ *
+ * 所以：
+ *  1. 系统类型让人一眼看出是哪一端的实现；
+ *  2. **区分靠设备名**（主机名）——两台 Windows 是「Windows · 公司台式机」「Windows · 笔记本」；
+ *  3. 设备名也撞了（都叫 DESKTOP / 都是 IP 而恰好相同）时，传进 `roster`，
+ *     这一台会自动补上 `@192.168.0.8`；没有 IP（跨网中继）就补设备号前 6 位。
+ */
+export function deviceLabel(
+  peer: { id?: string; name?: string; platform?: string; version?: string; host?: string } | undefined,
+  roster?: readonly { id?: string; name?: string; platform?: string; version?: string; host?: string }[],
+): string {
+  if (!peer) return '未知设备';
+  const base = baseLabel(peer);
+  if (!roster || !peer.id) return base;
+  const clashes = roster.filter((item) => item.id !== peer.id && baseLabel(item) === base);
+  if (!clashes.length) return base;
+  const suffix = (peer.host ?? '').trim() || `设备${String(peer.id).slice(0, 6)}`;
+  return `${base} @${suffix}`;
+}
+
+/** 只有「系统类型 · 设备名」，不带消歧信息。 */
+function baseLabel(peer: { name?: string; platform?: string; version?: string } | undefined): string {
+  if (!peer) return '未知设备';
+  const name = deviceName(peer.name);
+  // 手机（relayPage）的平台字段过网后会被归一成 linux，只能按版本 / 名字认。
+  if (peer.version === 'web' || /浏览器/.test(name) || /浏览器/.test(peer.name ?? '')) {
+    return `手机 · ${name.replace(/^浏览器\s*[·•]\s*/, '') || '浏览器'}`;
+  }
+  const os = platformLabel(isSyncPlatform(peer.platform) ? peer.platform : 'linux');
+  return name ? `${os} · ${name}` : os;
 }
 
 /**
@@ -461,7 +701,7 @@ export function makeNote(
  */
 export function notePromptForLocal(note: SyncNote, local: SyncPeer): string {
   return [
-    `队友消息（来自「${note.from.name}」的 ${platformLabel(note.from.platform)} 版本${note.topic ? `，主题：${note.topic}` : ''}）：`,
+    `队友消息（来自「${deviceLabel(note.from)}」的版本${note.topic ? `，主题：${note.topic}` : ''}）：`,
     '',
     note.body,
     '',
@@ -495,7 +735,7 @@ export function renderNotes(notes: readonly SyncNote[], limit = 10): string[] {
   return notes.slice(-Math.max(1, limit)).map((note) => {
     const time = new Date(note.at).toISOString().slice(5, 16).replace('T', ' ');
     const reply = note.replyTo ? ` (回复 ${note.replyTo})` : '';
-    return `[${time}] ${note.from.name}${note.topic ? ` · ${note.topic}` : ''}${reply}：${clip(note.body, 300)}`;
+    return `[${time}] ${deviceLabel(note.from)}${note.topic ? ` · ${note.topic}` : ''}${reply}：${clip(note.body, 300)}`;
   });
 }
 
@@ -507,6 +747,11 @@ function normalizePeer(value: unknown): SyncPeer | undefined {  if (!value || ty
   const projects = Array.isArray(record.projects)
     ? record.projects.map((item) => clip(item, 80)).filter(Boolean).slice(0, 60)
     : [];
+  const host = clip(record.host, 60);
+  const repo = normalizeRepoUrl(clip(record.repo, 200));
+  const projectRepos = Array.isArray(record.projectRepos)
+    ? record.projectRepos.map((item) => clip(item, 200)).filter(Boolean).slice(0, 60)
+    : [];
   return {
     id,
     name: clip(record.name, 60) || id,
@@ -514,6 +759,18 @@ function normalizePeer(value: unknown): SyncPeer | undefined {  if (!value || ty
     project: clip(record.project, 80),
     ...(login ? { login } : {}),
     ...(projects.length ? { projects } : {}),
+    /*
+     * **当前项目的仓库地址必须过网**。
+     *
+     * 以前这里没读 `repo`（只读了 `projectRepos`），后果有两处：
+     *  1. 群信息里对端永远显示「未绑定 GitHub 仓库」；
+     *  2. 项目门禁拿 `message.from.repo` 为空，两台是不是同一个项目判断退化。
+     */
+    ...(repo ? { repo } : {}),
+    // 项目对应的仓库地址：丢了它，对面这个项目就永远显示「未绑定 GitHub 仓库」。
+    ...(projectRepos.length ? { projectRepos } : {}),
+    // IP 只在「同名设备分不清」时显示，但仍要过网，否则同名时两边都没法消歧。
+    ...(/^[A-Za-z0-9.:_-]{1,60}$/.test(host) ? { host } : {}),
     version: clip(record.version, 20),
   };
 }
@@ -550,6 +807,10 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       title: clip(record.title, MAX_TITLE_CHARS) || clip(detail.split('\n')[0] ?? detail, MAX_TITLE_CHARS),
       detail,
       createdAt: typeof record.createdAt === 'number' && Number.isFinite(record.createdAt) ? record.createdAt : Date.now(),
+      // 这三个字段必须过网络保留：丢一个，项目门禁和「只让某台做」就都失效。
+      ...(clip(record.project, 80) ? { project: clip(record.project, 80) } : {}),
+      ...(clip(record.repo, 200) ? { repo: clip(record.repo, 200) } : {}),
+      ...(clip(record.assignee, 64) ? { assignee: clip(record.assignee, 64) } : {}),
     };
   }
   if (record.kind === 'report') {    const requirementId = clip(record.requirementId, 64);
@@ -588,7 +849,8 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
     const id = clip(record.id, 64);
     if (!id) return undefined;
     const action = record.action === 'preset' || record.action === 'steps'
-      || record.action === 'stop' || record.action === 'state'
+      || record.action === 'stop' || record.action === 'state' || record.action === 'project'
+      || record.action === 'stopGroup'
       ? record.action
       : undefined;
     if (!action) return undefined;
@@ -608,6 +870,8 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       action,
       ...(preset ? { preset } : {}),
       ...(steps !== undefined ? { steps } : {}),
+      ...(clip(record.project, 80) ? { project: clip(record.project, 80) } : {}),
+      ...(clip(record.repo, 200) ? { repo: clip(record.repo, 200) } : {}),
       ...(record.running === true ? { running: true } : {}),
       at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
     };
@@ -640,6 +904,18 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
     const phase = typeof record.phase === 'string' && PHASES.has(record.phase)
       ? record.phase as GroupPhase
       : 'analysis';
+    const options = Array.isArray(record.options)
+      ? record.options.map((item) => clip(item, 60)).filter(Boolean).slice(0, 5)
+      : [];
+    const rawMeta = record.meta && typeof record.meta === 'object' ? record.meta as Record<string, unknown> : undefined;
+    const meta = normalizeMeta(rawMeta
+      ? {
+        ...(typeof rawMeta.project === 'string' ? { project: rawMeta.project } : {}),
+        ...(typeof rawMeta.seconds === 'number' ? { seconds: rawMeta.seconds } : {}),
+        ...(Array.isArray(rawMeta.files) ? { files: rawMeta.files as string[] } : {}),
+        ...(rawMeta.stopped === true ? { stopped: true } : {}),
+      }
+      : undefined);
     return {
       kind: 'group',
       id,
@@ -651,6 +927,10 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
       ...(clip(record.assignee, 64) ? { assignee: clip(record.assignee, 64) } : {}),
       ...(clip(record.project, 80) ? { project: clip(record.project, 80) } : {}),
+      ...(clip(record.replyTo, 64) ? { replyTo: clip(record.replyTo, 64) } : {}),
+      ...(clip(record.to, 64) ? { to: clip(record.to, 64) } : {}),
+      ...(options.length ? { options } : {}),
+      ...(meta ? { meta } : {}),
     };
   }
   return undefined;
@@ -673,7 +953,14 @@ export function requirementPromptForLocal(
   requirement: SyncRequirement,
   local: SyncPeer,
   groupLines: readonly string[] = [],
-  options: { fromSelf?: boolean } = {},
+  options: {
+    fromSelf?: boolean;
+    projectRoot?: string;
+    projectName?: string;
+    readOnly?: boolean;
+    /** 群里其它设备（用来告诉 agent「队友是谁」）。 */
+    peers?: readonly SyncPeer[];
+  } = {},
 ): string {
   /*
    * `fromSelf`：这条需求是本机用户刚在群窗口里说的。
@@ -683,24 +970,143 @@ export function requirementPromptForLocal(
    */
   const origin = options.fromSelf
     ? `甲方在团队群里提出了一个需求（需求号 ${requirement.id}）。`
-    : `甲方在另一台设备「${requirement.from.name}」上提出了一个跨平台需求（需求号 ${requirement.id}）。`;
+    : `甲方在另一台设备「${deviceLabel(requirement.from)}」上提出了一个跨平台需求（需求号 ${requirement.id}）。`;
+  const roster = [local, ...(options.peers ?? [])];
+  const teammates = (options.peers ?? []).filter((peer) => peer.id !== local.id);
   return [
     origin,
+    '',
+    /*
+     * 项目标记：这条任务属于哪个项目、本机对应哪个目录。
+     *
+     * 用户的要求：「每个任务按时间段区分任务项目，执行过程做项目标记，
+     * 哪个任务是哪个项目的，避免串项目执行导致混乱和错误。」
+     *
+     * 所以把项目钉在提示词最前面，并明确「只改这个目录」——
+     * 多根工作区里 agent 很容易顺着当前打开的文件改到另一个项目去。
+     */
+    requirement.repo || requirement.project || options.projectName
+      ? [
+        `【任务项目】${requirement.project || options.projectName || '（未命名）'}`,
+        requirement.repo ? `（项目 ID：${requirement.repo}）` : '',
+        options.projectRoot ? `\n本机对应目录：${options.projectRoot}。**只改这个目录里的文件**，不要碰其它项目。` : '',
+        options.readOnly
+          ? '\n本轮是**只读**（两台做的不是同一个项目）：可以读代码、可以回答、可以给依据，**绝不修改任何文件**。'
+            + '如果需要改代码才能完成，就在群里说明要改什么，等甲方把两台项目对齐后再做。'
+          : '',
+      ].join('')
+      : '',
     '',
     '需求原文：',
     requirement.detail,
     '',
+    /*
+     * 身份与收件人（用户 2026-11-25）：
+     * 「agent 需要知道对方身份、用户身份，哪些是说给它听的，哪些不是」。
+     *
+     * 群里同时有：甲方（用户，可能在任何一台设备上）、你（本机乙方）、队友（另一台乙方）。
+     * 不写清这三者，agent 会把队友之间的私聊当成给自己的指令，或者把甲方的回答
+     * 当成「所有人都要做」而重复跑一轮。
+     */
+    '## 谁在说话（先认清这三方，再动手）',
+    `- **甲方（用户）**：发需求、做决定、给授权的人。他说的话是**最高指令**。`,
+    requirement.from.id === local.id
+      ? '- 这条需求是甲方在**本机**提的。'
+      : `- 这条需求是甲方在另一台设备「${deviceLabel(requirement.from, roster)}」上提的。`,
+    `- **你**：${deviceLabel(local, roster)} 的乙方（产品经理），在自己这台机器上执行。`,
+    teammates.length
+      ? `- **队友**：${teammates.map((peer) => `${deviceLabel(peer, roster)} 的乙方`).join('、')}。它是同事，不是甲方。`
+      : '- 当前没有队友在线。',
+    '- **怎么判断一条消息是不是说给你听的**：',
+    `  - \`to\` 是 \`${local.id}\` 或为空（所有人）→ 说给你听，要处理；`,
+    '  - `to` 是别的设备 → **只是参考**，不要执行、不要回答、不要再跑一轮；',
+    '  - 队友（另一台乙方）之间的往来 → **参考**它们的结论，别重复它们已经做完的事；',
+    '  - 甲方回答了某台的追问 → 只有那台接着做，其余只记录。',
+    '',
     groupLines.length ? ['团队群最近的发言（队友说过的，不要重复问）：', ...groupLines].join('\n') : '',
     '',
-    '你现在是**乙方产品经理**，不是马上写代码的机器。请按这个顺序做：',
+    '你现在是**乙方产品经理**，不是马上写代码的机器。请先判断这句话属于哪一类，再按对应流程做：',
+    '',
+    'A. 只是问一件事（不需要改任何文件）：**直接在群里回答**，必须给出依据（哪个文件/哪个字段/哪段逻辑），',
+    '   用 team_sync action=analysis 发出去，然后结束这一轮。不要提"第 1-6 步"，不要追问，不要列清单。',
+    '   答不出来就直说需要看哪部分，不要编。',
+    /*
+     * 回答的篇幅（用户 2026-11-25：「agent 回复报数这种简单问题都需要回复一大堆文字，是否合适？」）。
+     * 「简短回答」写在上面不够，模型会照样分节、列表、加粗堆一大段。这里给可数的硬上限。
+     */
+    '   **篇幅按问题大小走，不许一律长篇**：能一句话答清就只写一句；',
+    '   简单问题（报数、有没有某个功能、当前项目是哪个、某处写的是什么）**最多 3 行**，',
+    '   先给结论再给一句依据，**禁止**分节标题（##/###）、禁止表格、禁止「我的理解 / 结论 / 依据」这种三段式模板。',
+    '   只有确实需要对比多台/多项时才用列表，且每项一行。',
+    '',
+    'B. 要改代码：按下面 1-6 步走。',
+    '',
+    /*
+     * 「不达目标不罢休」+ 自己逐项核对。
+     *
+     * 用户要求：「尽量分析任务拆解任务，方便最后 agent 自己一项项核对任务目标完成情况」。
+     * 光说"做完"没有意义 —— 必须有可验收的清单，并且最后逐项给出证据。
+     */
+    '0. **先拆成可验收的清单**（用 update_todos）：每一条都要是能被验证的结果',
+    '   （看得见的界面效果 / 某个字段存在 / 某条命令通过 / 某个文件里有这段逻辑），',
+    '   不许写「优化一下」「修一下」这类无法验证的条目。目标没写清就先问甲方（见下一步）。',
+    '   **每条都必须是这台机器自己能做完的**：不许写「与另一台保持逐字一致」「比对两份代码」这种',
+    '   跨机器、跨平台的条目 —— 那既做不到也浪费时间（两台代码库本来就不同）。',
+    '   执行中每完成一项就更新清单状态，不要最后一次性全标完成。',
+    '',
     '1. 用甲方听得懂的话把需求复述一遍：他要看到什么效果、在哪个界面、什么算做完了。不要出现变量名、文件名、框架名。',
     `2. 说明在本机这个 ${platformLabel(local.platform)} 版本上你会改什么（用户能感知的部分），以及你不打算做什么、为什么。`,
     '3. 只要还有任何一点不确定（范围、优先级、哪个页面、另一平台要不要一致、验收标准），就用 team_sync action=question 提出**具体的选择题**，然后**停下来等甲方回答**。不要猜着做，也不要「先做一版看看」。',
     '4. 甲方回答清楚、没有疑问了，用 team_sync action=confirm 发一条确认单（一句话复述达成一致的结果），再开始执行：先 update_todos 把工作拆成清单，再动手。',
     '5. 做完用 team_sync action=result 报结果：改了什么（用甲方的话）、他怎么自己验证、有哪些平台差异。',
+    '   **必须在群里说清「需要你做的」**（用户 2026-11-25：『执行完需要我做的内容，它没有发出来到群聊里』）：',
+    '   只要还需要甲方做任何事（重启 / 重载窗口 / 装新包 / 去某个页面点一下 / 回复某个选择 / 上传素材），',
+    '   就在结论后面用一行一条列出来；**一件都不需要就明写「不需要你做什么」**，不要省略这一节。',
+    '   报结果时**必须逐项核对**：把第 0 步清单里的每一条列出来，写清「做到了 / 没做到」，',
+    '   做到了要给出证据（哪个文件哪段、哪条命令输出、哪个界面现象）。',
+    '   **只要还有没做到的项，就不许说「做完了」**：先继续做；确实卡住（缺信息、缺权限、',
+    '   需要甲方决定、需要队友那台配合）就用 team_sync action=question 说明卡在哪一项、缺什么，',
+    '   等群里答复后接着把这一项做完。目标没达成不要收工。',
+    '',
+    /*
+     * 跨平台对齐只要求「行为一致」，不许要求「逐字一致」。
+     *
+     * 用户实况（2026-11-24）：Windows 的清单里出现「在 Windows 版本实现并与 macOS 两份保持逐字一致」，
+     * 结果 agent 花十几分钟去比对两份不同平台的代码 —— 这是纯浪费：
+     * 两台的代码库本来就不同（语言、框架、目录结构都不一样），永远不可能字面一致。
+     * 甲方要的是「用户看到的效果一样」。
+     */
+    '   跨平台对齐只要求**行为一致**：甲方能感知的效果相同即可。',
+    '   **禁止**把「逐字一致 / 行数一致 / 文件内容相同 / 比对两份代码的差异」写成任务项，',
+    '   也禁止为了对齐去读队友那台的仓库或服务器。两台各自的代码库本来就不同，字面一致永远做不到。',
+    '   需要对齐时只做一件事：各自在本机实现，然后在群里用「用户能看到的效果」互相对一遍结论。',
     `6. 最后把结论补进 ${ALIGNMENT_FILE} 里这条需求对应的行。`,
     '',
     '群里只发需求、解析、追问、确认、进度和结果；不要把命令输出、代码、文件列表贴进群。',
+    '',
+    '这条活跑在「团队任务」对话框里，默认是**自动权限 + 无限步数**，普通操作不用再问甲方。',
+    '如果某一步被权限挡住（需要完全访问），就用 team_sync action=question 发一条，正文以「【权限申请】」开头，',
+    '说明卡在哪一步、为什么需要，然后停下来等甲方在群里回「授权」。拿到授权再继续。',
+    '',
+    /*
+     * 两个 agent 要**真的分工协作**，而不是各干各的。
+     *
+     * 用户反馈：「没有实现两个 agent 在团队群自己沟通任务的功能，还是各干各的」。
+     * 通道其实早就有（team_sync 的 send / ask 会让对方跑一轮），但从没在提示词里
+     * 要求用过 —— 我上一轮甚至写了「队友的结果不要理」，那是反方向。
+     */
+    '## 和另一台 agent 的分工（必须做，不是可选）',
+    '队友（对端那台电脑上的 agent）就在这个群里。上面「团队群最近的发言」里它的解析 / 进度 / 结果是背景：',
+    '不要复述、不要致谢、不要把它已经做完的事再做一遍。',
+    '',
+    '但只要这条活涉及两台，你就必须主动沟通，用 team_sync：',
+    '- **开始动手前**：先看队友已经说了什么。同一条需求它已经在做同一件事时，只做**你这一端**该做的部分，',
+    '  并立刻用 `action=send` 说一句「我负责 <你这一端的具体范围>，你那端不要动 <那部分>」，避免两边改同一处。',
+    '- **需要它确认或配合**（接口字段、验收标准、它那台的现状）：用 `action=ask` 直接问，问题要具体到能一句话回答。',
+    '- **发现会影响对方的差异**（两台实现不一致、字段对不上、它那边的结论和你的代码不符）：用 `action=send` 说清事实差异。',
+    '- 收到队友消息后**只回一次结论**，不要接龙客套；它已经答清的事不要再问一遍。',
+    '',
+    '禁止：发「收到」「好的」「我这边也在做」这类空消息；把代码、日志、文件清单贴进群。',
   ].filter((line) => line !== '').join('\n');
 }
 
@@ -722,14 +1128,15 @@ export interface LedgerParty {
   label: string;
 }
 
-function partyOf(report: SyncReport): LedgerParty {
-  // 设备名本身就是给人看的（`MagicBookV14 · win32`），再拼平台标签会变成 `… · win32 · Windows`
-  return { id: report.from.id, label: report.from.name };
+function partyOf(report: SyncReport, roster?: readonly SyncPeer[]): LedgerParty {
+  // 身份统一由 deviceLabel 拼（系统类型 · 设备名，同名时带 IP），
+  // 以前直接用 `from.name`，会出现 `MagicBookV14 · win32 · Windows` 这种重复。
+  return { id: report.from.id, label: deviceLabel(report.from, roster) };
 }
 
 /** 一台设备的名字；没有名字时才退回平台。 */
-function peerLabel(peer: SyncPeer): string {
-  return peer.name || platformLabel(peer.platform);
+function peerLabel(peer: SyncPeer, roster?: readonly SyncPeer[]): string {
+  return deviceLabel(peer, roster);
 }
 
 /**
@@ -785,8 +1192,8 @@ export function findDivergences(rows: readonly LedgerRow[], roster: readonly Syn
   const result: Divergence[] = [];
   for (const row of rows) {
     const reports = Object.values(row.reports).filter((report): report is SyncReport => Boolean(report));
-    const done = reports.filter((report) => report.status === 'done').map(partyOf);
-    const skipped = reports.filter((report) => report.status === 'skipped').map(partyOf);
+    const done = reports.filter((report) => report.status === 'done').map((report) => partyOf(report, roster));
+    const skipped = reports.filter((report) => report.status === 'skipped').map((report) => partyOf(report, roster));
     if (!done.length || !skipped.length) continue;
     const reported = new Set(reports.map((report) => report.from.id));
     result.push({
@@ -794,7 +1201,7 @@ export function findDivergences(rows: readonly LedgerRow[], roster: readonly Syn
       doneOn: done,
       missingOn: roster
         .filter((peer) => !reported.has(peer.id))
-        .map((peer) => ({ id: peer.id, label: peerLabel(peer) })),
+        .map((peer) => ({ id: peer.id, label: peerLabel(peer, roster) })),
       skippedOn: skipped,
       skippedNotes: reports
         .filter((report) => report.status === 'skipped')
@@ -835,7 +1242,7 @@ export function renderLedger(rows: readonly LedgerRow[], now = Date.now(), roste
   lines.push('## 需求对照', '', '| 需求 | 发起 | 执行设备 | 状态 | 说明 | 更新 |', '|---|---|---|---|---|---|');
   for (const row of rows) {
     const reports = Object.values(row.reports).filter((report): report is SyncReport => Boolean(report));
-    const requester = peerLabel(row.requirement.from);
+    const requester = peerLabel(row.requirement.from, roster);
     if (!reports.length) {
       lines.push(`| ${escapeCell(row.requirement.title)} | ${escapeCell(requester)} | — | 没有报告 | — | — |`);
       continue;
@@ -845,7 +1252,7 @@ export function renderLedger(rows: readonly LedgerRow[], now = Date.now(), roste
       const files = report.files.length ? `（${report.files.length} 个文件）` : '';
       lines.push(
         `| ${escapeCell(row.requirement.title)} | ${escapeCell(requester)} `
-        + `| ${escapeCell(partyOf(report).label)} | ${STATUS_LABEL[report.status]} `
+        + `| ${escapeCell(partyOf(report, roster).label)} | ${STATUS_LABEL[report.status]} `
         + `| ${escapeCell(`${detail}${files}`)} | ${new Date(report.at).toISOString().slice(5, 16).replace('T', ' ')} |`,
       );
     }

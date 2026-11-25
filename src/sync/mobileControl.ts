@@ -37,7 +37,13 @@ export interface MobileStatePayload {
   role: 'off' | 'hub' | 'peer';
   peers: SyncPeer[];
   messages: SyncGroupMessage[];
-  openQuestion?: { requirementId: string; body: string };
+  openQuestion?: {
+    requirementId: string;
+    body: string;
+    askerId?: string;
+    askerLabel?: string;
+    options?: string[];
+  };
   approvals: MobileApprovalView[];
   canApprove: boolean;
 }
@@ -192,9 +198,14 @@ export function renderMobilePage(options: { device: string; authed: boolean; can
   header .name { font-weight: 600; font-size: 15px; }
   header .role { margin-left: auto; font-size: 12px; color: var(--muted); }
   main { flex: 1; overflow-y: auto; padding: 12px 12px 20px; -webkit-overflow-scrolling: touch; }
-  .banner { margin: 0 0 12px; padding: 10px 12px; border-radius: 12px; font-size: 14px;
+  .banner { position: relative; margin: 0 0 12px; padding: 10px 12px; border-radius: 12px; font-size: 14px;
     background: rgba(240,180,41,.12); border: 1px solid rgba(240,180,41,.45); color: #f7d68a; }
-  .banner b { display: block; margin-bottom: 4px; color: var(--warn); }
+  .banner b { display: block; margin-bottom: 4px; color: var(--warn); padding-right: 26px; }
+  .banner-close { position: absolute; top: 4px; right: 6px; width: 26px; height: 26px; border: 0;
+    background: transparent; color: inherit; font-size: 18px; line-height: 1; opacity: .7; }
+  .banner-opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .banner-opts button { font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 999px;
+    border: 1px solid rgba(240,180,41,.6); background: transparent; color: inherit; }
   .msg { display: flex; margin-bottom: 12px; }
   .msg.user { justify-content: flex-end; }
   .bubble { max-width: 86%; padding: 9px 12px; border-radius: 14px; background: var(--panel2);
@@ -272,6 +283,8 @@ ${options.authed ? '<main id="main"><div class="empty">正在连接…</div></ma
   var input = document.getElementById('input');
   var send = document.getElementById('send');
   var signature = '';
+  /* 本机收起过的那条「等你回答」（只影响显示，不影响问题本身）。 */
+  var dismissedQuestion = '';
   var busy = false;
 
   function post(url, body) {
@@ -295,6 +308,16 @@ ${options.authed ? '<main id="main"><div class="empty">正在连接…</div></ma
     return ('0' + date.getHours()).slice(-2) + ':' + ('0' + date.getMinutes()).slice(-2);
   }
 
+  /* 身份标识：系统类型 · 设备名（与电脑端同一写法）。 */
+  function deviceLabelOf(peer) {
+    if (!peer) return '乙方';
+    var raw = String(peer.name || '').trim();
+    var name = raw.replace(/\\s*[·•]\\s*(win32|windows|darwin|macos|osx|linux|android|web)\\s*$/i, '').trim() || raw;
+    if (peer.version === 'web' || /浏览器/.test(name)) return '手机 · 浏览器';
+    var os = peer.platform === 'darwin' ? 'macOS' : (peer.platform === 'win32' ? 'Windows' : 'Linux');
+    return name ? os + ' · ' + name : os;
+  }
+
   function render(state) {
     document.getElementById('dot').className = 'dot' + (state.role === 'off' ? '' : ' on');
     document.getElementById('role').textContent = state.role === 'hub' ? '主机' : state.role === 'peer' ? '已连接' : '单机';
@@ -306,10 +329,37 @@ ${options.authed ? '<main id="main"><div class="empty">正在连接…</div></ma
     signature = next;
 
     main.innerHTML = '';
-    if (state.openQuestion) {
+    /* 收起过的追问不再占地方；同一台提了新问题（正文变了）会重新弹出来。 */
+    var questionKey = state.openQuestion
+      ? String(state.openQuestion.requirementId || '') + '|' + String(state.openQuestion.body || '')
+      : '';
+    if (state.openQuestion && questionKey !== dismissedQuestion) {
       var banner = el('div', 'banner');
-      banner.appendChild(el('b', null, '乙方在等你回答'));
+      var close = el('button', 'banner-close', '×');
+      close.type = 'button';
+      close.addEventListener('click', function () {
+        dismissedQuestion = questionKey;
+        signature = '';
+        banner.remove();
+      });
+      banner.appendChild(close);
+      banner.appendChild(el('b', null, state.openQuestion.askerLabel
+        ? state.openQuestion.askerLabel + ' 的乙方在等你回答'
+        : '乙方在等你回答'));
       banner.appendChild(el('span', null, state.openQuestion.body));
+      /* 现成答案直接点，手机上更不该逼人打一整句。 */
+      if (state.openQuestion.options && state.openQuestion.options.length) {
+        var opts = el('div', 'banner-opts');
+        state.openQuestion.options.forEach(function (option) {
+          var button = el('button', null, option);
+          button.type = 'button';
+          button.addEventListener('click', function () {
+            post('/m/send', { text: option, assignee: state.openQuestion.askerId }).catch(function () {});
+          });
+          opts.appendChild(button);
+        });
+        banner.appendChild(opts);
+      }
       main.appendChild(banner);
     }
     (state.approvals || []).forEach(function (approval) {
@@ -336,7 +386,7 @@ ${options.authed ? '<main id="main"><div class="empty">正在连接…</div></ma
       var bubble = el('div', 'bubble');
       var meta = el('div', 'meta');
       meta.appendChild(el('span', 'tag ' + message.phase, PHASES[message.phase] || message.phase));
-      meta.appendChild(el('span', null, (mine ? '你' : (message.from && message.from.name) || '乙方') + ' · ' + timeOf(message.at)));
+      meta.appendChild(el('span', null, (mine ? '你' : deviceLabelOf(message.from)) + ' · ' + timeOf(message.at)));
       bubble.appendChild(meta);
       bubble.appendChild(el('div', null, message.body));
       wrap.appendChild(bubble);

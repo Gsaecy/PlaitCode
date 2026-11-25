@@ -30,6 +30,11 @@ const builds = [
         entryPoints: testEntries,
         outdir: 'out/test',
         alias: { vscode: './src/test/support/vscodeMock.ts' },
+        /*
+         * linkedom 是纯 ESM：不 bundle 它（bundle 会把 ESM 转成 require 而失败），
+         * 运行时用动态 import 由 Node 自己解析。
+         */
+        external: ['linkedom'],
       }]
     : []),
 ];

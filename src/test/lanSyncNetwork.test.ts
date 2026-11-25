@@ -26,6 +26,9 @@ async function makeService(peer: SyncPeer, options: {
   onRequirement?: (requirement: SyncRequirement) => Promise<boolean>;
   onNote?: (note: SyncNote) => Promise<boolean>;
   onGroupMessage?: (message: any) => Promise<void>;
+  onGroupPending?: () => void;
+  onRemoteGroupChat?: (message: any) => void;
+  onStateChanged?: () => void;
   /** 测试与真实运行中的扩展隔离：真实实例会占用 47821 广播。 */
   discoveryPort?: number;
 } = {}): Promise<{ service: LanSyncService; dir: string; ledgers: string[] }> {
@@ -36,6 +39,9 @@ async function makeService(peer: SyncPeer, options: {
     runRequirement: options.onRequirement ?? (async () => true),
     runNote: options.onNote ?? (async () => true),
     ...(options.onGroupMessage ? { onGroupMessage: options.onGroupMessage } : {}),
+    ...(options.onGroupPending ? { onGroupPending: options.onGroupPending } : {}),
+    ...(options.onRemoteGroupChat ? { onRemoteGroupChat: options.onRemoteGroupChat } : {}),
+    ...(options.onStateChanged ? { onState: options.onStateChanged } : {}),
     writeLedger: async (markdown) => { ledgers.push(markdown); },
     writeTranscript: async () => undefined,
     log: () => undefined,
@@ -43,6 +49,180 @@ async function makeService(peer: SyncPeer, options: {
   await service.load();
   return { service, dir, ledgers };
 }
+
+/**
+ * 用户 2026-11-24：「Windows 发消息，群里要过 2 秒左右才出现」。
+ *
+ * 原因是「这是闲聊还是任务」要问一次模型，判完才把话记进群。
+ * 现在先本机画一条「发送中」，判定完由正式消息替换 —— 判得慢也看得见。
+ */
+test('端到端：加入方一进群，主机端立刻看到（不用等对方先说话）', async () => {
+  const HUB_PORT = 48_351;
+  const PEER_PORT = 48_352;
+  let hubStates = 0;
+
+  const hub = await makeService(winPeer, { onStateChanged: () => { hubStates += 1; } });
+  const peer = await makeService(macPeer);
+
+  try {
+    await hub.service.setPairingCode('JOIN-CODE');
+    await peer.service.setPairingCode('JOIN-CODE');
+    assert.equal((await hub.service.startHub(HUB_PORT)).ok, true);
+
+    const before = hubStates;
+    const joined = await peer.service.joinHub(`http://127.0.0.1:${HUB_PORT}`, PEER_PORT);
+    assert.equal(joined.ok, true, joined.message);
+
+    /*
+     * 用户的实况：加入方已经显示「2 台设备」，主机端还在「等对方加入」，
+     * 一直等到对方先往群里说一句才刷新。所以这里要求加入的那一刻就通知界面。
+     */
+    assert.ok(hubStates > before, '主机端必须立刻收到一次状态变化');
+    assert.deepEqual(hub.service.remotePeers().map((item) => item.name), [macPeer.name]);
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
+test('端到端：对端在群里问了一句，本机也接到「该答一句」的通知', async () => {
+  const HUB_PORT = 48_361;
+  const PEER_PORT = 48_362;
+  const hubChats: string[] = [];
+  const peerChats: string[] = [];
+
+  const hub = await makeService(winPeer, { onRemoteGroupChat: (message) => { hubChats.push(String(message.body)); } });
+  const peer = await makeService(macPeer, { onRemoteGroupChat: (message) => { peerChats.push(String(message.body)); } });
+
+  try {
+    await hub.service.setPairingCode('CHAT-CODE');
+    await peer.service.setPairingCode('CHAT-CODE');
+    assert.equal((await hub.service.startHub(HUB_PORT)).ok, true);
+    assert.equal((await peer.service.joinHub(`http://127.0.0.1:${HUB_PORT}`, PEER_PORT)).ok, true);
+
+    // 甲方在 mac 上说「报数」（已被判定为闲聊）：Windows 也必须接到通知去答一句。
+    await peer.service.postGroup({ author: 'user', phase: 'analysis', body: '报数' });
+    assert.deepEqual(hubChats, ['报数'], '另一台必须被叫去答一句');
+    assert.deepEqual(peerChats, [], '自己发的话不该再叫自己答一遍（否则一条问句两个回答）');
+
+    // agent 自己的回答不该在对端再触发一轮，否则两个 agent 能聊到把额度烧光。
+    peerChats.length = 0;
+    await hub.service.postGroup({ author: 'agent', phase: 'analysis', body: '报到！' });
+    assert.deepEqual(peerChats, [], 'agent 的发言不能再触发对方回答');
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
+test('两台项目不同，群里的问答也必须能互相回（项目只影响改代码的任务）', async () => {
+  const HUB_PORT = 48_371;
+  const PEER_PORT = 48_372;
+  const hubChats: string[] = [];
+  const peerChats: string[] = [];
+
+  const hub = await makeService(winPeer, { onRemoteGroupChat: (message) => { hubChats.push(String(message.body)); } });
+  const peer = await makeService(macPeer, { onRemoteGroupChat: (message) => { peerChats.push(String(message.body)); } });
+
+  try {
+    await hub.service.setPairingCode('DIFF-CODE');
+    await peer.service.setPairingCode('DIFF-CODE');
+    assert.equal((await hub.service.startHub(HUB_PORT)).ok, true);
+    assert.equal((await peer.service.joinHub(`http://127.0.0.1:${HUB_PORT}`, PEER_PORT)).ok, true);
+
+    // 两台故意在做**不同**的项目（用户实况：plaitcode vs personal-workstation-os）。
+    await hub.service.setCollabProject('app-win', 'github.com/acme/app-win');
+    await peer.service.setCollabProject('app-mac', 'github.com/acme/app-mac');
+
+    // 甲方在 mac 上说「报数」：Windows 必须照答，不能因为项目不同就不吭声。
+    await peer.service.postGroup({ author: 'user', phase: 'analysis', body: '报数' });
+    assert.deepEqual(hubChats, ['报数'], '项目不同不该挡住问答');
+    assert.ok(
+      hub.service.recentGroup().some((item) => item.body === '报数'),
+      '消息本身必须落到本机的群记录里（先能收到，才谈得上回答）',
+    );
+
+    // 反向也一样。
+    await hub.service.postGroup({ author: 'user', phase: 'analysis', body: '几点了' });
+    assert.deepEqual(peerChats, ['几点了'], '项目不同不该挡住反方向的问答');
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
+test('话里说「让 macos 做」时，Windows 不执行（不再两台都跑）', async () => {
+  const { resolveAssigneeFromText } = await import('../sync/assignIntent.js');
+  const devices = [
+    { id: 'p-win', name: 'MagicBookV14 · win32', platform: 'win32' },
+    { id: 'p-mac', name: '192.168.0.8 · darwin', platform: 'darwin' },
+  ];
+
+  // 用户实况的那句话。
+  const hit = resolveAssigneeFromText(
+    'macos那边agent，需要检查项目的数据同步、邮件、订阅、日程、便签、api设置，有没有同步功能',
+    devices,
+  );
+  assert.equal(hit?.id, 'p-mac', '要认出这条是派给 macOS 的');
+
+  // 反过来也一样。
+  assert.equal(
+    resolveAssigneeFromText('这条让 Windows 执行', devices)?.id,
+    'p-win',
+  );
+  // 设备名直接说也认。
+  assert.equal(
+    resolveAssigneeFromText('交给 MagicBookV14 处理', devices)?.id,
+    'p-win',
+  );
+  // 只是讨论，没指派 → 不猜（两台各做各的，保持旧行为）。
+  assert.equal(resolveAssigneeFromText('Windows 和 mac 的差异是什么？', devices), undefined);
+  // 一句话点了两台 → 不猜。
+  assert.equal(resolveAssigneeFromText('让 mac 传给 Windows', devices), undefined);
+});
+
+test('指派信息必须过网络保留，否则对端照样会跑', async () => {
+  const { makeRequirement, parseSyncMessage } = await import('../sync/lanProtocol.js');
+  const peer = { id: 'p-win', name: 'PC', platform: 'win32' as const, project: 'app', version: 't' };
+  const requirement = makeRequirement(peer, '让 macos 做这件事', 1000, 'x')!;
+  requirement.assignee = 'p-mac';
+  requirement.project = 'app';
+  requirement.repo = 'github.com/acme/app';
+
+  const parsed = parseSyncMessage(JSON.parse(JSON.stringify(requirement)));
+  assert.ok(parsed && parsed.kind === 'requirement');
+  assert.equal(parsed!.assignee, 'p-mac', 'parseSyncMessage 不能把 assignee 丢掉');
+  assert.equal(parsed!.repo, 'github.com/acme/app', 'repo 也必须保留，否则项目门禁失效');
+});
+
+test('刚发的话立刻上屏：判定期间有临时那条，正式消息进群后消失', async () => {
+  let pendingRepaints = 0;
+  const { service, dir } = await makeService(winPeer, {
+    onGroupPending: () => { pendingRepaints += 1; },
+  });
+  try {
+    service.beginPendingGroup('  报数  ');
+    assert.equal(service.groupState().pending?.body, '报数', '去掉首尾空白后立刻可见');
+    assert.equal(pendingRepaints, 1, '必须立刻让面板重画一次');
+
+    await service.postGroup({ author: 'user', phase: 'analysis', body: '报数' });
+    assert.equal(service.groupState().pending, undefined, '正式消息进群后临时那条必须收掉');
+    assert.deepEqual(service.recentGroup().map((item) => item.body), ['报数']);
+
+    // 空内容不该造出一条假的「发送中」。
+    service.beginPendingGroup('   ');
+    assert.equal(service.groupState().pending, undefined);
+  } finally {
+    service.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 /**
  * 用户反复卡住的那一步：**群里发的话，另一台到底收没收到**。
@@ -824,6 +1004,44 @@ test('项目身份 = 仓库地址：各种写法归一成同一个 ID，文件�
   assert.equal(sameProject({ project: 'app' }, { project: 'app' }), true);
 });
 
+test('「项目对不上」只在真的对不上时才说', async () => {
+  const { projectMismatchText } = await import('../sync/projectRef.js');
+
+  /*
+   * 用户实况：群里两边仓库明明相同，顶上却挂着红字「本机 github.com/…/personal-workstation-os；
+   * 192.168.0.8 在做 personal workstation」。
+   *
+   * 原因就是拿「本机的仓库地址」直接和「对方的项目名」比 —— 永远不相等。
+   */
+  assert.equal(
+    projectMismatchText(
+      { repo: 'https://github.com/gsaecy/personal-workstation-os', project: 'Personal-Workstation-OS' },
+      [{ name: '192.168.0.8 · darwin', project: 'personal workstation' }],
+    ),
+    '',
+    '本机有仓库、对方只有一个（写法不同的）项目名时，不能断言不一致',
+  );
+
+  assert.equal(
+    projectMismatchText(
+      { repo: 'https://github.com/gsaecy/personal-workstation-os', project: 'a' },
+      [{ name: 'Mac', repo: 'git@github.com:gsaecy/personal-workstation-os.git', project: 'b' }],
+    ),
+    '',
+    '仓库相同（写法不同）就是同一个项目',
+  );
+
+  const differ = projectMismatchText(
+    { repo: 'https://github.com/gsaecy/plaitcode', project: 'a' },
+    [{ name: 'Mac', repo: 'github.com/gsaecy/personal-workstation-os', project: 'b' }],
+  );
+  assert.match(differ, /plaitcode/);
+  assert.match(differ, /personal-workstation-os/);
+
+  // 对方什么都没报（刚连上还没同步身份）时不该报警。
+  assert.equal(projectMismatchText({ repo: 'github.com/a/b', project: 'x' }, [{ name: 'Mac' }]), '');
+});
+
 test('群里的需求：本机 agent 必须拿到协议提示词，不是用户原文', async () => {
   const { requirementPromptForLocal, makeRequirement } = await import('../sync/lanProtocol.js');
   const peer = { id: 'p-win', name: 'PC · Windows', platform: 'win32' as const, project: 'app', version: 't' };
@@ -843,7 +1061,7 @@ test('群里的需求：本机 agent 必须拿到协议提示词，不是用户�
 
   // 对端来的需求仍然保持原来的措辞。
   const remotePrompt = requirementPromptForLocal(requirement, peer);
-  assert.match(remotePrompt, /甲方在另一台设备「PC · Windows」上提出了一个跨平台需求/);
+  assert.match(remotePrompt, /甲方在另一台设备「Windows · PC」上提出了一个跨平台需求/);
   assert.match(remotePrompt, /需求原文：\nagent 报数/);
 });
 
