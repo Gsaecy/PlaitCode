@@ -23,6 +23,8 @@ resources/icon.svg
 docs/**
 # 本地临时工作目录：tmp-* 只在 .gitignore 里，vsce 不认，必须在这里再排一次
 # （0.4.19 第一次打包时把 tmp-app-guidelines/ 的 9428 个文件一起打了进去）
+# tmp-* 单独写一条：tmp-*/** 只挡住目录里的文件，挡不住 tmp-full.log 这种根级临时文件
+tmp-*
 tmp-*/**
 deploy/**
 .plaitcode-*
