@@ -76,8 +76,12 @@ export function planGateBlockReason(toolName: string, phase: TeamPhase | undefin
     + '所以不要索取授权，不要说「本轮没有写文件能力」，也不要当成故障汇报。'
     + (waiting
       ? '现在只做两件事：等甲方确认；需要队友补充事实就用 team_sync action=ask。'
+        + '如果甲方**已经**说过「确认 / 开工 / 按已确认的做」，那是阶段没同步 —— 请甲方在群里再发一句'
+        + '「确认，开始做」，这一句会立刻解除限制（宿主认这句话，不靠模型判断）。'
       : '现在只做两件事：和队友把事实对齐，用 team_sync action=result 发出**一份**双方都同意的方案，'
-        + '并写明「方案待甲方确认」。');
+        + '并写明「方案待甲方确认」。'
+        + '如果甲方**已经**发过开工令（例如「不再谈方案，按已确认的动手」），请让他在群里补一句'
+        + '「确认，开始做」——宿主认这句，会立刻放行写操作。');
 }
 
 /**
@@ -157,6 +161,21 @@ const APPROVE_PATTERNS: readonly RegExp[] = [
   /^(?:ok|okay|go|approve|approved|lgtm)[.!\s]*$/i,
   /(?:yes|confirm|approved|go ahead|proceed)[.!\s]*$/i,
 ];
+/**
+ * 「已经确认过」+「去做」同时出现 → 就是批准，**不看句子长度**。
+ *
+ * 用户实况（2026-11-26）：甲方在群里说的是
+ * 「不再谈方案，macOS 这台按已确认的内容动手开工」——意思非常明确，
+ * 但旧判据要求句子 ≤40 字且必须出现「按…方案…动手」，于是**没认出来**：
+ * 阶段停在「沟通中」，写文件的闸一直关着，两台 agent 只能继续互相解释。
+ * 那是「聊了一整天、项目没动」的直接原因之一。
+ */
+const APPROVE_CONFIRMED_IMPERATIVE: readonly RegExp[] = [
+  /(?:已确认|确认过|确认了|就按|不用再谈|不再谈|别谈了|已定|定稿)/,
+];
+const APPROVE_IMPERATIVE: readonly RegExp[] = [
+  /(?:动手|开工|开始做|开始改|开始执行|去做|去改|照做|执行吧)/,
+];
 
 /** 甲方是不是在**否决 / 要求改方案**。 */
 const REJECT_PATTERNS: readonly RegExp[] = [
@@ -169,13 +188,36 @@ const REJECT_PATTERNS: readonly RegExp[] = [
  * 这句话是不是在确认方案。
  *
  * 宁可漏判也不要错判：错判会把「改一下第 2 步」当成批准，agent 就带着半成品方案动手了。
- * 所以只认明确的短句或「确认/同意…方案」这类完整表述。
+ * 所以只认明确的短句，或者「已确认 + 去做」这种不含歧义的组合（见
+ * `APPROVE_CONFIRMED_IMPERATIVE`；这一档不看句子长度 —— 甲方写长句很常见）。
  */
 export function looksLikePlanApproval(text: string): boolean {
   const value = (text ?? '').trim();
-  if (!value || value.length > 40) return false;
+  if (!value) return false;
   if (looksLikePlanRejection(value)) return false;
+  /*
+   * 「已确认 / 就按 / 不用再谈」+「动手 / 开工 / 开始做」同时出现 = 批准。
+   * 不设长度上限：甲方的指令经常是一整段（2026-11-26 的实况就是一整段带分工的指令）。
+   */
+  if (APPROVE_CONFIRMED_IMPERATIVE.some((pattern) => pattern.test(value))
+    && APPROVE_IMPERATIVE.some((pattern) => pattern.test(value))) {
+    return true;
+  }
+  if (value.length > 40) return false;
   return APPROVE_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+/**
+ * 「已确认 + 去做」这种**强**批准（不看长度）。
+ *
+ * 用途：阶段停在「沟通中」时，用这条判断甲方是不是已经下了开工令 ——
+ * 短句「确认」仍然要求群里确实有方案，但一整段指令不会再被长度限制吞掉。
+ */
+export function looksLikeExplicitGoAhead(text: string): boolean {
+  const value = (text ?? '').trim();
+  if (!value || looksLikePlanRejection(value)) return false;
+  return APPROVE_CONFIRMED_IMPERATIVE.some((pattern) => pattern.test(value))
+    && APPROVE_IMPERATIVE.some((pattern) => pattern.test(value));
 }
 
 /** 这句话是不是在否决 / 要求改方案（这时必须回到谈判阶段）。 */

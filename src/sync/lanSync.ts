@@ -70,7 +70,8 @@ import {
   type SyncReport,
   type SyncRequirement,
 } from './lanProtocol';
-import { initialTeamPhase, isTeamPhase, looksLikePlanApproval, looksLikePlanRejection, teamPhaseLabel, type TeamPhase } from './planGate';
+import { initialTeamPhase, isTeamPhase, looksLikeExplicitGoAhead, looksLikePlanApproval, looksLikePlanRejection, teamPhaseLabel, type TeamPhase } from './planGate';
+import { TEAM_DISCIPLINE_PROMPT, RECENT_POST_WINDOW, checkTeamPost, staleNudgeBody, staleWatchVerdict } from './processDiscipline';
 import { normalizeRepoUrl } from './projectRef';
 import { projectGate } from './projectGate';
 import {
@@ -492,6 +493,10 @@ export class LanSyncService implements Disposable {
    * 见 `holdNoteDelivery()` / `resumeNoteDelivery()`。
    */
   private notesHeld = false;
+  /** 自上次真正推进以来，agent 一共发了多少条（「停线」判据，见 `processDiscipline`）。 */
+  private stalePosts = 0;
+  /** 已经在哪条需求上停线提醒过（同一条需求只提醒一次，避免自己也刷屏）。 */
+  private staleNudgedAt = '';
   /** 重投定时器：只在队列非空时存在。 */
   private noteRetryTimer?: ReturnType<typeof setInterval>;
   /**
@@ -3394,7 +3399,10 @@ export class LanSyncService implements Disposable {
         && /待甲方确认|请甲方确认|等你确认|请确认方案/.test(message.body))
       : false;
     const target = awaiting[awaiting.length - 1]
-      ?? (planPosted && latest && this.phaseOf(latest.id) === 'negotiate' ? latest.id : undefined);
+      ?? (latest && this.phaseOf(latest.id) !== 'implement'
+        && (planPosted || looksLikeExplicitGoAhead(text))
+        ? latest.id
+        : undefined);
     /* 既没有待确认的方案、群里也没有方案：这句话跟阶段无关，别抢着解释。 */
     if (!target) return undefined;
     const requirementId = target;
@@ -3756,6 +3764,61 @@ export class LanSyncService implements Disposable {
       : input.requirementId || this.requirements[this.requirements.length - 1]?.id || '';
     const group = makeGroupMessage(this.localPeer(), { ...message, requirementId });
     if (!group) return { ok: false, message: '群消息内容为空。' };
+    /*
+     * **过程纪律闸门**（用户 2026-11-26：「agent 相互乱说、这里改一下那里改一下，项目却
+     * 没有丝毫推进」）。
+     *
+     * 只拦两类**确定没信息量**的发言（判据见 `sync/processDiscipline.ts`）：
+     *  1. 和本机最近说过的几乎一样 → 复述不推进项目；
+     *  2. 非要当「结果」发却没有任何可核对的东西 → 按 Definition of Done 只能算进展。
+     * 拦下来把「该怎么做」直接回给模型（`ok: false` 会让 `team_sync` 把这句话交给它）。
+     */
+    if (input.author === 'agent') {
+      const check = checkTeamPost({
+        body: input.body,
+        phase: input.phase,
+        recent: this.group
+          .filter((item) => item.author === 'agent' && item.from.id === this.bridge.peer().id)
+          .slice(-RECENT_POST_WINDOW)
+          .map((item) => item.body),
+      });
+      if (check.action === 'reject') {
+        this.bridge.log(`[sync] 拦下一条没信息量的发言：${input.body.slice(0, 40)}`);
+        return { ok: false, message: check.guidance ?? '这条发言没有新信息，换一个做法。' };
+      }
+    }
+    /*
+     * 「没有推进」的计数：甲方发话、阶段推进、收到报告都算推进，把计数清零；
+     * agent 每发一条就 +1，到阈值就停线（先提醒，再不推进就关掉自动应答）。
+     */
+    if (input.author === 'agent') {
+      this.stalePosts += 1;
+      const verdict = staleWatchVerdict(this.stalePosts);
+      if (verdict !== 'ok' && this.staleNudgedAt !== requirementId) {
+        this.staleNudgedAt = requirementId;
+        this.bridge.log(`[sync] 连续 ${this.stalePosts} 条发言没有推进：停线提醒`);
+        void this.postGroup({
+          author: 'agent',
+          phase: 'question',
+          body: staleNudgeBody(this.stalePosts),
+          ...(requirementId ? { requirementId } : {}),
+          options: ['只推进一件事，我来定', '先停下，我要改方向'],
+        }).catch(() => undefined);
+        if (verdict === 'hold') {
+          /*
+           * 停线到硬阈值：再发一条**明确的**停线消息，但**不静默关掉协作**。
+           *
+           * 之前这里直接 `notesHeld = true`：那是「对方说话这台不再听」，属于静默副作用 ——
+           * 一旦误判，用户看到的就是「怎么叫都不动」，比绕圈更糟。
+           * 关协作只留给人一个动作：他在群里说一句，或按「停止执行」。
+           */
+          this.bridge.log('[sync] 停线已达硬阈值：只提示甲方，不静默关闭协作');
+        }
+      }
+    } else {
+      this.stalePosts = 0;
+      this.staleNudgedAt = '';
+    }
     // 本机发出的消息：到达时刻就是它被造出来的时刻（对端则以到达它的时刻为准）。
     const local: typeof group = { ...group, receivedAt: group.at };
     this.group = [...this.group, local].slice(-MAX_GROUP_MESSAGES);

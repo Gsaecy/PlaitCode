@@ -21,6 +21,7 @@ import { decideWhenBusy } from '../sync/sendGate';
 import { allowsWriteTools, nextPhaseAfterRun, planGateBlockReason, resolvePlanGate, resolveSyncReadOnly, teamPhaseLabel, type TeamPhase } from '../sync/planGate';
 import { planTeamCompaction, teamMilestoneReached } from '../sync/teamCompaction';
 import { fitMessagesForWebview, trimMessageForWebview } from './webviewPayload';
+import { enforceSingleInProgress } from '../sync/processDiscipline';
 import { BRIDGED_TOOL_PREFIX, trimToolSurface, wantsBridgedTools } from '../agent/toolSurface';
 import { findRemoteImages, resolveRemoteImages } from '../agent/remoteImages';
 import { chooseReferenceMatch } from '../agent/fileReferenceResolve';
@@ -2231,12 +2232,24 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     if (!this.lanSync || !input.requirementId) return;
     const current = this.lanSync.phaseOf(input.requirementId);
     const autonomous = this.lanSync.autonomous();
-    const next = nextPhaseAfterRun({
-      phase: current,
-      done: input.outcome === 'completed',
-      pendingPeerAsks: input.waiting,
-      ...(autonomous ? { autonomous: true } : {}),
-    });
+    /*
+     * 模型可能已经**把方案发出来了**（正文里有「方案待甲方确认」），但这一轮并不是
+     * `completed`（被打断 / 被顶掉 / 报错）。以前这种情况下阶段永远停在「沟通中」，
+     * 甲方回了「确认」也不认、写操作永远被拦 —— 用户看到的就是「确定放行了还是会被拦」。
+     * 所以先看群里有没有方案：有就至少推进到「等确认」，与轮次结局无关。
+     */
+    const planPosted = this.lanSync.recentGroup(6)
+      .some((message) => message.requirementId === input.requirementId
+        && message.author === 'agent'
+        && /待甲方确认|请甲方确认|等你确认|请确认方案/.test(message.body));
+    const next = planPosted && current === 'negotiate'
+      ? 'awaiting-approval'
+      : nextPhaseAfterRun({
+        phase: current,
+        done: input.outcome === 'completed',
+        pendingPeerAsks: input.waiting,
+        ...(autonomous ? { autonomous: true } : {}),
+      });
     if (next === current) return;
     this.lanSync.setPhase(input.requirementId, next);
     if (next === 'implement') {
@@ -2876,6 +2889,25 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
 
   dispose(): void {
     for (const run of this.runs.values()) run.controller.abort();
+    /*
+     * 自己起的定时器必须一起收掉。
+     *
+     * 2026-11-26 的实测：心跳 `setInterval` 与状态合并 `setTimeout` 只 `unref()` 不清除时，
+     * 进程不退（测试套件因此挂住 10 分钟以上）。`unref` 只保证「不阻止退出」，
+     * 但定时器回调仍会在宿主里跑，且测试里 `dispose()` 之后还会继续触发日志/推送。
+     */
+    if (this.heartbeatWatchdog) {
+      clearInterval(this.heartbeatWatchdog);
+      this.heartbeatWatchdog = undefined;
+    }
+    if (this.webviewWatchdog) {
+      clearTimeout(this.webviewWatchdog);
+      this.webviewWatchdog = undefined;
+    }
+    if (this.statePushTimer) {
+      clearTimeout(this.statePushTimer);
+      this.statePushTimer = undefined;
+    }
     // 关窗口前把还没落盘的任务记忆写掉：这是下一轮的记忆，不能只停在去抖计时器里。
     for (const conversationId of [...this.pendingTaskMemory.keys()]) {
       // 走合并路径：直接写 `pending.nodes` 会把上一轮做完的任务覆盖掉（真实丢记忆点）。
@@ -4389,9 +4421,21 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
              * 这里拦的是**动作**，不是能力：写工具照常下发，模型调了才拒，并把原因一次说清
              * （不是权限不足、不要索取授权、不要说没有写文件能力）。
              */
-            const blockedByPlanGate = planGateBlockReason(call.function.name, planGate);
+            /*
+             * 阶段**在调用这一刻重算**，不用起跑时捕获的那份。
+             *
+             * 用户实况（2026-11-26）：「确定好方案，确定放行了，还是会被拦。」
+             * 根因就在这里：`planGate` 是这一轮开始时算的，甲方中途说「确认，开始做」只改了
+             * 服务层的阶段 —— 正在跑的这一轮仍然拿着旧值，于是它**永远**写不了文件，
+             * 只能继续解释（看起来就是「确认了也没用」）。
+             * 现在每次工具调用都问一次服务层：放行的瞬间，下一个调用就能写。
+             */
+            const liveGate = run.syncRequirementId
+              ? this.lanSync?.phaseOf(run.syncRequirementId) ?? planGate
+              : planGate;
+            const blockedByPlanGate = planGateBlockReason(call.function.name, liveGate);
             if (blockedByPlanGate) {
-              this.log(`[sync] 阶段 ${planGate} 拦下写操作：${call.function.name}`);
+              this.log(`[sync] 阶段 ${liveGate} 拦下写操作：${call.function.name}`);
               return {
                 result: {
                   status: 'denied',
@@ -7480,7 +7524,22 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
     // 推送 / 版本号不属于任务清单：正确做法是拆分任务时就排除，模型偶尔仍会写进来。
     // 这里是最后一道兜底——清单一旦显示在面板上，用户点「继续执行」就等于认可了它，
     // 于是用户没说过的「推送」借清单拿到了授权。宁可当场摘掉并告知模型去单独征询。
-    const { kept: todos, excluded } = splitTodoScope(submitted);
+    const scoped = splitTodoScope(submitted);
+    const excluded = scoped.excluded;
+    let todos = scoped.kept;
+    /*
+     * **WIP = 1**（Kanban / Lean 的单件流；Toyota Kata 的「只攻一个障碍」）。
+     *
+     * 用户原话：「这里改一下，那里改一下，项目却没有丝毫推进。」多件同时 in_progress 正是
+     * 这种状态的可观测特征：每件都开个头，没有一件被验证。这里**只保留第一件**进行中，
+     * 其余降回 pending，并把这件事明确回给模型。
+     */
+    const wip = enforceSingleInProgress(todos);
+    todos = wip.todos;
+    const wipNotice = wip.demoted.length
+      ? `\n\n【过程纪律】同时只能有**一件**事在进行中。已把「${wip.demoted.join('；')}」降回待办 —— `
+        + '先把手里这件做完并验证，再开始下一件。'
+      : '';
     const excludedItems = excluded.map((entry) => entry.todo.content).join('；');
     const excludedNotice = excluded.length
       ? tt('todo.scopeExcludedNotice', { count: excluded.length, items: excludedItems })
@@ -7574,6 +7633,7 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
         .map((todo, index) => `${index + 1}. [${todo.status}] ${todo.content}`)
         .join('\n')
         + (hasMultipleInProgress(todos) ? `\n\n${tt('todo.hintSingleActive')}` : '')
+        + wipNotice
         + (excludedNotice ? `\n\n${excludedNotice}` : '')
         + archivedNotice,
       approval: 'not-required',

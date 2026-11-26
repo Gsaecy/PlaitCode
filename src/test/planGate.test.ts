@@ -226,7 +226,8 @@ test('拦在调用那一刻：面板在执行工具前先过阶段判定，且�
     '阶段判定要在工具真正执行之前（而且是第一道）',
   );
   assert.match(panel, /syncPlanGate: phase/, '阶段要随这一轮传下去');
-  assert.match(panel, /planGateBlockReason\(call\.function\.name, planGate\)/, '拦的是内部算出来的阶段（续跑也不放过）');
+  assert.match(panel, /planGateBlockReason\(call\.function\.name, liveGate\)/, '拦的是**调用这一刻**的阶段（确认后立刻放行）');
+  assert.match(panel, /const liveGate = run\.syncRequirementId[\s\S]{0,160}phaseOf\(run\.syncRequirementId\)/, '阶段要现算，不能用起跑时的快照');
   assert.doesNotMatch(
     panel,
     /options\?\.syncReadOnly \|\| [^\n]*allowsWriteTools/,
@@ -479,6 +480,53 @@ test('续跑不放过闸门：没有调用方阶段时，按当前需求的阶�
   // 普通对话不受影响。
   assert.equal(resolvePlanGate({ activePhase: 'negotiate', teamRun: false }), undefined);
   assert.equal(resolvePlanGate({ teamRun: true }), undefined, '还没有任何需求时不拦');
+});
+
+test('甲方一整段带分工的开工令也算确认（这条吞掉就会「聊一天没动手」）', async () => {
+  const { looksLikePlanApproval, looksLikeExplicitGoAhead } = await import('../sync/planGate.js');
+  /*
+   * 2026-11-26 的真实原话（agent 就是因为这句没被认成确认，才一直在「方案还没定」里打转）：
+   * 「不再谈方案，macOS 这台按已确认的内容动手开工，Windows 原地待命等我这边的『可用』。」
+   */
+  const order = '不再谈方案，macOS 这台按已确认的内容动手开工，Windows 原地待命等我这边的「可用」。';
+  assert.equal(looksLikePlanApproval(order), true, '长句开工令必须认出来');
+  assert.equal(looksLikeExplicitGoAhead(order), true);
+
+  // 仍然不能被误判：要求改方案、或只是陈述，都不算。
+  assert.equal(looksLikePlanApproval('不同意，按已确认的内容再改一下第 2 步'), false, '带否决词的不能算批准');
+  assert.equal(looksLikePlanApproval('先别动手，我还没确认'), false);
+  assert.equal(looksLikePlanApproval('我把方案看了一遍，觉得还行'), false, '只是评价不是指令');
+  assert.equal(looksLikePlanApproval('确认'), true, '短句照旧');
+});
+
+test('阶段卡在「沟通中」时，一句开工令也能解除写操作限制', async () => {
+  const { LanSyncService } = await import('../sync/lanSync.js');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'hwchat-goahead-'));
+  const service = new LanSyncService(join(dir, 'state.json'), {
+    peer: () => me,
+    runRequirement: async () => true,
+    writeLedger: async () => undefined,
+    writeTranscript: async () => undefined,
+    log: () => undefined,
+  });
+  await service.load();
+  try {
+    const shared = await service.shareRequirement('连通文件本体', undefined, []);
+    const id = shared.requirement!.id;
+    assert.equal(service.phaseOf(id), 'negotiate');
+    assert.ok(planGateBlockReason('write_file', service.phaseOf(id)), '一开始确实写不了');
+
+    // 没有方案发言、没有 awaiting-approval，只有甲方这句开工令。
+    const decision = service.applyPlanDecision('不再谈方案，按已确认的内容动手开工');
+    assert.deepEqual(decision, { requirementId: id, phase: 'implement' }, '开工令必须直接解除限制');
+    assert.equal(planGateBlockReason('write_file', service.phaseOf(id)), undefined, '写操作要放行');
+  } finally {
+    service.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('模型真的伸手写时，只读档的拒绝文案不能是半个句子', async () => {

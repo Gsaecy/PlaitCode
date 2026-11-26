@@ -18,6 +18,7 @@
 
 import { normalizeRepoUrl } from './projectRef';
 import { APPROVED_PROMPT, AUTONOMY_PROMPT, NEGOTIATION_PROMPT, isTeamPhase, type TeamPhase } from './planGate';
+import { TEAM_DISCIPLINE_PROMPT } from './processDiscipline';
 
 export const SYNC_PROTOCOL_VERSION = 1;
 /** 单条消息上限（字节）：需求正文最多几千字，这个值足够，同时挡住畸形转发。 */
@@ -1410,6 +1411,14 @@ export function requirementPromptForLocal(
           : '',
     /* 自主迭代：谈定就开工，但「必须真的谈成」这一条不放松。 */
     options.autonomous ? AUTONOMY_PROMPT : '',
+    /*
+     * 过程纪律（WIP=1 / 一次一个动作 / 带证据 / 不重复）。
+     *
+     * 用户 2026-11-26：「团队群里面 agent 很没有逻辑…避免 agent 相互乱说，又没有逻辑，
+     * 这里改一下，那里改一下，项目却没有丝毫推进。」判据在 `sync/processDiscipline.ts`
+     * （宿主会真的拦），这段让模型一开始就按那个方式工作。
+     */
+    TEAM_DISCIPLINE_PROMPT,
     /*
      * 项目标记：这条任务属于哪个项目、本机对应哪个目录。
      *
