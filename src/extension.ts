@@ -16,7 +16,15 @@ import { fetchViaProxy } from './providers/proxyFetch';
 import { proxyEnv } from './providers/netDiagnostics';
 import { ChatPanel } from './views/chatPanel';
 import { SettingsPanel } from './views/settingsPanel';
+import { STALE_VIEW_CHECK_DELAY_MS, shouldHealStaleView } from './views/webviewHealth';
 import { tt } from './core/i18n';
+
+/**
+ * workspaceState 里记「上次会话打开过对话框视图」的键。
+ *
+ * 用途：宿主重启后如果这次没拿到视图句柄，就说明界面是上一任宿主留下的残留 iframe。
+ */
+const VIEW_OPENED_KEY = 'hwchat.chatView.opened';
 import { setupLanSync } from './sync/lanSetup';
 
 let activeStorage: ConversationStorage | undefined;
@@ -176,9 +184,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     },
   );
 
-  const chatView = vscode.window.registerWebviewViewProvider(ChatPanel.viewType, chat, {
+  const chatView = vscode.window.registerWebviewViewProvider(ChatPanel.viewType, {
+    resolveWebviewView: (view) => {
+      /*
+       * 记下「这个视图被真的要过」。
+       *
+       * 宿主重启后如果这次**没有**再被调用，而上次是打开过的，就说明界面是上一任宿主
+       * 留下的残留 iframe（看着正常、其实已经断开），必须主动重新解析 ——
+       * 用户 2026-11-26 的「刚装完是好的，后面才变空白」就是这个过程。
+       */
+      void context.workspaceState.update(VIEW_OPENED_KEY, true);
+      chat.resolveWebviewView(view);
+    },
+  }, {
     webviewOptions: { retainContextWhenHidden: true },
   });
+
+  /*
+   * 宿主重启后的残留视图：激活后查一次，必要时主动重新解析。
+   *
+   * 为什么不能只在「重新加载界面」命令里做：用户不会知道要运行那条命令 ——
+   * 他看到的是「界面突然白了」，以为扩展坏了。
+   */
+  const healStaleView = (attempt: number): void => {
+    const heal = shouldHealStaleView({
+      wasOpen: context.workspaceState.get<boolean>(VIEW_OPENED_KEY) === true,
+      hasView: chat.hasWebview(),
+      attempts: attempt,
+    });
+    if (!heal) return;
+    output.info(`[webview] 这次激活没有拿到视图句柄（上次打开过）：第 ${attempt + 1} 次主动重新解析`);
+    chat.reloadWebview('stale-after-restart');
+    const timer = setTimeout(() => healStaleView(attempt + 1), STALE_VIEW_CHECK_DELAY_MS);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  };
+  const staleCheck = setTimeout(() => healStaleView(0), STALE_VIEW_CHECK_DELAY_MS);
+  (staleCheck as unknown as { unref?: () => void }).unref?.();
 
   const commands: Array<[string, (...args: unknown[]) => unknown]> = [
     ['hwchat.openChat', (id?: unknown) => chat.open(typeof id === 'string' ? id : undefined)],
@@ -333,9 +374,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       output.show(true);
       await vscode.window.showInformationMessage(tt('ext.resourceStats', { active: stats.search?.active ?? 0, queued: stats.search?.queued ?? 0, commands: stats.commands.active }));
     }],
-    // 面板布局问题（右边被切 / 显示不全）没法从扩展侧取证：扩展宿主不知道 webview
-    // 有多宽、文档有没有横向溢出。这条命令让界面自己量一遍再把数字报回来。
+    /*
+     * 自主迭代模式开关。
+     *
+     * 用户 2026-11-26：「增加一个自主迭代模式，就是 agent 相互沟通好都确认没问题不需要
+     * 用户确认，然后开始执行，适合自主迭代项目」。—— 一键切换，不用翻设置。
+     */
+    ['hwchat.toggleAutonomy', async () => {
+      const config = vscode.workspace.getConfiguration('hwchat');
+      const next = !config.get<boolean>('team.autonomous', false);
+      await config.update('team.autonomous', next, vscode.ConfigurationTarget.Global);
+      output.info(`[collab] 自主迭代模式：${next ? '开' : '关'}`);
+      await vscode.window.showInformationMessage(tt(next ? 'ext.autonomyOn' : 'ext.autonomyOff'));
+    }],
+    /*
+     * 面板布局问题（右边被切 / 显示不全）没法从扩展侧取证：扩展宿主不知道 webview
+     * 有多宽、文档有没有横向溢出。这条命令让界面自己量一遍再把数字报回来。
+     */
     ['hwchat.reportLayout', () => chat.requestLayoutReport()],
+    /*
+     * 界面白屏的确定性修法：重新给 webview 赋一次 html（iframe 连同脚本整个重建）。
+     *
+     * 用户 2026-11-26：「对话框和设置界面变成一片空白了」。这种状态重载窗口一定能好，
+     * 但重载窗口会连带停掉正在跑的任务；这条命令只重建两个 webview，其它都不动。
+     */
+    ['hwchat.reloadUi', async () => {
+      /*
+       * 对话框可能**白着但宿主没被调用过**（VS Code 没有解析视图）：这时 `hasWebview()`
+       * 是 false，旧实现只回一句「未打开」，用户的自救之路就断了。
+       * 现在 `reloadWebview()` 会先把视图叫出来；这里按「叫出来了吗」给准确回执。
+       */
+      const hadChat = chat.hasWebview();
+      const hadSettings = settingsPanel.reloadWebview();
+      /*
+       * 不管有没有视图句柄都要走一次：`reloadWebview()` 在没有句柄时会先聚焦视图，
+       * 强制 VS Code 重新解析 —— 这才是「白屏但宿主没被调用」时唯一的自救路径。
+       */
+      chat.reloadWebview('manual');
+      if (!hadChat) {
+        const healed = await chat.waitForWebview(2_500);
+        output.info(`[webview] 手动重载界面：对话框当时没有视图句柄，聚焦后${healed ? '已恢复' : '仍未恢复'}`);
+      }
+      output.info(`[webview] 手动重载界面：对话框 ${chat.hasWebview() ? '已重建' : '未打开'}，设置页 ${hadSettings ? '已重建' : '未打开'}`);
+      await vscode.window.showInformationMessage(tt('ext.reloadUiDone', {
+        chat: chat.hasWebview() ? tt('ext.reloadUiPanelChat') : tt('ext.reloadUiPanelNone'),
+        settings: hadSettings ? tt('ext.reloadUiPanelSettings') : tt('ext.reloadUiPanelNone'),
+      }));
+    }],
+    // 语音听写期间状态栏那个按钮点下去就走这里（编辑器听写默认快捷键 Ctrl+Alt+V，
+    // 用户不一定知道；给一个看得见、点得到的结束方式）。
+    ['hwchat.stopVoiceInput', () => chat.stopVoiceInput()],
     ['hwchat.showPermissionScope', async () => {
       const report = describePermissionScope();
       for (const line of formatPermissionScope(report)) {

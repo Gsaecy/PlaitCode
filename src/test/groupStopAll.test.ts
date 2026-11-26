@@ -90,7 +90,7 @@ test('A 点停止 → B 也收到 stopGroup，且不往群里塞多余状态', a
   }
 });
 
-test('只有本机在线时说「只有本机」，不假装通知了谁', async () => {
+test('只有本机在线时说「只有本机」，并真的把本机停下', async () => {
   const controls: any[] = [];
   const { service, dir } = await make(winPeer, controls);
   try {
@@ -99,7 +99,11 @@ test('只有本机在线时说「只有本机」，不假装通知了谁', async
     const result = await service.broadcastStop();
     assert.equal(result.ok, true);
     assert.match(result.message, /只有本机/);
-    assert.equal(controls.length, 0, '不该给自己发指令');
+    /*
+     * 单机时没有对端可播，但**本机必须真的停** —— 手机上的「停止执行」走的就是这个方法，
+     * 以前这里直接返回「已停」却什么都没停（用户点了停止，任务还在跑）。
+     */
+    assert.deepEqual(controls.map((control) => control.action), ['stopGroup'], '本机要收到一次停止指令');
   } finally {
     service.dispose();
     await rm(dir, { recursive: true, force: true });

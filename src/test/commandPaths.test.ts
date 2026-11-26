@@ -345,7 +345,7 @@ test('the rewrite suggestion fixes every temp path, not just the first', () => {
   const command = 'cd /tmp && rm -f pws-t.mov && screencapture -v pws-t.mov 2>/tmp/pws-t.err; cat /tmp/pws-t.err';
   // 先确认隔离确实拦下了它（否则测试会变成「改写一个本来就能跑的命令」）
   assert.match(String(commandPathViolation(command, [osRoot], osRoot)), /不在当前工作区内/);
-  const suggestion = pathRewriteSuggestion(command, [osRoot]);
+  const suggestion = pathRewriteSuggestion(command, [osRoot], undefined, 'darwin');
   assert.match(suggestion, /Personal Workstation OS\/tmp/);
   /*
    * 建议里**每一个** `/tmp` 都必须属于工作区内那个临时目录 —— 只要还剩一处裸 `/tmp`，
@@ -358,7 +358,7 @@ test('the rewrite suggestion fixes every temp path, not just the first', () => {
 });
 
 test('a single temp path is still rewritten once', () => {
-  assert.match(pathRewriteSuggestion('cat /tmp/x.log', [osRoot]), /Personal Workstation OS\/tmp\/x\.log/);
+  assert.match(pathRewriteSuggestion('cat /tmp/x.log', [osRoot], undefined, 'darwin'), /Personal Workstation OS\/tmp\/x\.log/);
 });
 
 /* ── 建议必须落在「命令所在的那个工作区」里 ─────────────────────── */
@@ -376,19 +376,53 @@ const TWO_ROOTS = ['/Users/x/Personal Workstation OS', '/Users/x/Safevault_windo
 
 test('建议用命令所在工作区（cwd）的根，不是对话绑定的项目根', () => {
   const command = 'cd "/Users/x/Safevault_macOS" && find src -type f | sort > /tmp/mac.txt && diff -u /tmp/mac.txt /tmp/win.txt';
-  const suggestion = pathRewriteSuggestion(command, TWO_ROOTS, '/Users/x/Safevault_windows');
+  const suggestion = pathRewriteSuggestion(command, TWO_ROOTS, '/Users/x/Safevault_windows', 'darwin');
   assert.match(suggestion, /Safevault_windows\/tmp\/mac\.txt/);
   assert.doesNotMatch(suggestion, /Personal Workstation OS\/tmp/);
 });
 
 test('建议先把临时目录建出来（那个目录通常并不存在）', () => {
-  const suggestion = pathRewriteSuggestion('cat /tmp/x.log', ['/Users/x/proj'], '/Users/x/proj');
+  const suggestion = pathRewriteSuggestion('cat /tmp/x.log', ['/Users/x/proj'], '/Users/x/proj', 'darwin');
   assert.match(suggestion, /mkdir -p '?\/Users\/x\/proj\/tmp'?/);
 });
 
 test('cwd 就是根本身时也能选对', () => {
-  const suggestion = pathRewriteSuggestion('cat /tmp/x.log', TWO_ROOTS, '/Users/x/Safevault_windows');
+  const suggestion = pathRewriteSuggestion('cat /tmp/x.log', TWO_ROOTS, '/Users/x/Safevault_windows', 'darwin');
   assert.match(suggestion, /Safevault_windows\/tmp\/x\.log/);
+});
+
+/*
+ * Windows 分支（用户 2026-11-25 问「39 条失败影响功能吗」时查出来的真问题）：
+ * 建议里原本是 `mkdir -p '\Users\x\proj\tmp' && cat \Users\x\proj\tmp/x.log` ——
+ * cmd 不认 `-p`，单引号也只是普通字符，照抄会建出一个叫 `-p` 的目录；路径还混用 `/` 和 `\`。
+ */
+test('Windows：建目录用 cmd 语法，分隔符不混用', () => {
+  const suggestion = pathRewriteSuggestion('cat /tmp/x.log', ['D:\\proj'], 'D:\\proj', 'win32');
+  assert.doesNotMatch(suggestion, /mkdir -p/, 'cmd 没有 mkdir -p');
+  assert.match(suggestion, /if not exist "D:\\proj\\tmp" md "D:\\proj\\tmp"/, '按需建目录且用双引号');
+  assert.doesNotMatch(suggestion, /tmp\/x\.log/, '尾巴不能再留 POSIX 分隔符');
+  assert.match(suggestion, /D:\\proj\\tmp\\x\.log/);
+  /*
+   * `&&` 会让「目录已存在导致 md 报错」时把后半条命令吞掉 —— 那是「建议改了但没用」的
+   * 另一种写法，所以这里必须是 `&`。
+   */
+  assert.match(suggestion, /md "D:\\proj\\tmp" & cat/, '目录已存在时也要继续执行后半条');
+});
+
+test('Windows：多根工作区仍然按命令所在的那个根改写', () => {
+  const roots = ['D:\\Personal Workstation OS', 'D:\\Safevault_windows'];
+  const suggestion = pathRewriteSuggestion('cat /tmp/x.log', roots, 'D:\\Safevault_windows', 'win32');
+  assert.match(suggestion, /Safevault_windows\\tmp\\x\.log/);
+  assert.doesNotMatch(suggestion, /Personal Workstation OS/);
+});
+
+test('路径带空格必须加引号：不加就会被拆成两个参数，照抄跑不起来', () => {
+  const posix = pathRewriteSuggestion('cat /tmp/x.log', ['/Users/x/AI projects'], '/Users/x/AI projects', 'darwin');
+  assert.match(posix, /'\/Users\/x\/AI projects\/tmp\/x\.log'/, 'POSIX 用单引号包住整条路径');
+  const win = pathRewriteSuggestion('cat /tmp/x.log', ['D:\\AI projects\\proj'], 'D:\\AI projects\\proj', 'win32');
+  assert.match(win, /"D:\\AI projects\\proj\\tmp\\x\.log"/, 'cmd 用双引号包住整条路径');
+  // 没有空格时不该多加引号（保持可读，也别和原来的断言打架）。
+  assert.match(pathRewriteSuggestion('cat /tmp/x.log', ['D:\\proj'], 'D:\\proj', 'win32'), /cat D:\\proj\\tmp\\x\.log/);
 });
 
 /* ── bash 专有语法：/bin/sh 跑不了，要换 bash ───────────────────── */
@@ -405,9 +439,10 @@ test('普通命令不触发（保持默认 sh，避免改变展开/引号行为�
 });
 
 test('只有需要时才切 /bin/bash；Windows 不切', () => {
-  assert.equal(shellFor('diff <(a) <(b)', 'darwin'), '/bin/bash');
-  assert.equal(shellFor('ls -la', 'darwin'), true);
-  assert.equal(shellFor('diff <(a) <(b)', 'win32'), true);
+  // 第三个参数是「本机有没有 /bin/bash」：显式传 true，这条规则在任何机器上都验得到。
+  assert.equal(shellFor('diff <(a) <(b)', 'darwin', true), '/bin/bash');
+  assert.equal(shellFor('ls -la', 'darwin', true), true);
+  assert.equal(shellFor('diff <(a) <(b)', 'win32', true), true);
 });
 
 test('shell selection: cmd 专属串联（& / && / ||）一律留在 cmd', () => {

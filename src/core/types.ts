@@ -251,6 +251,14 @@ export interface ChatMessage {
    * 只有用户消息会写；老存档里没有这个字段，界面就不画徽标（不猜）。
    */
   executionStatus?: MessageExecutionStatus;
+  /**
+   * 界面上**只显示这一段**，`content` 仍然完整发给模型（历史、上下文都认 `content`）。
+   *
+   * 用在哪：团队群的需求会带一整段协议提示词（身份 / 分工 / 报数规则 / 收尾要求…）——
+   * 那是给模型的「潜规则」，用户要求气泡里只留自己说的那句话
+   * （2026-11-25：「除了需求原文外，其他的内容根本不需要显示出来，只要保证它生效」）。
+   */
+  displayContent?: string;
 }
 
 export interface ConversationSummary {
@@ -613,6 +621,16 @@ export interface ToolExecution {
    * 只在还「没结束」时有意义：结果落定后会清掉，不进入存档语义。
    */
   stallHint?: string;
+  /**
+   * 推给界面时这段输出被截断了（**只在发给 webview 的副本上出现**，存档永远是全文）。
+   *
+   * 为什么必须有它：一条团队任务消息能到 2.2 MB（几百个工具、每个 output 上限 200 KB），
+   * 一次状态推送就可能几十 MB —— 足以把 webview 渲染进程打死，界面从此白屏。
+   * 界面据此提示「已截断」，而不是让人以为命令只输出了这么点。
+   */
+  outputTruncated?: boolean;
+  /** 被截断前的完整长度（字符）。 */
+  outputTotal?: number;
 }
 
 export interface ToolExecutionResult {

@@ -173,7 +173,8 @@ test('newChat 永远不删已有对话：空卡片时连点也必须各出一张
   const { readFile } = await import('node:fs/promises');
   const { dirname, join } = await import('node:path');
   // 与 searchBoundary.test.ts 同口径：编译产物在 out/test，源码在 src。
-  const source = await readFile(join(dirname(__dirname), '..', 'src', 'views', 'chatPanel.ts'), 'utf8');
+  // 统一成 LF：本文件按 `'\n  }\n'` 切函数体，Windows 检出（CRLF）会切不到、然后扫整个文件。
+  const source = (await readFile(join(dirname(__dirname), '..', 'src', 'views', 'chatPanel.ts'), 'utf8')).replace(/\r\n/g, '\n');
   const start = source.indexOf('  async newChat(): Promise<void> {');
   assert.ok(start > 0, '找不到 newChat()');
   const body = source.slice(start, source.indexOf('\n  }\n', start));
@@ -207,7 +208,7 @@ test('装了「本地skill快捷调用」时空对话不会被清理误删', asy
 test('当前已是空对话时不再新建卡片（最多一张空对话）', async () => {
   const { readFile } = await import('node:fs/promises');
   const { dirname, join } = await import('node:path');
-  const source = await readFile(join(dirname(__dirname), '..', 'src', 'views', 'chatPanel.ts'), 'utf8');
+  const source = (await readFile(join(dirname(__dirname), '..', 'src', 'views', 'chatPanel.ts'), 'utf8')).replace(/\r\n/g, '\n');
   const start = source.indexOf('  async newChat(): Promise<void> {');
   const body = source.slice(start, source.indexOf('\n  }\n', start));
 

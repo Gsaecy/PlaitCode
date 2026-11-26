@@ -31,7 +31,8 @@ test('频道规则：只有 origin=group 才广播给对端', () => {
 test('群窗口发送走 origin=group（否则等于只在群里演戏）', () => {
   const index = PANEL.indexOf('async sendGroupMessage(');
   assert.ok(index > 0);
-  const body = PANEL.slice(index, index + 260);
+  // 按函数结尾切：写死长度会在加附件处理后把断言挤出窗口。
+  const body = PANEL.slice(index, PANEL.indexOf('async stageGroupAttachment(', index));
   assert.match(body, /origin: 'group'/, '群窗口的消息必须标成群频道');
 });
 

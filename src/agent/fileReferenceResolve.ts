@@ -79,8 +79,16 @@ export function referenceCandidatePaths(
   value: string,
   roots: readonly string[],
   preferred?: string,
+  /*
+   * 与 `chooseReferenceMatch` 的入参一样，平台必须是**显式**的。
+   * 原来这里读 `process.platform`，于是调用方传 `platform: 'darwin'` 时，
+   * 分隔符仍按本机来 —— 跨平台判断（比如另一台设备报上来的路径）会拼出 `\a\b`
+   * 这种和它自己声明的平台不符的候选，`exists` 一律不命中。
+   */
+  platform: string = process.platform,
 ): string[] {
-  const api = process.platform === 'win32' ? win32 : posix;
+  const windows = platform === 'win32';
+  const api = windows ? win32 : posix;
   const clean = value.replace(/^\.\//, '');
   const ordered: string[] = [];
   if (preferred) ordered.push(preferred);
@@ -90,7 +98,7 @@ export function referenceCandidatePaths(
   for (const root of ordered) {
     const candidate = api.join(root, clean);
     // Windows 上大小写不敏感，`C:/A` 与 `c:/a` 是同一个候选。
-    const key = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+    const key = windows ? candidate.toLowerCase() : candidate;
     if (seen.has(key)) continue;
     seen.add(key);
     candidates.push(candidate);
@@ -150,7 +158,7 @@ export function chooseReferenceMatch(input: ChooseReferenceMatchInput): string |
     return acceptable(path, input.roots, platform) ? path : undefined;
   }
 
-  for (const candidate of referenceCandidatePaths(path, input.roots, input.preferred)) {
+  for (const candidate of referenceCandidatePaths(path, input.roots, input.preferred, platform)) {
     if (input.exists(candidate)) return candidate;
   }
 

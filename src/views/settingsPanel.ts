@@ -12,6 +12,16 @@ import { ChatSettings } from '../core/types';
 import { validateSettingsIncomingMessage } from '../core/incomingMessage';
 import { DeepSeekClient } from '../providers/deepseekClient';
 import { mediaUri, nonce } from './webview';
+import {
+  freshWebviewHealth,
+  markHtmlSet,
+  markManualReload,
+  markReady,
+  markRecovered,
+  WEBVIEW_READY_TIMEOUT_MS,
+  webviewHealthVerdict,
+  type WebviewHealth,
+} from './webviewHealth';
 
 interface SettingsPanelCallbacks {
   onChanged: () => void;
@@ -41,6 +51,9 @@ type IncomingMessage =
   | { type: 'lanSyncConnect' }
   | { type: 'lanSyncJoin' }
   | { type: 'lanSyncGroup' }
+  | { type: 'relayCreate' }
+  | { type: 'relayJoin' }
+  | { type: 'relayStatus' }
   | { type: 'mobileOpen' }
   | { type: 'lanSyncDisconnect' }
   | { type: 'lanSyncLedger' };
@@ -48,6 +61,9 @@ type IncomingMessage =
 export class SettingsPanel implements vscode.Disposable {
   private panel: vscode.WebviewPanel | undefined;
   private readonly disposables: vscode.Disposable[] = [];
+  /** 设置页也会白屏（2026-11-26 与对话框同时空白），同样用看门狗自愈。 */
+  private webviewHealth: WebviewHealth = freshWebviewHealth();
+  private webviewWatchdog?: ReturnType<typeof setTimeout>;
   /** 上次生成 HTML 时用的语言；语言设置变化后据此触发重建。 */
   private renderedLanguage?: Language;
 
@@ -77,7 +93,8 @@ export class SettingsPanel implements vscode.Disposable {
         },
       );
       this.panel.iconPath = vscode.Uri.joinPath(this.extensionUri, 'resources', 'logo.png');
-      this.panel.webview.html = this.html(this.panel.webview);
+      this.webviewHealth = freshWebviewHealth();
+      this.assignWebviewHtml();
       this.panel.webview.onDidReceiveMessage(
         (message: unknown) => {
           /*
@@ -96,6 +113,10 @@ export class SettingsPanel implements vscode.Disposable {
       );
       this.panel.onDidDispose(() => {
         this.panel = undefined;
+        if (this.webviewWatchdog) {
+          clearTimeout(this.webviewWatchdog);
+          this.webviewWatchdog = undefined;
+        }
       }, undefined, this.disposables);
     } else {
       this.panel.reveal(vscode.ViewColumn.One, true);
@@ -106,12 +127,52 @@ export class SettingsPanel implements vscode.Disposable {
   async refresh(): Promise<void> {
     // 文案在生成 HTML 时静态注入，语言变了必须整页重建，否则界面会停留在旧语言。
     if (this.panel && this.renderedLanguage !== currentLanguage()) {
-      this.panel.webview.html = this.html(this.panel.webview);
+      this.assignWebviewHtml();
       return;
     }
     if (this.panel?.visible) {
       await this.sendState();
     }
+  }
+
+  /** 把界面 HTML 赋给 webview，并起一次「等到 ready」的看门狗（理由见 `views/webviewHealth.ts`）。 */
+  private assignWebviewHtml(reason = 'init'): void {
+    if (!this.panel) return;
+    this.webviewHealth = markHtmlSet(this.webviewHealth, Date.now());
+    this.panel.webview.html = this.html(this.panel.webview);
+    if (reason !== 'init') this.log(`重新加载设置界面（${reason}）`);
+    this.armWebviewWatchdog();
+  }
+
+  private armWebviewWatchdog(): void {
+    if (this.webviewWatchdog) clearTimeout(this.webviewWatchdog);
+    const timer = setTimeout(() => {
+      this.webviewWatchdog = undefined;
+      const verdict = webviewHealthVerdict(this.webviewHealth, Date.now());
+      if (verdict === 'recover') {
+        this.webviewHealth = markRecovered(this.webviewHealth, Date.now());
+        this.log('设置界面 8 秒没有就绪（可能是白屏），自动重新加载一次');
+        this.assignWebviewHtml('watchdog');
+        return;
+      }
+      if (verdict === 'give-up') return;
+      if (verdict === 'waiting') this.armWebviewWatchdog();
+    }, WEBVIEW_READY_TIMEOUT_MS + 100);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.webviewWatchdog = timer;
+  }
+
+  /** 命令「重新加载界面」用：设置页开着就重建。 */
+  reloadWebview(): boolean {
+    if (!this.panel) return false;
+    this.webviewHealth = markManualReload(this.webviewHealth, Date.now());
+    this.assignWebviewHtml('manual');
+    void this.sendState().catch(() => undefined);
+    return true;
+  }
+
+  private log(line: string): void {
+    console.warn(`[hwchat] ${line}`);
   }
 
   dispose(): void {
@@ -125,6 +186,12 @@ export class SettingsPanel implements vscode.Disposable {
     try {
       switch (message.type) {
         case 'ready':
+          // 设置页活了：记一笔，看门狗据此判断「要不要重赋 html」。
+          this.webviewHealth = markReady(this.webviewHealth, Date.now());
+          if (this.webviewWatchdog) {
+            clearTimeout(this.webviewWatchdog);
+            this.webviewWatchdog = undefined;
+          }
           await this.sendState();
           break;
         case 'save':
@@ -174,6 +241,16 @@ export class SettingsPanel implements vscode.Disposable {
           break;
         case 'lanSyncGroup':
           await vscode.commands.executeCommand('hwchat.lanSync.openGroup');
+          break;
+        // 跨网络（不同 WiFi / 4G）：走中继，和上面「同一局域网直连」是两条独立通道。
+        case 'relayCreate':
+          await vscode.commands.executeCommand('hwchat.relay.create');
+          break;
+        case 'relayJoin':
+          await vscode.commands.executeCommand('hwchat.relay.join');
+          break;
+        case 'relayStatus':
+          await vscode.commands.executeCommand('hwchat.relay.status');
           break;
         case 'mobileOpen':
           await vscode.commands.executeCommand('hwchat.mobile.open');
@@ -548,9 +625,38 @@ export class SettingsPanel implements vscode.Disposable {
         <section id="collab" class="settings-section">
           <div class="section-heading"><h2>${t(lang, 'settings.collab.title')}</h2></div>
           <div class="privacy-summary"><p>${t(lang, 'settings.collab.body')}</p></div>
+          <!--
+            网络条件必须写清楚。
+            用户 2026-11-26 的要求：「在协作设置页面写清楚协作的网络条件，如果能跨网络最好」。
+            这里分成「同一局域网」与「跨网络」两栏：前者是默认路径（端口要一致、遇到 AP 隔离就换热点），
+            后者走中继（不要求同一个 WiFi，但两边要进同一个跨网频道）。
+          -->
+          <div class="network-conditions">
+            <div class="network-card">
+              <strong>${t(lang, 'settings.collab.netLanTitle')}</strong>
+              <ul>
+                <li>${t(lang, 'settings.collab.netLan1')}</li>
+                <li>${t(lang, 'settings.collab.netLan2')}</li>
+                <li>${t(lang, 'settings.collab.netLan3')}</li>
+              </ul>
+            </div>
+            <div class="network-card">
+              <strong>${t(lang, 'settings.collab.netWideTitle')}</strong>
+              <ul>
+                <li>${t(lang, 'settings.collab.netWide1')}</li>
+                <li>${t(lang, 'settings.collab.netWide2')}</li>
+                <li>${t(lang, 'settings.collab.netWide3')}</li>
+              </ul>
+            </div>
+          </div>
           <div class="storage-actions">
             <button id="lanSyncConnectButton" type="button" class="primary">${t(lang, 'settings.collab.startGroup')}</button>
             <button id="lanSyncJoinButton" type="button">${t(lang, 'settings.collab.joinGroup')}</button>
+          </div>
+          <div class="storage-actions">
+            <button id="relayCreateButton" type="button">${t(lang, 'settings.collab.relayCreate')}</button>
+            <button id="relayJoinButton" type="button">${t(lang, 'settings.collab.relayJoin')}</button>
+            <button id="relayStatusButton" type="button">${t(lang, 'settings.collab.relayStatus')}</button>
           </div>
           <div class="storage-actions">
             <button id="lanSyncGroupButton" type="button">${t(lang, 'settings.collab.group')}</button>

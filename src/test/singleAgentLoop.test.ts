@@ -19,10 +19,13 @@ test('群消息不再走分类器分流', () => {
   assert.ok(share > 0, '要能找到落成需求的那一行');
   const start = PANEL.lastIndexOf("options?.origin === 'group'", share);
   assert.ok(start > 0);
-  const branch = PANEL.slice(start, start + 6_000);
+  // 按分支结尾切片，不要写死长度：加几行注释就会把断言挤出窗口。
+  const end = PANEL.indexOf("} else if (options?.origin !== 'sync'", start);
+  assert.ok(end > start, '要能切到群分支的结尾');
+  const branch = PANEL.slice(start, end);
   assert.doesNotMatch(branch, /classifyGroupIntent/, '群分支里不该再出现分类调用');
   assert.doesNotMatch(branch, /verdict\.intent/, '不该再按判定结果分两条路');
-  assert.match(branch, /shareRequirement\(content/, '一律落成需求，进同一条会话跑一轮');
+  assert.match(branch, /shareRequirement\(content/, '（除报数等群口令外）一律落成需求，进同一条会话跑一轮');
 });
 
 test('提示词里区分「只是问」和「要改代码」，问就带依据简短答', () => {

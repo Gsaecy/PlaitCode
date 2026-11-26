@@ -17,6 +17,20 @@ import { spawnCommand, shouldReportStall, COMMAND_STALL_REFRESH_SECONDS } from '
 
 const MAX_OUTPUT = 100_000;
 
+/**
+ * 跨平台的「一直不结束」命令。
+ *
+ * Windows 没有 `sleep`（`sleep 30` 会立刻报「不是内部或外部命令」，于是「超时杀进程组」
+ * 这条规则在本机一次都没被验证过）。用 node 自己起一个空转进程：
+ * 测试本来就跑在 node 上，一定存在。
+ *
+ * 注意**不能写箭头函数**：命令经 cmd 执行，`=>` 里的 `>` 会被当成重定向，整段脚本被截断。
+ */
+const longRunning = (seconds: number): string => `node -e "setTimeout(function(){}, ${Math.round(seconds * 1000)})"`;
+
+/** 读 stdin 直到 EOF 再退出（替代 `cat`：Windows 上没有 cat）。 */
+const ECHO_STDIN = 'node -e "process.stdin.pipe(process.stdout)"';
+
 test('孙进程继续攥着 stdout 时，仍然在宽限期后结算（回归：永不挂起的工具调用）', async () => {
   const startedAt = Date.now();
   // `sleep 6 &` 让一个后台进程继承 stdout：shell 立刻退出，但管道写端还没关，
@@ -38,7 +52,7 @@ test('正常命令照常返回退出码与输出', async () => {
 
 test('超时会把整个进程组杀掉并结算，timedOut 为 true', async () => {
   const startedAt = Date.now();
-  const result = await spawnCommand('sleep 30', process.cwd(), 1, MAX_OUTPUT);
+  const result = await spawnCommand(longRunning(30), process.cwd(), 1, MAX_OUTPUT);
   const elapsed = (Date.now() - startedAt) / 1000;
 
   assert.equal(result.timedOut, true);
@@ -48,7 +62,7 @@ test('超时会把整个进程组杀掉并结算，timedOut 为 true', async () 
 test('stdin 接到 /dev/null：需要输入的命令立刻读到 EOF，不会无限等待', async () => {
   // 旧实现把 stdin 留成一条永远不写入的管道，`cat` 这类命令会一直等输入。
   const startedAt = Date.now();
-  const result = await spawnCommand('cat', process.cwd(), 10, MAX_OUTPUT);
+  const result = await spawnCommand(ECHO_STDIN, process.cwd(), 10, MAX_OUTPUT);
   const elapsed = (Date.now() - startedAt) / 1000;
 
   assert.equal(result.timedOut, false, '应当因为 EOF 自己结束，而不是被超时杀掉');
@@ -59,7 +73,7 @@ test('运行期只在「卡住」时推送，不再有每秒一次的 tick', asy
   // 「已运行 N 秒」是 webview 自己按 startedAt 算的，扩展不需要每秒推一次；
   // 旧实现每秒回调一次，而消费者第一行就是 `phase !== 'stall' → return`（纯废弃调用）。
   const phases: string[] = [];
-  await spawnCommand('sleep 3', process.cwd(), 10, MAX_OUTPUT, (progress) => {
+  await spawnCommand(longRunning(3), process.cwd(), 10, MAX_OUTPUT, (progress) => {
     phases.push(progress.phase);
   }, { stallSeconds: 1 });
   assert.ok(phases.length > 0, '调低阈值后必须能观察到停滞提示');
@@ -69,7 +83,7 @@ test('运行期只在「卡住」时推送，不再有每秒一次的 tick', asy
 
 test('没有卡住时不推送任何进度（每秒一次的空回调也会被删掉）', async () => {
   const phases: string[] = [];
-  await spawnCommand('sleep 2', process.cwd(), 10, MAX_OUTPUT, (progress) => {
+  await spawnCommand(longRunning(2), process.cwd(), 10, MAX_OUTPUT, (progress) => {
     phases.push(progress.phase);
   });
   assert.deepEqual(phases, [], '默认 30 秒阈值下，2 秒的命令一次都不该回调');

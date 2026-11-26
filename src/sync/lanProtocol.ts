@@ -17,6 +17,7 @@
  */
 
 import { normalizeRepoUrl } from './projectRef';
+import { APPROVED_PROMPT, AUTONOMY_PROMPT, NEGOTIATION_PROMPT, isTeamPhase, type TeamPhase } from './planGate';
 
 export const SYNC_PROTOCOL_VERSION = 1;
 /** 单条消息上限（字节）：需求正文最多几千字，这个值足够，同时挡住畸形转发。 */
@@ -103,6 +104,13 @@ export interface SyncRequirement {
    * 只记录。以前没有这个字段，两台都会各跑一遍同一份活。
    */
   assignee?: string;
+  /**
+  * 这条需求附带的图片 / 文件（甲方在群里发的附件）。
+  *
+  * 接收方等分片到齐、落到本机磁盘后，把**本机路径**交给自己的 agent ——
+  * 这样两台 agent 看到的是同一张图，而不是只有发消息那台能看到。
+  */
+  assets?: GroupAssetRef[];
 }
 
 /** 一条进度报告。 */
@@ -136,7 +144,18 @@ export interface SyncNote {
   body: string;
   /** 回答哪一条；空串表示这是一条新的发起消息。 */
   replyTo: string;
+  /**
+   * 这条消息说给谁（设备 id）；留空 = 群里每一台都看得见、都要看。
+   *
+   * 用户 2026-11-26 的规则：「让 agent 的消息也像用户消息一样，能被相互看见，
+   * 唯一约束看不看得见的是 @某个 agent 的行为」。所以 `to` 是**唯一的可见性闸门**：
+   *  - 空：所有设备都收到、都读、都由自己的 agent 判断要不要接；
+   *  - 有值：只有那一台读，其余的设备也**显示**（人要看得到过程），但不当成给自己的活。
+   */
+  to?: string;
   at: number;
+  /** 本机收到它的时刻（时间线排序依据，见 `messageOrderKey`；本地产生时等于 `at`）。 */
+  receivedAt?: number;
 }
 
 /**
@@ -165,6 +184,18 @@ export interface SyncApprovalMessage {
 export type RemotePreset = 'askAll' | 'review' | 'autopilot' | 'full';
 
 /**
+ * 一台设备的 agent 现在在做什么（团队群的指示灯）。
+ *
+ *  - `running`：正在执行任务（绿灯闪动）
+ *  - `waiting`：卡在等甲方确认 / 授权 / 回答（黄灯闪动）
+ *  - `error`：上一轮异常中断（红灯）
+ *  - `idle`：没在跑（灰灯）
+ */
+export type AgentActivity = 'running' | 'waiting' | 'error' | 'idle';
+
+const AGENT_ACTIVITIES: ReadonlySet<string> = new Set(['running', 'waiting', 'error', 'idle']);
+
+/**
  * 手机发来的**远程控制**指令：改权限档位、改步数、中止当前任务。
  *
  * 为什么需要它：agent 在电脑上跑起来之后，卡点全在"要不要允许这条命令"。
@@ -180,9 +211,19 @@ export interface SyncControlMessage {
    * 手机第一次连上时发一次，电脑随后广播自己的真实状态。
    * 没有它，手机只能显示自己点过什么，和电脑实际设置可能不一致。
    */
-  action: 'preset' | 'steps' | 'stop' | 'state' | 'project' | 'stopGroup';
+  action: 'preset' | 'steps' | 'stop' | 'state' | 'project' | 'stopGroup' | 'agentState';
   preset?: RemotePreset;
   steps?: number;
+  /**
+   * 只有 `agentState` 用：这台 agent 现在处于什么状态。
+   *
+   * 用户 2026-11-25：「团队群需要能显示设备 agent 运行状态，也就是哪个 agent 正在运行，
+   * 哪个停止运行了」——群里用指示灯显示，每台自己上报，不靠猜。
+   *
+   * 单独一个 action 而不是复用 `state`：`state` 是「请把设置告诉我」的查询语义，
+   * 两台互发会形成回声。
+   */
+  agentState?: AgentActivity;
   /** `project` 用：让对端切到哪个项目（名字来自对端自己的项目列表）。 */
   project?: string;
   /** `project` 用：该项目的仓库地址（项目唯一 ID）。 */
@@ -192,7 +233,70 @@ export interface SyncControlMessage {
   at: number;
 }
 
-export type SyncMessage = SyncRequirement | SyncReport | SyncNote | SyncGroupMessage | SyncApprovalMessage | SyncControlMessage;
+/**
+ * 「这条群消息我收到了」（已读回执）。
+ *
+ * 用户 2026-11-25：「我发 @所有人的消息，window 这个 agent 收到后，
+ * 这个消息下面会显示 Windows 这个 agent 已读」——否则甲方无法区分
+ * 「没收到」和「收到了但正在忙」。
+ *
+ * 独立成一种消息而不是往群消息里塞字段：
+ *  - 群里**不产生气泡**（回执不是发言，混进去会把对话淹掉）；
+ *  - 旧版本收到不认识的 kind 会直接丢弃（`parseSyncMessage` 返回 undefined），
+ *    因此不会把回执误当成「需求」或「回答」，天然兼容。
+ */
+export interface SyncReceipt {
+  kind: 'receipt';
+  id: string;
+  from: SyncPeer;
+  /** 已读的群消息 id（一次最多若干条，避免刷屏）。 */
+  ids: string[];
+  at: number;
+}
+
+/**
+ * 群附件（图片 / 文件）的**元信息**，随群消息和需求一起走。
+ *
+ * 用户 2026-11-25：「我发在群聊天的图片，没法传递到各自 agent 的设备上，所以会显示看不到」
+ * 「团队群需要有普通对话框的文件附件读取图片输出等全部功能，不要砍功能」。
+ *
+ * 只放元信息（几十字节），真正的字节走 `kind: 'asset'` 的分片：
+ * 单条消息 80 KB 上限不能被一张 3 MB 的图撑爆，而且分片丢了可以只重传那一片。
+ */
+export interface GroupAssetRef {
+  id: string;
+  name: string;
+  mimeType: string;
+  kind: 'image' | 'file';
+  /** 原始字节数（解出后核对，防止坏片）。 */
+  bytes?: number;
+}
+
+/**
+ * 附件分片。
+ *
+ * `total` / `index` 让接收方拼回去；收不全就当没收到（绝不交付半张图给模型）。
+ */
+export interface SyncAssetChunk {
+  kind: 'asset';
+  id: string;
+  from: SyncPeer;
+  index: number;
+  total: number;
+  name: string;
+  mimeType: string;
+  assetKind: 'image' | 'file';
+  dataBase64: string;
+  at: number;
+}
+
+/** 单个分片的 base64 上限：留足 JSON 包装的余量，单条消息仍远小于 `MAX_MESSAGE_BYTES`。 */
+export const ASSET_CHUNK_CHARS = 52_000;
+/** 一个附件最多多少分片（≈ 3.9 MB base64 ≈ 2.9 MB 原图）。 */
+export const ASSET_MAX_CHUNKS = 80;
+export const ASSET_MAX_REFS = 8;
+
+export type SyncMessage = SyncRequirement | SyncReport | SyncNote | SyncGroupMessage | SyncApprovalMessage | SyncControlMessage | SyncReceipt | SyncAssetChunk;
 
 /**
  * **团队群**里的一条发言（用户 2026-11-23）。
@@ -223,6 +327,19 @@ export interface SyncGroupMessage {
   /** 关联的需求号；用户那条自身就是需求，填自己的 id。 */
   requirementId: string;
   at: number;
+  /**
+   * **本机收到这条消息的时刻**（发送方没写就由接收方补上）。
+   *
+   * 为什么需要它（2026-11-26 的真实故障）：
+   * 两台机器的系统时钟并不一致 —— 实测 macOS 那台比 Windows 慢 123 ms，于是
+   * 「Windows 发出的需求（07:41:40.015）」与「Mac 回复的进度（07:41:39.892）」
+   * 按 `at` 排序会得到「回复在提问前面」。手机上看到的就是「回复跑到我刚发的
+   * 那条消息上面」，和微信/飞书完全相反。
+   *
+   * 到达顺序是**单机单调**的，不受两台时钟影响，所以时间线以它为准：
+   * `receivedAt` 相同才退回比 `at`。展示上的时间仍然用 `at`（那才是对方说话的时刻）。
+   */
+  receivedAt?: number;
   /**
    * 这条需求指派给哪台设备执行（设备 id）。
    *
@@ -261,6 +378,185 @@ export interface SyncGroupMessage {
    * 看着就像程序在说话。现在拆出来，由界面渲染成小标签。
    */
   meta?: GroupMessageMeta;
+  /**
+   * 这条发言自带的附件（图片 / 文件）。
+   *
+   * 字节走 `kind: 'asset'` 分片，这里只有元信息：界面先画出占位 / 图片，
+   * 另一台设备收到分片后落盘，再交给它自己的 agent 读。
+   */
+  assets?: GroupAssetRef[];
+}
+
+/** 附件元信息只留认识的字段，数量与长度都有上限。 */
+export function normalizeAssetRefs(value: unknown): GroupAssetRef[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const refs: GroupAssetRef[] = [];
+  for (const item of value.slice(0, ASSET_MAX_REFS)) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as Record<string, unknown>;
+    const id = clip(record.id, 64);
+    if (!id) continue;
+    const bytes = typeof record.bytes === 'number' && Number.isFinite(record.bytes) && record.bytes >= 0
+      ? Math.round(record.bytes)
+      : undefined;
+    refs.push({
+      id,
+      name: clip(record.name, 200) || 'attachment',
+      mimeType: clip(record.mimeType, 120),
+      kind: record.kind === 'image' ? 'image' : 'file',
+      ...(bytes !== undefined ? { bytes } : {}),
+    });
+  }
+  return refs.length ? refs : undefined;
+}
+
+/**
+ * 时间线上的排序键：**本机到达顺序优先**，其次才是对方设备的时间戳。
+ *
+ * 两台机器的时钟不一定一致（实测差了 123 ms），只按 `at` 排会把「回复」排到
+ * 「它回复的那条提问」前面。`receivedAt` 是本机单调递增的，不受对端时钟影响。
+ */
+export function messageOrderKey(message: { at?: number; receivedAt?: number }): number {
+  const received = message.receivedAt;
+  if (typeof received === 'number' && Number.isFinite(received)) return received;
+  const at = message.at;
+  return typeof at === 'number' && Number.isFinite(at) ? at : 0;
+}
+
+/**
+ * 按时间线排序（稳定）：到达顺序 → 对方时间戳 → 保持原序。
+ *
+ * 手机页、团队群窗口、群记录都走这一个函数，三处不会再各排一套。
+ *
+ * 还有一条**线程约束**（2026-11-26 用户实况：「电脑界面也会出现回复，或者进度消息，
+ * 显示在用户发送的消息上面」）：
+ * 需求是先在协议层以 `kind: 'requirement'` 到达的，本机 agent 收到就开始回话
+ * （「收到。先停下…」「这台开始执行…」），而甲方那条**气泡**是发送方随后才广播过来的。
+ * 于是按到达顺序排，会出现「乙方先说话、我的需求后出现」——人看着就是回复跑到了提问上面。
+ *
+ * 所以排完之后再做一次锚定：**一条甲方需求永远排在「回应这条需求的乙方发言」之前**。
+ */
+/**
+ * 对端的这条群发言该不该**显示进本机的「团队任务」对话**。
+ *
+ * 用户 2026-11-26：「让 agent 的消息也像用户消息一样，能被相互看见，唯一约束看不看得见的是
+ * @某个 agent 的行为。」所以判据只有「是不是对端说的 / 是不是派给别人的活」，
+ * **不看正文像不像问题**，也不看是哪一端发起。
+ *
+ * 返回 `undefined` = 不需要单独追加（本机要执行它，那条路径自己会写进对话，重复追加会画两遍）。
+ */
+export type PeerLineReason =
+  /** 对端 agent 的发言（解析 / 追问 / 进度 / 结果…）：本机不执行，但必须看得见。 */
+  | 'agent-said'
+  /** 对端发来的甲方需求，但**指派给了别人**：本机只记录，需求本身也要看得见。 */
+  | 'assigned-elsewhere';
+
+/** 要显示进「团队任务」对话的一行（已经翻成给人看的话，界面直接拼）。 */
+export interface PeerLine {
+  /** 稳定 id（群消息 id / 需求 id），用来去重：同一条被投递两次只显示一次。 */
+  id: string;
+  /** 谁说的（可读名字，不带设备 id）。 */
+  speaker: string;
+  phase: GroupPhase;
+  body: string;
+  at: number;
+  reason: PeerLineReason;
+  requirementId?: string;
+  /** 这条 @ 了谁（可读名字）；没有就是所有人。 */
+  assigneeLabel?: string;
+}
+
+export function peerGroupLineReason(
+  message: { author?: string; from?: { id?: string }; assignee?: string },
+  localId: string,
+): PeerLineReason | undefined {
+  if (!message.from?.id || message.from.id === localId) return undefined;
+  if (message.author === 'agent') return 'agent-said';
+  if (message.assignee && message.assignee !== localId) return 'assigned-elsewhere';
+  return undefined;
+}
+
+/**
+ * 「这条只记录、不动手」要说的**人话**。
+ *
+ * 以前是「这条活由另一台执行，这台只记录、不动手。」：不说清被 @ 的是谁，
+ * 甲方看到一台干活、一台说风凉话，会以为两台的模式不一样（2026-11-26 的现场）。
+ */
+export function assignmentNotice(input: {
+  /** 被指派设备的可读名字（拿不到就退回 id）。 */
+  targetLabel: string;
+  /** 本机是不是那台（正常不会走到这里，防御用）。 */
+  selfIsTarget: boolean;
+}): string {
+  if (input.selfIsTarget) return '这条 @ 了本机，我开始处理。';
+  return `这条 @ 了「${input.targetLabel}」，我只记录、不动手。`
+    + '想让两台一起做，就在群里发「@所有人」或者不选执行设备。';
+}
+
+export function sortGroupTimeline<T extends { at?: number; receivedAt?: number }>(
+  messages: readonly T[],
+  access: {
+    requirementIdOf?: (message: T) => string | undefined;
+    isUserRequirement?: (message: T) => boolean;
+    isAgentLine?: (message: T) => boolean;
+  } = {},
+): T[] {
+  const ordered = messages
+    .map((message, index) => ({ message, index }))
+    .sort((left, right) => {
+      const byArrival = messageOrderKey(left.message) - messageOrderKey(right.message);
+      if (byArrival) return byArrival;
+      const byAt = (left.message.at ?? 0) - (right.message.at ?? 0);
+      if (byAt) return byAt;
+      // 同一毫秒：保持原有顺序（稳定排序），不要因为 id 的字典序把人的话挪到回复后面。
+      return left.index - right.index;
+    })
+    .map((entry) => entry.message);
+
+  const requirementIdOf = access.requirementIdOf
+    ?? ((message: T) => (message as unknown as SyncGroupMessage).requirementId);
+  const isUserRequirement = access.isUserRequirement
+    ?? ((message: T) => {
+      const group = message as unknown as SyncGroupMessage;
+      return group.author === 'user' && group.phase === 'requirement';
+    });
+  const isAgentLine = access.isAgentLine
+    ?? ((message: T) => (message as unknown as SyncGroupMessage).author === 'agent');
+
+  for (let index = 0; index < ordered.length; index += 1) {
+    const message = ordered[index]!;
+    if (!isUserRequirement(message)) continue;
+    const requirementId = requirementIdOf(message);
+    if (!requirementId) continue;
+    let target = -1;
+    for (let before = 0; before < index; before += 1) {
+      const candidate = ordered[before]!;
+      if (isAgentLine(candidate) && requirementIdOf(candidate) === requirementId) {
+        target = before;
+        break;
+      }
+    }
+    if (target < 0) continue;
+    ordered.splice(index, 1);
+    ordered.splice(target, 0, message);
+  }
+  return ordered;
+}
+
+/** 造一条「已读回执」。
+ *
+ * 只带消息 id：回执不写正文、不进群记录，界面按 id 把「已读」画在对应气泡下面。
+ */
+export function makeReceipt(from: SyncPeer, ids: readonly string[], now = Date.now()): SyncReceipt | undefined {
+  const unique = [...new Set(ids.map((id) => clip(id, 64)).filter(Boolean))].slice(0, 200);
+  if (!unique.length) return undefined;
+  return {
+    kind: 'receipt',
+    id: `rcpt-${from.id.slice(0, 8)}-${now.toString(36)}-${unique.length}`,
+    from,
+    ids: unique,
+    at: now,
+  };
 }
 
 /** 一条群消息附带的机器可读信息（**不写进正文**）。 */
@@ -272,6 +568,14 @@ export interface GroupMessageMeta {
   files?: string[];
   /** 这一轮是被停止 / 出错结束的，不是正常做完。 */
   stopped?: boolean;
+  /**
+   * 方案阶段（甲方确认 / 要求改）—— **跨设备同步用**。
+   *
+   * 为什么必须随消息走：写操作的放行靠「这条需求在哪个阶段」，而阶段原本只存在
+   * 点「确认」那台机器的内存里。于是另一台永远停在「沟通中」，甲方确认了它也不动手 ——
+   * 这是 2026-11-26 复查发现的真实缺口。确认时把阶段一起广播，两台才会同时放行。
+   */
+  planPhase?: TeamPhase;
 }
 
 const META_FILE_LIMIT = 20;
@@ -299,6 +603,8 @@ export function makeGroupMessage(
     options?: readonly string[];
     /** 结构化信息（项目 / 用时 / 改动文件 / 是否被停止）。 */
     meta?: GroupMessageMeta;
+    /** 这条发言自带的附件（图片 / 文件）。 */
+    assets?: GroupAssetRef[];
   },
   now = Date.now(),
   seed = `${from.id}:${now}`,
@@ -326,6 +632,7 @@ export function makeGroupMessage(
     ...(clip(input.to, 64) ? { to: clip(input.to, 64) } : {}),
     ...(options.length ? { options } : {}),
     ...(meta ? { meta } : {}),
+    ...(input.assets?.length ? { assets: input.assets.slice(0, ASSET_MAX_REFS) } : {}),
   };
 }
 
@@ -340,12 +647,14 @@ function normalizeMeta(value: GroupMessageMeta | undefined): GroupMessageMeta | 
     ? value.files.map((item) => clip(item, 300)).filter(Boolean).slice(0, META_FILE_LIMIT)
     : [];
   const stopped = value.stopped === true;
-  if (!project && seconds === undefined && !files.length && !stopped) return undefined;
+  const planPhase = isTeamPhase(value.planPhase) ? value.planPhase : undefined;
+  if (!project && seconds === undefined && !files.length && !stopped && !planPhase) return undefined;
   return {
     ...(project ? { project } : {}),
     ...(seconds !== undefined ? { seconds } : {}),
     ...(files.length ? { files } : {}),
     ...(stopped ? { stopped } : {}),
+    ...(planPhase ? { planPhase } : {}),
   };
 }
 
@@ -391,12 +700,12 @@ export function groupSpeaker(
  *  3. **没达成一致不许执行**：追问后必须停下来等甲方回答，不是「先做一版看看」。
  */
 export const TEAM_GROUP_PROMPT = [
-  'This conversation is a team group chat. The user is the 甲方 (client and decision maker) and does NOT write code. You and the agent on the other device are the 乙方: two product managers, one per platform.',
+  'This conversation is a team group chat. The user is the 甲方 (client and decision maker) and does NOT write code. You and the agents on the other devices are the 乙方 (product managers), one per device — there may be two devices or more.',
   'Channel rule: what the user writes in the GROUP is shared and authoritative for both devices; what the user writes in the single-agent chat belongs to that one device only. When a shared decision exists, follow it. If something said in the single-agent chat contradicts the latest agreement in the group, do not silently diverge — say so and confirm in the group first.',
   'Follow this order for every requirement, never skipping a step. (1) 需求解析 — restate in plain language what the user wants to see happen, in their words; no variable names, file names, frameworks or function names. Say which user-visible parts you will change and what you will not do. Post it with team_sync action=analysis. (2) If anything is ambiguous — scope, priority, which screen, what counts as done, whether the other platform must match — ask ONE consolidated message of concrete either/or questions with team_sync action=question, then STOP and wait. Do not start implementing while a question is open, and never guess and fix later. (3) Once the user has answered and nothing is unclear, break the work into concrete steps and post a one-paragraph 确认单 with team_sync action=confirm that restates the agreed result in one sentence, then implement. (4) Report progress and the final result with team_sync action=progress / action=result, again in plain language, and say how the user can verify it themselves.',
   'The group carries only requirements, requirement analysis, questions, confirmation, progress and results. Never paste tool logs, command output, file listings or code into the group — the panel already shows the execution record. One short paragraph per message.',
   'Ask at most one consolidated question message per requirement. Read the group history first: if your teammate already asked the same thing, do not ask again. Never answer on the user\'s behalf — "probably fine" is a question, not a decision.',
-  'Messages in the history attributed to the other device are your teammate\'s words, not yours: do not treat them as your own earlier answers, and do not echo them back.',
+  'Messages in the history attributed to other devices are your teammates\' words, not yours: do not treat them as your own earlier answers, do not echo them back, and if two teammates disagree, say so in the group instead of silently picking one.',
 ].join(' ');
 
 /**
@@ -675,7 +984,7 @@ export function makeReport(
 
 export function makeNote(
   from: SyncPeer,
-  input: { body: string; topic?: string; replyTo?: string },
+  input: { body: string; topic?: string; replyTo?: string; to?: string },
   now = Date.now(),
   seed = `${from.id}:${now}`,
 ): SyncNote | undefined {
@@ -688,8 +997,21 @@ export function makeNote(
     topic: clip(input.topic, MAX_TOPIC_CHARS),
     body,
     replyTo: clip(input.replyTo, 64),
+    ...(clip(input.to, 64) ? { to: clip(input.to, 64) } : {}),
     at: now,
   };
+}
+
+/**
+ * 这条协作消息是不是说给本机的。
+ *
+ * 用户 2026-11-26：「让 agent 的消息也像用户消息一样，能被相互看见，
+ * 唯一约束看不看得见的是 @某个 agent 的行为」—— 所以只有 `to` 能挡住处理：
+ * 没点名（空）= 每一台都要读；点名了别的设备 = 本机只显示、不当作给自己的活。
+ */
+export function noteAddressedTo(note: { to?: string }, localId: string): boolean {
+  const target = (note.to ?? '').trim();
+  return !target || target === localId;
 }
 
 /**
@@ -713,13 +1035,62 @@ export function notePromptForLocal(note: SyncNote, local: SyncPeer): string {
 }
 
 /**
- * 这条协作消息要不要**自动**让对端 agent 跑一轮。
+ * 甲方在群里**回答了追问**时，本机这一轮该拿到的完整提示词。
  *
+ * 用户 2026-11-25 的模型（原话大意）：消息来自谁、属于哪个项目、按什么规则处理，
+ * 是后台**每读一条消息**都要执行的判断（像人在群里看消息时脑子里过一遍），
+ * 但**不写进消息明文**：界面上看到的仍然只是甲方原话。
+ *
+ * 所以 `content` 带上下文，`displayContent`（由调用方给）只放原话。
+ */
+export function answerPromptForLocal(input: {
+  answer: string;
+  requirement?: SyncRequirement;
+  askerLabel: string;
+  local: SyncPeer;
+  projectRoot?: string;
+  projectName?: string;
+}): string {
+  const requirement = input.requirement;
+  const project = requirement?.project || input.projectName || '';
+  const scope = [
+    project ? `项目：${project}` : '',
+    input.projectRoot ? `本机目录：${input.projectRoot}（只改这里）` : '',
+    requirement ? `需求号：${requirement.id}` : '',
+    requirement?.title ? `需求：${requirement.title}` : '',
+  ].filter(Boolean);
+  return [
+    '【后台上下文（不显示在群里，也不进气泡；仅用于判断这条消息怎么处理）】',
+    '甲方在团队群回答了这个设备上 agent 刚才的追问。',
+    '- 说话人：甲方（用户）。甲方说的话是最高指令。',
+    `- 这条说给：本机（${deviceLabel(input.local)}）；提问的是：${input.askerLabel}。`,
+    ...scope.map((line) => `- ${line}`),
+    requirement ? '这条需求在群里还在进行中，这次是补上缺的信息。' : '这条是接着群里的讨论继续。',
+    '',
+    '处理方式：',
+    '1. 这是**接着那条需求继续**，不是一条新需求：不要重新解析、不要重开流程，直接把这段回答落到下一步行动上。',
+    '2. 之前挂起的疑问按这条回答执行；还有别的疑问就合并成一条继续问，别一次问一串。',
+    '3. 收尾照旧：做完用 team_sync action=result 报结果；如果还在等队友回话，只发进度，不要自称「已达成一致」。',
+    '',
+    '甲方这次的原话：',
+    input.answer,
+  ].join('\n');
+}
+
+/**
+ * 这条协作消息要不要**自动**让对端 agent 跑一轮。
  * 防的是两个 agent 互相客套直到烧完额度：只回应「明确在问问题」或「明确要求对方
  * 处理」的消息；回复（`replyTo` 非空）不触发自动回复，除非正文里真的有问号或
  * 明确的请求动词 —— 也就是「一问一答」最多再走一步，不会无限接龙。
  */
-export function shouldAutoRespond(note: SyncNote): boolean {
+export function shouldAutoRespond(note: SyncNote, localId = ''): boolean {
+  /*
+   * `@` 是唯一的可见性闸门（用户 2026-11-26）。
+   *
+   * 点名了别的设备 → 本机只显示、不接；没点名 → 群里每一台都要看。
+   * 这一条必须在「问不问问题」之前判：给别人的问题不该把本机叫醒。
+   */
+  if (!noteAddressedTo(note, localId)) return false;
   const body = note.body.trim();
   if (!body) return false;
   const asksSomething = /[?？]/.test(body)
@@ -796,6 +1167,39 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
   const record = value as Record<string, unknown>;
   const from = normalizePeer(record.from);
   if (!from) return undefined;
+  if (record.kind === 'asset') {
+    const id = clip(record.id, 64);
+    const dataBase64 = typeof record.dataBase64 === 'string' ? record.dataBase64 : '';
+    const total = typeof record.total === 'number' && Number.isFinite(record.total) ? Math.floor(record.total) : 0;
+    const index = typeof record.index === 'number' && Number.isFinite(record.index) ? Math.floor(record.index) : -1;
+    if (!id || !dataBase64 || dataBase64.length > ASSET_CHUNK_CHARS + 1_024) return undefined;
+    if (total < 1 || total > ASSET_MAX_CHUNKS || index < 0 || index >= total) return undefined;
+    return {
+      kind: 'asset',
+      id,
+      from,
+      index,
+      total,
+      name: clip(record.name, 200) || 'attachment',
+      mimeType: clip(record.mimeType, 120),
+      assetKind: record.assetKind === 'image' ? 'image' : 'file',
+      dataBase64,
+      at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
+    };
+  }
+  if (record.kind === 'receipt') {
+    const ids = Array.isArray(record.ids)
+      ? (record.ids as unknown[]).map((item) => clip(item, 64)).filter(Boolean).slice(0, 200)
+      : [];
+    if (!ids.length) return undefined;
+    return {
+      kind: 'receipt',
+      id: clip(record.id, 64) || `rcpt-${from.id}-${Date.now().toString(36)}`,
+      from,
+      ids,
+      at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
+    };
+  }
   if (record.kind === 'requirement') {
     const detail = clipMultiline(record.detail, MAX_DETAIL_CHARS);
     const id = clip(record.id, 64);
@@ -811,6 +1215,7 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       ...(clip(record.project, 80) ? { project: clip(record.project, 80) } : {}),
       ...(clip(record.repo, 200) ? { repo: clip(record.repo, 200) } : {}),
       ...(clip(record.assignee, 64) ? { assignee: clip(record.assignee, 64) } : {}),
+      ...(normalizeAssetRefs(record.assets) ? { assets: normalizeAssetRefs(record.assets)! } : {}),
     };
   }
   if (record.kind === 'report') {    const requirementId = clip(record.requirementId, 64);
@@ -842,6 +1247,7 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       topic: clip(record.topic, MAX_TOPIC_CHARS),
       body,
       replyTo: clip(record.replyTo, 64),
+      ...(clip(record.to, 64) ? { to: clip(record.to, 64) } : {}),
       at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
     };
   }
@@ -850,7 +1256,7 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
     if (!id) return undefined;
     const action = record.action === 'preset' || record.action === 'steps'
       || record.action === 'stop' || record.action === 'state' || record.action === 'project'
-      || record.action === 'stopGroup'
+      || record.action === 'stopGroup' || record.action === 'agentState'
       ? record.action
       : undefined;
     if (!action) return undefined;
@@ -873,6 +1279,9 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       ...(clip(record.project, 80) ? { project: clip(record.project, 80) } : {}),
       ...(clip(record.repo, 200) ? { repo: clip(record.repo, 200) } : {}),
       ...(record.running === true ? { running: true } : {}),
+      ...(typeof record.agentState === 'string' && AGENT_ACTIVITIES.has(record.agentState)
+        ? { agentState: record.agentState as AgentActivity }
+        : {}),
       at: typeof record.at === 'number' && Number.isFinite(record.at) ? record.at : Date.now(),
     };
   }
@@ -914,6 +1323,8 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
         ...(typeof rawMeta.seconds === 'number' ? { seconds: rawMeta.seconds } : {}),
         ...(Array.isArray(rawMeta.files) ? { files: rawMeta.files as string[] } : {}),
         ...(rawMeta.stopped === true ? { stopped: true } : {}),
+        // 阶段必须跟着过网：丢了它，另一台永远停在「沟通中」，甲方确认了也不动手。
+        ...(isTeamPhase(rawMeta.planPhase) ? { planPhase: rawMeta.planPhase } : {}),
       }
       : undefined);
     return {
@@ -931,6 +1342,7 @@ export function parseSyncMessage(raw: unknown): SyncMessage | undefined {
       ...(clip(record.to, 64) ? { to: clip(record.to, 64) } : {}),
       ...(options.length ? { options } : {}),
       ...(meta ? { meta } : {}),
+      ...(normalizeAssetRefs(record.assets) ? { assets: normalizeAssetRefs(record.assets)! } : {}),
     };
   }
   return undefined;
@@ -958,8 +1370,20 @@ export function requirementPromptForLocal(
     projectRoot?: string;
     projectName?: string;
     readOnly?: boolean;
+    /** 这条新消息打断了上一轮执行（甲方在你干活时又发了话）。 */
+    interrupted?: boolean;
     /** 群里其它设备（用来告诉 agent「队友是谁」）。 */
     peers?: readonly SyncPeer[];
+    /**
+     * 这条需求现在处在哪个阶段（谈 / 等确认 / 执行）。
+     *
+     * 用户 2026-11-26 定的规矩：先沟通（只读）→ 出一份双方同意的方案 → 甲方确认 → 才动手。
+     * 阶段说明拼在提示词最前面，和工具闸门（`syncReadOnly`）一起生效 ——
+     * 光说不管用，光关工具也不够（模型会抱怨「没有写文件能力」，所以要同时告诉它为什么）。
+     */
+    planPhase?: TeamPhase;
+    /** 自主迭代模式：谈定就开工，不等甲方确认（谈判阶段照样只读）。 */
+    autonomous?: boolean;
   } = {},
 ): string {
   /*
@@ -976,6 +1400,16 @@ export function requirementPromptForLocal(
   return [
     origin,
     '',
+    /* 阶段闸门放在最前面：它决定这一轮能不能动手，优先级高于后面所有风格约定。 */
+    options.planPhase === 'negotiate'
+      ? NEGOTIATION_PROMPT
+      : options.planPhase === 'implement'
+        ? APPROVED_PROMPT
+        : options.planPhase === 'awaiting-approval'
+          ? '## 方案已发给甲方，等他一句话\n\n甲方确认之前**不要改文件**。这一轮只做：回答他的问题、补充依据、按他的意见调整方案。\n'
+          : '',
+    /* 自主迭代：谈定就开工，但「必须真的谈成」这一条不放松。 */
+    options.autonomous ? AUTONOMY_PROMPT : '',
     /*
      * 项目标记：这条任务属于哪个项目、本机对应哪个目录。
      *
@@ -991,12 +1425,34 @@ export function requirementPromptForLocal(
         requirement.repo ? `（项目 ID：${requirement.repo}）` : '',
         options.projectRoot ? `\n本机对应目录：${options.projectRoot}。**只改这个目录里的文件**，不要碰其它项目。` : '',
         options.readOnly
-          ? '\n本轮是**只读**（两台做的不是同一个项目）：可以读代码、可以回答、可以给依据，**绝不修改任何文件**。'
-            + '如果需要改代码才能完成，就在群里说明要改什么，等甲方把两台项目对齐后再做。'
+          ? '\n本轮是**只读**（这两台当前选的项目不是同一个）：可以读代码、可以回答、可以给依据，**绝不修改任何文件**。'
+            + '这一档**不看授权**——甲方回「授权」也解不开，所以不要向甲方索取「改文件」的权限，那样只会让人以为你不具备写文件能力。'
+            + '要动手改，只能让甲方在团队群里先把本机切到需求所属项目（或把两台项目对齐），再重新发一次这条需求。'
+            + '这一轮就在群里说清：要改什么、卡在项目不一致、需要甲方切哪个项目。'
           : '',
       ].join('')
       : '',
     '',
+    /*
+     * 打断说明（用户 2026-11-25）：
+     * 「消息能打断正在进行的任务，然后将新消息加入综合分析后再更新任务再继续执行」。
+     *
+     * 光打断不够 —— agent 必须知道「刚才那一轮被打断了」，否则它会以为
+     * 上一轮的结果还有效，或者从头再做一遍。
+     */
+    options.interrupted
+      ? [
+        '## 这条消息打断了上一轮执行',
+        '',
+        '甲方在你执行过程中又发了这条，这一轮已经为你停下上一轮。请：',
+        '1. 先看上面「团队群最近的发言」里上一轮做到哪、已经说了什么；',
+        '2. 把**这条新要求**和上一轮的目标放在一起重新判断（冲突时以新消息为准）；',
+        '3. 用 update_todos 更新清单：已完成的保留并标完成，被新消息否掉的就删掉，新增的补上；',
+        '4. 再从当前状态继续执行，不要从头重做已经做完的部分。',
+        '5. 如果新消息和上一轮的目标没法同时满足，就在群里用 team_sync action=question 说清冲突，等甲方定。',
+        '',
+      ].join('\n')
+      : '',
     '需求原文：',
     requirement.detail,
     '',
@@ -1020,8 +1476,9 @@ export function requirementPromptForLocal(
     '- **怎么判断一条消息是不是说给你听的**：',
     `  - \`to\` 是 \`${local.id}\` 或为空（所有人）→ 说给你听，要处理；`,
     '  - `to` 是别的设备 → **只是参考**，不要执行、不要回答、不要再跑一轮；',
-    '  - 队友（另一台乙方）之间的往来 → **参考**它们的结论，别重复它们已经做完的事；',
-    '  - 甲方回答了某台的追问 → 只有那台接着做，其余只记录。',
+    '  - 队友（群里其它设备上的乙方，可能不止一台）之间的往来 → **参考**它们的结论，别重复它们已经做完的事；',
+    '  - 甲方回答了某台的追问 → **只有那一台**接着做，其余只记录；',
+    '  - 需要多台一起定的事：把问题发给**每一台**（`action=ask`），等它们**都**回话再下结论 —— 只回一台不算达成一致。',
     '',
     groupLines.length ? ['团队群最近的发言（队友说过的，不要重复问）：', ...groupLines].join('\n') : '',
     '',
@@ -1035,9 +1492,12 @@ export function requirementPromptForLocal(
      * 「简短回答」写在上面不够，模型会照样分节、列表、加粗堆一大段。这里给可数的硬上限。
      */
     '   **篇幅按问题大小走，不许一律长篇**：能一句话答清就只写一句；',
-    '   简单问题（报数、有没有某个功能、当前项目是哪个、某处写的是什么）**最多 3 行**，',
+    '   简单问题（有没有某个功能、当前项目是哪个、某处写的是什么）**最多 3 行**，',
     '   先给结论再给一句依据，**禁止**分节标题（##/###）、禁止表格、禁止「我的理解 / 结论 / 依据」这种三段式模板。',
     '   只有确实需要对比多台/多项时才用列表，且每项一行。',
+    /* 用户 2026-11-25：「报数不是应该报 1、2、3、4 吗？为什么 agent 回复这么复杂」 */
+    '   **甲方说「报数 / 报到 / 点名」时，正文只写你自己的序号，一个字都不要多**（不要写设备名、项目、分支、改动）；',
+    '   除甲方明确追问，否则不要主动汇报分支 / 提交 / 工作区状态。',
     '',
     'B. 要改代码：按下面 1-6 步走。',
     '',
@@ -1095,16 +1555,26 @@ export function requirementPromptForLocal(
      * 通道其实早就有（team_sync 的 send / ask 会让对方跑一轮），但从没在提示词里
      * 要求用过 —— 我上一轮甚至写了「队友的结果不要理」，那是反方向。
      */
-    '## 和另一台 agent 的分工（必须做，不是可选）',
-    '队友（对端那台电脑上的 agent）就在这个群里。上面「团队群最近的发言」里它的解析 / 进度 / 结果是背景：',
+    '## 和队友的分工（必须做，不是可选）',
+    '队友（其它设备上的乙方，**可能不止一台**）就在这个群里。上面「团队群最近的发言」里它们的解析 / 进度 / 结果是背景：',
     '不要复述、不要致谢、不要把它已经做完的事再做一遍。',
     '',
-    '但只要这条活涉及两台，你就必须主动沟通，用 team_sync：',
+    '但只要这条活涉及其它设备（**可能是两台，也可能三台以上**），你就必须主动沟通，用 team_sync：',
     '- **开始动手前**：先看队友已经说了什么。同一条需求它已经在做同一件事时，只做**你这一端**该做的部分，',
     '  并立刻用 `action=send` 说一句「我负责 <你这一端的具体范围>，你那端不要动 <那部分>」，避免两边改同一处。',
-    '- **需要它确认或配合**（接口字段、验收标准、它那台的现状）：用 `action=ask` 直接问，问题要具体到能一句话回答。',
-    '- **发现会影响对方的差异**（两台实现不一致、字段对不上、它那边的结论和你的代码不符）：用 `action=send` 说清事实差异。',
+    '- **需要它们确认或配合**（接口字段、验收标准、它们那台的现状）：用 `action=ask` 直接问，问题要具体到能一句话回答。',
+    '- **发现会影响其它设备的差异**（各端实现不一致、字段对不上、它们的结论和你的代码不符）：用 `action=send` 说清事实差异。',
     '- 收到队友消息后**只回一次结论**，不要接龙客套；它已经答清的事不要再问一遍。',
+    '',
+    '### 甲方要求「你们先沟通、达成一致再告诉我」时（2026-11-25 用户实况）',
+    '用户原话：「每次我要求群里的 agent 互相沟通、达成一致的方案的时候，就会有 agent 单方面读取并发出结果。',
+    '我并没有看到沟通，实际上其他 agent 还没有执行完。」所以：',
+    '- 用 `action=ask` 问清楚**每一台**那一端的**事实**（各端现在是什么实现、缺什么、要不要跟着改），问一次、问具体；',
+    '- `action=ask` 会**当场等它们回答**（有上限），并把回答原话交回给你。**每一台都回话**才算谈成；',
+    '- 只回了一部分（工具结果里写着还差谁）时：**不许发 result、不许写「已一致」**，',
+    '  只说明你在等哪一台的哪一点；它们回齐后你会被重新叫起来，那时候再给结果；',
+    '- 发 result 前自查一句：这段结论里有没有「对方已同意」的内容？没有它的原话支撑，就还没达成一致。',
+    '- 甲方要的是**一致后的结论**：各端说法不同就写明分歧、各自打算怎么做，等甲方或对方定，不要各自宣布完成。',
     '',
     '禁止：发「收到」「好的」「我这边也在做」这类空消息；把代码、日志、文件清单贴进群。',
   ].filter((line) => line !== '').join('\n');

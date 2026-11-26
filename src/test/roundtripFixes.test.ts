@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { planOutcomePost } from '../sync/outcomePlan';
 
 /**
  * 这一轮四个反馈各自对应的不变量。
@@ -36,15 +37,27 @@ test('第 4 条：群 / 对端来源发送失败时不回填主对话输入框',
 });
 
 test('第 2 条：提示词要求区分「队友的结果是背景」和「必须主动分工」', () => {
-  assert.match(PROTOCOL, /和另一台 agent 的分工（必须做，不是可选）/, '要有明确的分工章节');
+  assert.match(PROTOCOL, /和队友的分工（必须做，不是可选）/, '要有明确的分工章节');
   assert.match(PROTOCOL, /不要复述、不要致谢/, '不要复述客套');
   assert.match(PROTOCOL, /action=ask/, '需要核对事实时要能向队友提问');
   assert.match(PROTOCOL, /action=send/, '要让队友知道分工时要能发言');
   assert.match(PROTOCOL, /只回一次结论/, '限定只回一次，避免接龙');
+  assert.match(PROTOCOL, /可能不止一台/, '不写死台数：三台以上也要成立');
 });
 
 test('第 1 条：回执里带真实耗时，没有开始时间就不编', () => {
+  const withTime = planOutcomePost({
+    outcome: 'completed', text: '做完了', files: [], requirementId: 'req-1',
+    seconds: 42, waitingTeammates: [], alreadyReported: false, superseded: false,
+  });
+  assert.equal(withTime.post?.meta.seconds, 42, '有开始时间就给出真实耗时');
+  const withoutTime = planOutcomePost({
+    outcome: 'completed', text: '做完了', files: [], requirementId: 'req-1',
+    waitingTeammates: [], alreadyReported: false, superseded: false,
+  });
+  assert.equal(withoutTime.post?.meta.seconds, undefined, '没有开始时间就不显示，绝不编一个');
+
+  // 面板只负责记开始时间并把它交给纯函数。
   assert.match(PANEL, /syncRunStarted\.set\(requirement\.id, Date\.now\(\)\)/, '开始时要记时间');
-  assert.match(PANEL, /const elapsed = startedAt \?/, '没开始时间时不显示耗时');
-  assert.match(PANEL, /用时 \$\{elapsed\}s/, '回执里给出秒数');
+  assert.match(PANEL, /seconds: Math\.max\(0, Math\.round\(\(Date\.now\(\) - startedAt\) \/ 1000\)\)/, '耗时由开始时间算出来');
 });

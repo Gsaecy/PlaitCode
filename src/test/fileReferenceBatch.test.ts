@@ -60,6 +60,7 @@ test('forty bare filenames trigger exactly one merged search', async () => {
 
   const resolved = await resolveFileReferences(queries, {
     roots: [ROOT],
+    platform: 'darwin',
     missTtlMs: 600_000,
     cache,
     exists: (candidate) => files.includes(candidate),
@@ -104,6 +105,7 @@ test('a miss is cached, so re-rendering the same message searches nothing', asyn
   const queries = [{ index: 0, path: 'does-not-exist.ts', preferred: ROOT }];
   const options = {
     roots: [ROOT],
+    platform: 'darwin',
     missTtlMs: 600_000,
     cache,
     exists: () => false,
@@ -130,14 +132,16 @@ test('a miss expires after the TTL so a newly created file becomes visible', asy
   const queries = [{ index: 0, path: 'created.ts', preferred: ROOT }];
 
   await resolveFileReferences(queries, {
-    roots: [ROOT], missTtlMs: 1_000, cache, exists: () => exists, search,
+    roots: [ROOT], platform: 'darwin',
+    missTtlMs: 1_000, cache, exists: () => exists, search,
   });
   const afterFirst = requests.length;
   assert.ok(afterFirst > 0);
 
   exists = true;
   const afterTtl = await resolveFileReferences(queries, {
-    roots: [ROOT], missTtlMs: 0, cache, exists: () => exists, search,
+    roots: [ROOT], platform: 'darwin',
+    missTtlMs: 0, cache, exists: () => exists, search,
   });
   assert.deepEqual(afterTtl, [`${ROOT}/created.ts`]);
   assert.equal(requests.length, afterFirst, '文件已存在时走 existsSync，不需要再搜');
@@ -150,13 +154,14 @@ test('candidates already on disk never reach the search layer', async () => {
     [{ index: 0, path: 'package.json', preferred: ROOT }],
     {
       roots: [ROOT],
-      missTtlMs: 600_000,
+      platform: 'darwin',
+    missTtlMs: 600_000,
       cache,
-      exists: (candidate) => candidate === join(ROOT, 'package.json'),
+      exists: (candidate) => candidate === `${ROOT}/package.json`,
       search,
     },
   );
-  assert.deepEqual(resolved, [join(ROOT, 'package.json')]);
+  assert.deepEqual(resolved, [`${ROOT}/package.json`]);
   assert.equal(requests.length, 0, '确定性命中不该启动 ripgrep');
 });
 
@@ -171,6 +176,7 @@ test('a project-root hit avoids the whole-workspace pass entirely', async () => 
 
   const resolved = await resolveFileReferences(queries, {
     roots: [ROOT, OTHER],
+    platform: 'darwin',
     missTtlMs: 600_000,
     cache,
     exists: (candidate) => files.includes(candidate),
@@ -192,7 +198,7 @@ test('references survive when the file lives only in another root', async () => 
   const { requests, search } = countingSearch(files);
   const resolved = await resolveFileReferences(
     [{ index: 0, path: 'file.ts', preferred: ROOT }],
-    { roots: [ROOT, OTHER], missTtlMs: 600_000, cache, exists: (candidate) => files.includes(candidate), search },
+    { platform: 'darwin', roots: [ROOT, OTHER], missTtlMs: 600_000, cache, exists: (candidate) => files.includes(candidate), search },
   );
   assert.equal(resolved[0], `${OTHER}/deep/file.ts`, '项目根没找到时要继续在整个工作区找');
   assert.equal(requests.length, 2);
@@ -210,6 +216,7 @@ test('names beyond the merge cap degrade instead of triggering extra searches', 
 
   const resolved = await resolveFileReferences(queries, {
     roots: [ROOT],
+    platform: 'darwin',
     missTtlMs: 600_000,
     cache,
     exists: () => false,
@@ -232,6 +239,7 @@ test('item count is bounded per verification request', async () => {
   }));
   const resolved = await resolveFileReferences(queries, {
     roots: [ROOT],
+    platform: 'darwin',
     missTtlMs: 600_000,
     cache,
     exists: () => false,

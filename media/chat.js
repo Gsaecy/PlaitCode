@@ -1,6 +1,42 @@
 (() => {
   const vscode = acquireVsCodeApi();
 
+  /*
+   * 界面自身的错误必须能被宿主看到（用户 2026-11-26：「为什么 copilot chat 面对超长对话
+   * 能正常显示？你确定问题找对根本原因了吗」）。
+   *
+   * 以前脚本一抛错，屏幕上什么都不说，宿主日志里也一个字没有 —— 于是只能靠猜。
+   * 现在：任何未捕获错误都发回宿主记一行，并且在界面上留一块可读的提示（不是白屏）。
+   */
+  (function installErrorSurface() {
+    var reported = 0;
+    function report(kind, message, detail) {
+      if (reported >= 5) return;
+      reported += 1;
+      try { vscode.postMessage({ type: 'webviewError', kind: kind, message: String(message || ''), detail: String(detail || '').slice(0, 2000) }); } catch (_) { /* 通道没了 */ }
+      try {
+        var box = document.getElementById('bootFallback');
+        if (!box) {
+          box = document.createElement('div');
+          box.id = 'bootFallback';
+          box.className = 'boot-fallback';
+          box.innerHTML = '<div class="boot-fallback-card"><strong></strong><p></p><p class="boot-fallback-hint"></p></div>';
+          document.body.appendChild(box);
+        }
+        box.querySelector('strong').textContent = 'HWChat 界面出错了';
+        box.querySelector('p').textContent = String(message || kind);
+        box.querySelector('.boot-fallback-hint').textContent = '已把错误写进 HWChat 输出面板；可运行「HWChat: 重新加载界面」重试。';
+      } catch (_) { /* 连兜底都挂就算了，至少宿主已经收到 */ }
+    }
+    window.addEventListener('error', function (event) {
+      report('error', event.message, (event.error && event.error.stack) || (event.filename + ':' + event.lineno));
+    });
+    window.addEventListener('unhandledrejection', function (event) {
+      var reason = event.reason;
+      report('rejection', (reason && reason.message) || reason, reason && reason.stack);
+    });
+  })();
+
   // 词表由扩展在生成 HTML 时按当前语言注入，脚本只做查表，不保存任何文案。
   const messages = (() => {
     try {
@@ -542,7 +578,14 @@
    * 只留 2 份：每份最大约 8 MB，多留没有意义（用户几乎不会连点第三张不同的图）。
    */
   const clipboardImageCache = new Map();
-  const CLIPBOARD_IMAGE_CACHE_MAX = 2;
+  /**
+   * 预取缓存要放得下「一条消息里的全部图片」。
+   *
+   * 用户 2026-11-25：「气泡消息复制只能第一张附件/图，很不方便，需要能复制全部附件/图 + 消息内容」。
+   * 一条消息通常 ≤ 6 张图，这里按 8 张留余量；再多就退化成「文字 + 清单」。
+   */
+  const CLIPBOARD_IMAGE_CACHE_MAX = 8;
+  const CLIPBOARD_MESSAGE_IMAGE_LIMIT = 8;
 
   /** 预取某条图片附件并转为 PNG，存进缓存；失败静默忽略（点击时会再试一次）。 */
   async function prefetchClipboardImage(attachment) {
@@ -559,6 +602,22 @@
     clipboardImageCache.set(attachment.id, png);
     while (clipboardImageCache.size > CLIPBOARD_IMAGE_CACHE_MAX) {
       clipboardImageCache.delete(clipboardImageCache.keys().next().value);
+    }
+  }
+
+  /**
+   * 预取这条消息里的**所有**图片。
+   *
+   * 异步剪贴板写入必须紧跟用户点击（Chrome 的手势窗口约 5 秒），所以数据要在
+   * 悬停时就备好；只预取第一张的话，多图消息里后面的图永远来不及。
+   */
+  async function prefetchMessageImages(message) {
+    const images = (message?.attachments || [])
+      .filter((attachment) => attachment.kind === 'image' && attachment.id)
+      .slice(0, CLIPBOARD_MESSAGE_IMAGE_LIMIT);
+    for (const image of images) {
+      // 顺序取：并发几张 5 MB 的图会让 webview 卡住，而悬停本来就有几百毫秒余量。
+      await prefetchClipboardImage(image);
     }
   }
 
@@ -684,30 +743,125 @@
    * 降级是**显式**的：写图片失败时仍然把文字复制成功，并弹一句说明，而不是让用户
    * 以为复制成功了、粘贴时才发现少了图。
    */
+  /**
+   * 附件的可读清单（文件名 + 本机路径）。
+   *
+   * 纯文本格式里图片只能以**路径**存在：粘到编辑器 / 别的聊天窗口时，
+   * 至少知道有哪些附件、文件在哪，而不是「只剩一段文字、图全丢了」。
+   */
+  function attachmentManifest(attachments) {
+    const rows = [];
+    for (const attachment of attachments || []) {
+      const kind = attachment.kind === 'image' ? '图片' : '文件';
+      const name = attachment.label || kind;
+      rows.push(attachment.path ? `[${kind}] ${name}：${attachment.path}` : `[${kind}] ${name}`);
+    }
+    return rows.join('\n');
+  }
+
+  /**
+   * 富文本（`text/html`）：**所有**图片都贴进去，一个都不少。
+   *
+   * `ClipboardItem` 的 `image/png` 键一次只能放一张图，但 `text/html` 可以放任意多张
+   * （图片用 data URL 内联）。Word / 邮件 / 微信 / VS Code 编辑器粘出来都是完整内容。
+   */
+  function buildCopyHtml(text, images) {
+    const escape = (value) => String(value || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const parts = [];
+    if (text) parts.push(`<pre style="white-space:pre-wrap;font-family:inherit">${escape(text)}</pre>`);
+    images.forEach((image, index) => {
+      const src = image.dataUrl;
+      if (!src) {
+        parts.push(`<p>[图片] ${escape(image.label)}</p>`);
+        return;
+      }
+      parts.push(`<p><img src="${src}" alt="${escape(image.label)}" style="max-width:100%"></p>`);
+      if (image.path) parts.push(`<p style="font-size:12px;color:#888">${escape(image.path)}</p>`);
+      void index;
+    });
+    return parts.join('\n');
+  }
+
+  /**
+   * 复制整条消息：文字 + **全部**附件。
+   *
+   * 三种格式一次写入：
+   *  - `text/plain`：正文 + 附件清单（名称与路径）；
+   *  - `text/html`  ：正文 + 所有图片（data URL 内联）；
+   *  - `image/png`  ：第一张图（兼容只认图片的输入框，例如聊天软件的「粘贴图片」）。
+   *
+   * 图片数据在悬停时已经预取（手势窗口约 5 秒），所以这里只剩写入本身。
+   */
   async function copyMessage(button, message) {
     const text = message?.content || '';
-    const images = (message?.attachments || []).filter((attachment) => attachment.kind === 'image' && attachment.id);
-    if (!images.length) {
+    const attachments = message?.attachments || [];
+    const images = attachments.filter((attachment) => attachment.kind === 'image' && attachment.id);
+    if (!attachments.length) {
       requestClipboardWrite(text, button);
       return;
     }
     if (button) { button.disabled = true; button.textContent = t('common.copying'); }
-    // 悬停时已经预取过 → 直接写，用户手势一定还有效（见 prefetchClipboardImage）。
-    const cached = clipboardImageCache.get(images[0].id);
-    const written = cached
-      ? await writeRichClipboardWithBlob(text, cached)
-      : await (async () => {
-        const data = await requestAttachmentData(images[0].id);
-        return data ? writeRichClipboard(text, data) : false;
-      })();
+    const manifest = attachmentManifest(attachments);
+    const plain = [text, manifest].filter(Boolean).join('\n\n');
+    // 取齐所有图片：先用预取缓存，缺的再要一次（可能超出手势窗口，下面会显式降级）。
+    const resolved = [];
+    for (const image of images.slice(0, CLIPBOARD_MESSAGE_IMAGE_LIMIT)) {
+      let png = clipboardImageCache.get(image.id);
+      if (!png) {
+        const data = await requestAttachmentData(image.id);
+        if (data) {
+          try { png = await toPngBlob(data); } catch { png = null; }
+          if (png) clipboardImageCache.set(image.id, png);
+        }
+      }
+      if (!png) continue;
+      const dataUrl = await blobToDataUrl(png);
+      resolved.push({ label: image.label, path: image.path, dataUrl });
+    }
+    const written = await writeFullClipboard(plain, buildCopyHtml(text, resolved), resolved[0]?.dataUrl);
     if (written) {
       flashCopyLabel(button, true);
-      showToast(images.length > 1 ? t('chat.copyImageFirstOnly') : t('chat.copiedWithImage'), 'neutral');
+      showToast(
+        resolved.length
+          ? t('chat.copyAllDone', { images: String(resolved.length), files: String(attachments.length) })
+          : t('chat.copiedWithManifest'),
+        'neutral',
+      );
       return;
     }
-    // 图片没能写进剪贴板：文字仍然要复制成功，只是少了图。
-    requestClipboardWrite(text, button);
+    // 富格式写不进去（手势过期 / 环境不支持）：文字 + 清单仍然要复制成功，并说清楚。
+    requestClipboardWrite(plain, button);
     showToast(t('chat.copyImageUnsupported'), 'warning');
+  }
+
+  /** Blob → data URL（HTML 里内联图片用）。 */
+  function blobToDataUrl(blob) {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => resolve('');
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  /** 一次写入 text/plain + text/html (+ 首图 image/png)。 */
+  async function writeFullClipboard(plain, html, firstImageDataUrl) {
+    if (typeof ClipboardItem === 'undefined' || !navigator.clipboard?.write) return false;
+    try {
+      const entries = {
+        'text/plain': new Blob([plain], { type: 'text/plain' }),
+        'text/html': new Blob([html], { type: 'text/html' }),
+      };
+      if (firstImageDataUrl) {
+        const response = await fetch(firstImageDataUrl);
+        entries['image/png'] = await response.blob();
+      }
+      await navigator.clipboard.write([new ClipboardItem(entries)]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   function requestClipboardWrite(text, button, idleLabel = t('common.copy')) {
@@ -3054,19 +3208,29 @@
   }
 
   function renderMessage(message) {
+    /*
+     * 只显示**用户原话**。
+     *
+     * 团队群的需求会带着一整段协议提示词发给模型（身份、分工、报数规则、收尾要求…），
+     * 这些是「潜规则」：模型必须读到，用户不该在气泡里读一整屏。所以要发的那份留在
+     * `content`（历史与请求都用它），界面只用 `displayContent`。
+     */
+    const view = typeof message.displayContent === 'string' ? { ...message, content: message.displayContent } : message;
     const article = document.createElement('article');
     article.className = `message ${message.role}${message.status === 'error' ? ' error' : ''}`; article.dataset.messageId = message.id;
     const meta = document.createElement('div'); meta.className = 'message-meta';
     const author = textElement('span', '', message.role === 'user' ? t('chat.you') : 'HWChat');
     const time = textElement('time', '', formatTime(message.createdAt)); time.dateTime = new Date(message.createdAt).toISOString(); meta.append(author, time);
-    if (message.content) {
+    if (view.content) {
       const copy = textElement('button', 'message-copy-button', t('common.copy')); copy.type = 'button'; copy.title = t('chat.copyMessage');
-      copy.addEventListener('click', () => { void copyMessage(copy, message); });
-      // 悬停/聚焦就预取原图并转 PNG：点下去时不用再等，用户手势不会过期。
-      const firstImage = (message.attachments || []).find((attachment) => attachment.kind === 'image' && attachment.id);
-      if (firstImage) {
-        copy.addEventListener('pointerenter', () => { void prefetchClipboardImage(firstImage); });
-        copy.addEventListener('focus', () => { void prefetchClipboardImage(firstImage); });
+      copy.addEventListener('click', () => { void copyMessage(copy, view); });
+      /*
+       * 悬停/聚焦就预取**全部**图片：点下去时不用再等，用户手势不会过期。
+       * 以前只预取第一张，多图消息就只能复制到一张（用户 2026-11-25 报的问题）。
+       */
+      if ((message.attachments || []).some((attachment) => attachment.kind === 'image' && attachment.id)) {
+        copy.addEventListener('pointerenter', () => { void prefetchMessageImages(view); });
+        copy.addEventListener('focus', () => { void prefetchMessageImages(view); });
       }
       meta.append(copy);
     }
@@ -3075,9 +3239,9 @@
     if (attached.length) body.append(renderMessageAttachments(attached));
     if (message.usedSkills?.length) body.append(renderSkillUsage(message.usedSkills));
     if (message.reasoning) body.append(renderReasoning(message.reasoning, message.status === 'streaming'));
-    const flow = appendMessageFlow(body, message);
+    const flow = appendMessageFlow(body, view);
     // 用户消息太长就折叠：只留开头几行 + 渐隐 + 「展开全文」。
-    if (message.role === 'user' && flow?.tail?.node) attachUserMessageClamp(flow.tail.node, message);
+    if (message.role === 'user' && flow?.tail?.node) attachUserMessageClamp(flow.tail.node, view);
     // 每条用户消息都带执行状态徽标（还没执行 / 执行中 / 已执行 / 已跳过）。
     if (message.role === 'user') {
       const execution = renderExecutionRow(message);
@@ -3086,7 +3250,7 @@
     // 用户自己贴进来的明文凭据：在界面层直接认出来，不等模型提醒。
     // 放在消息正文之后，顺序上与「你说的话 → 系统的警告」一致。
     if (message.role === 'user') {
-      const warning = secretWarningNode(message.content || '');
+      const warning = secretWarningNode(view.content || '');
       if (warning) body.append(warning);
     }
     // 只换助手的输出：用户自己打的 emoji 是他输入的内容，不该被我们改写。
@@ -3166,7 +3330,7 @@
     if (!editor) return;
     editingBubbleMessageId = message.id;
     editingBubbleTaskId = node?.id || null;
-    editingBubbleDraft = message.content || '';
+    editingBubbleDraft = message.displayContent ?? message.content ?? '';
     editingBubbleMode = mode === 'resend' ? 'resend' : 'inPlace';
     elements.messageEditorTitle.textContent = mode === 'resend' ? t('chat.editResend') : t('chat.editMessage');
     elements.messageEditorHint.textContent = mode === 'resend' ? t('chat.editResendHint') : t('chat.editMessageKeys');
@@ -3505,9 +3669,13 @@
     const fallback = attachment.thumbnailDataUrl;
     if (fallback) imageFallbacks.set(image, fallback);
     /*
-     * `recovery` 记的是「已经试到第几级」：first → host-retried → thumb。
+     * `recovery` 记的是「已经试到第几级」：first → waiting-host → bytes → thumb。
      * 关键点：宿主回地址时**不能**把它重置回 first，否则第二次失败又会去问宿主，
-     * 无限循环，永远走不到缩略图那一级（第一版就是这么错的，守护脚本当场抓到）。
+     * 无限循环，永远走不到下一级（第一版就是这么错的，守护脚本当场抓到）。
+     *
+     * `bytes` 这一级是 2026-11-25 加的：资源协议（`asWebviewUri`）在某些设备上会被
+     * 拦掉（用户实况：贴进群和团队任务的图片都只剩占位），那时只有「让宿主把字节
+     * 直接发过来、用 data URL 显示」是稳的。
      */
     image.dataset.recovery = 'first';
     image.addEventListener('error', () => {
@@ -3517,18 +3685,39 @@
         post('resolveAttachmentSrc', { attachmentId: id });
         return;
       }
-      if (stage === 'thumb' || stage === 'waiting-host') {
-        if (stage === 'waiting-host') image.dataset.recovery = 'host-retried';
-        if (stage === 'thumb') return;
+      if (stage === 'waiting-host') {
+        image.dataset.recovery = 'bytes';
+        void recoverWithBytes(image, attachment);
+        return;
       }
-      post('imageLoadFailed', { src: image.getAttribute('src') || '', label: attachment.label || '' });
-      const current = image.getAttribute('src') || '';
-      if (fallback && current !== fallback) {
-        image.dataset.recovery = 'thumb';
-        image.src = fallback;
-        image.classList.add('image-is-thumbnail');
+      if (stage === 'bytes-ok' || stage === 'thumb') {
+        post('imageLoadFailed', { src: image.getAttribute('src') || '', label: attachment.label || '' });
+        return;
       }
+      applyThumbnail(image, attachment);
     });
+  }
+
+  /** 第三级兜底：向宿主直接要字节，用 data URL 显示（不依赖资源协议）。 */
+  async function recoverWithBytes(image, attachment) {
+    const data = attachment.id ? await requestAttachmentData(attachment.id) : null;
+    if (data && data.dataBase64) {
+      image.dataset.recovery = 'bytes-ok';
+      image.src = `data:${data.mimeType || attachment.mimeType || 'image/png'};base64,${data.dataBase64}`;
+      return;
+    }
+    applyThumbnail(image, attachment);
+  }
+
+  function applyThumbnail(image, attachment) {
+    image.dataset.recovery = 'thumb';
+    const fallback = attachment.thumbnailDataUrl || imageFallbacks.get(image);
+    if (fallback && image.getAttribute('src') !== fallback) {
+      image.src = fallback;
+      image.classList.add('image-is-thumbnail');
+      return;
+    }
+    post('imageLoadFailed', { src: image.getAttribute('src') || '', label: attachment.label || '' });
   }
 
   /** 宿主重新解析后送回来的地址：换上去，顺带清掉失败状态。 */
@@ -3567,8 +3756,15 @@
       if (attachment.kind === 'image' && imageSrc) {
         const figure = document.createElement('figure'); figure.className = 'message-image-attachment';
         if (attachment.id) figure.dataset.attachmentId = attachment.id;
-        const image = document.createElement('img'); image.src = imageSrc; image.alt = attachment.label;
+        const image = document.createElement('img'); image.alt = attachment.label;
+        /*
+         * 监听要先挂上，再设 `src`。
+         *
+         * 反过来的顺序有个真实风险：地址失效时 `error` 可能在监听器挂上之前就派发，
+         * 于是三级兜底（宿主重解析 → 字节 → 缩略图）一次都跑不到，界面就只剩一个破图。
+         */
         attachImageRecovery(image, attachment);
+        image.src = imageSrc;
         // 图片可以拖回输入框变成新附件：`img` 默认就是可拖的（浏览器会拖出图片本身），
         // 但那样松手只能落到「拖出 webview」，落不进输入框。关掉原生拖拽、改由 figure
         // 承担，才能走我们自己的 dragstart/drop 通道（见 makeAttachmentDraggable）。
@@ -3771,7 +3967,13 @@
     if (running && tool.stallHint) detail.append(textElement('p', 'tool-stall', tool.stallHint));
     if (tool.changedFiles?.length) detail.append(textElement('div', 'tool-files', t('chat.toolFiles', { files: tool.changedFiles.join(t('common.listSeparator')) })));
     if (tool.input) detail.append(detailBlock(t('chat.toolInput'), tool.input, tool.risk === 'command' ? commandText(tool.input) : undefined));
-    if (tool.output) detail.append(detailBlock(t('chat.toolOutput'), tool.output));
+    if (tool.output) {
+      detail.append(detailBlock(t('chat.toolOutput'), tool.output));
+      // 说明「这里只是预览」：否则用户会以为命令真的只输出了这么点。
+      if (tool.outputTruncated) {
+        detail.append(textElement('p', 'tool-cleaned', t('chat.toolOutputTruncated', { total: formatBytes(tool.outputTotal || 0) })));
+      }
+    }
     if (!tool.input && !tool.output) detail.append(textElement('p', 'tool-cleaned', tool.finishedAt ? t('chat.toolCleaned') : t('chat.toolWaiting')));
   }
 
@@ -4775,8 +4977,26 @@
     elements.voiceButton.disabled = archived;
     elements.detachHistoryButton.disabled = state.streaming || archived;
     elements.promptInput.placeholder = archived ? t('chat.promptPlaceholderArchived') : state.streaming ? t('chat.promptPlaceholderStreaming') : t('chat.promptPlaceholderAgent');
+    updateTeamTaskStop();
     syncPermissionHint();
     syncNextSendHints();
+  }
+
+  /**
+   * 团队任务状态条上的「停止执行」：**只在真的在跑的时候**是红色闪动的，空闲时是灰色且点不动。
+   *
+   * 用户 2026-11-25：「只有在运行的时候显示闪动的红色，没运行的时候显示成灰色，且不可点击」。
+   * 以前它直接借用输入框那颗 `.stop-button` 的样式，红色呼吸一直在闪 —— 看起来永远有活可停，
+   * 点下去却什么都不发生（没在跑，`stop` 没人接）。
+   */
+  function updateTeamTaskStop() {
+    const button = document.getElementById('teamTaskStop');
+    if (!button) return;
+    const running = Boolean(state.streaming);
+    button.disabled = !running;
+    button.classList.toggle('team-stop-running', running);
+    button.title = running ? t('chat.stop') : t('teamTask.stopIdle');
+    button.setAttribute('aria-disabled', running ? 'false' : 'true');
   }
 
   function autoResize() { elements.promptInput.style.height = 'auto'; elements.promptInput.style.height = `${Math.min(elements.promptInput.scrollHeight, 180)}px`; updateComposerState(); }
@@ -5474,36 +5694,94 @@
     }
   }
 
-  function startVoiceRecognition() {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      showToast(t('chat.noSpeechRecognition'), 'warning');
+  /**
+   * 语音识别结果：**整段重发**，所以先撤掉上一次插入的那段再插新的。
+   *
+   * 听写在 VS Code 里是实时的，每识别出几个字就送来整句；直接 append 会把
+   * 同一句话重复十几遍（这正是「录音输入」与「一次性识别」的区别）。
+   */
+  let voiceInserted = '';
+  /*
+   * 麦克风按钮周围那圈「安装 VS Code Speech」的进度环。
+   *
+   * 用户 2026-11-25：安装时「录音图标周围显示一圈绿色的圆圈安装进度条」，
+   * 装好后「闭环 + 绿色亮 3 秒然后消失」（一次性特效）。
+   * 用 SVG 环而不是 border：不改变按钮尺寸也能画出精确的进度弧。
+   */
+  let voiceRing = null;
+  let voiceRingTimer = null;
+
+  function ensureVoiceRing() {
+    if (voiceRing && voiceRing.isConnected) return voiceRing;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', 'voice-ring');
+    svg.setAttribute('viewBox', '0 0 100 100');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    svg.setAttribute('aria-hidden', 'true');
+    for (const name of ['track', 'bar']) {
+      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      circle.setAttribute('class', name);
+      circle.setAttribute('cx', '50');
+      circle.setAttribute('cy', '50');
+      circle.setAttribute('r', '46');
+      if (name === 'bar') circle.setAttribute('pathLength', '100');
+      svg.appendChild(circle);
+    }
+    elements.voiceButton.classList.add('has-ring');
+    elements.voiceButton.appendChild(svg);
+    voiceRing = svg;
+    return svg;
+  }
+
+  function paintVoiceRing(phase) {
+    if (!elements.voiceButton) return;
+    if (voiceRingTimer) { clearTimeout(voiceRingTimer); voiceRingTimer = null; }
+    if (phase === 'failed') {
+      if (voiceRing && voiceRing.isConnected) voiceRing.remove();
+      elements.voiceButton.classList.remove('has-ring');
+      voiceRing = null;
       return;
     }
-    if (state.voiceRecognition) {
-      state.voiceRecognition.stop();
+    const svg = ensureVoiceRing();
+    svg.classList.remove('installing', 'ready');
+    if (phase === 'installing') {
+      // 进度不可知（VS Code 不提供下载百分比），先跑到 88% 等完成信号。
+      svg.classList.add('installing');
       return;
     }
-    const recognition = new SpeechRecognition();
-    state.voiceRecognition = recognition; state.voiceActive = true;
-    recognition.lang = navigator.language || 'zh-CN'; recognition.interimResults = true; recognition.continuous = false;
-    const original = elements.promptInput.value;
-    recognition.onresult = (event) => {
-      let finalTranscript = '';
-      let interimTranscript = '';
-      for (let index = 0; index < event.results.length; index += 1) {
-        const value = event.results[index][0]?.transcript || '';
-        if (event.results[index].isFinal) finalTranscript += value;
-        else interimTranscript += value;
-      }
-      const transcript = `${finalTranscript}${interimTranscript}`;
-      elements.promptInput.value = `${original}${original && transcript ? ' ' : ''}${transcript}`;
-      autoResize();
-    };
-    recognition.onerror = (event) => showToast(t('chat.speechFailed', { error: event.error || t('common.unknown') }), 'warning');
-    recognition.onend = () => { state.voiceRecognition = null; state.voiceActive = false; elements.voiceButton.classList.remove('active'); updateComposerState(); };
-    elements.voiceButton.classList.add('active');
-    try { recognition.start(); } catch (error) { recognition.onend(); showToast(t('chat.speechStartFailed', { error: error?.message || error }), 'warning'); }
+    svg.classList.add('ready');
+    voiceRingTimer = setTimeout(() => {
+      if (voiceRing && voiceRing.isConnected) voiceRing.remove();
+      elements.voiceButton.classList.remove('has-ring');
+      voiceRing = null;
+    }, 3_000);
+  }
+
+  /** 录音时把话筒图标换成一排跳动的音波条（懒创建，只建一次）。 */
+  function ensureVoiceBars() {
+    const button = elements.voiceButton;
+    if (!button || button.querySelector('.voice-bars')) return;
+    const bars = document.createElement('span');
+    bars.className = 'voice-bars';
+    bars.setAttribute('aria-hidden', 'true');
+    for (let index = 0; index < 5; index += 1) bars.appendChild(document.createElement('i'));
+    button.appendChild(bars);
+  }
+
+  function applyVoiceText(text, live) {
+    const clean = String(text || '').trim();
+    if (!clean) return;
+    let base = elements.promptInput.value;
+    if (voiceInserted) {
+      if (base.endsWith(voiceInserted)) base = base.slice(0, base.length - voiceInserted.length);
+      else base = base.split(voiceInserted).join('');
+    }
+    const trimmed = base.replace(/\s+$/, '');
+    elements.promptInput.value = trimmed ? `${trimmed} ${clean}` : clean;
+    // 语音这一段已结束：之后用户自己改字，不再被下一次识别结果当「上次插入」删掉。
+    voiceInserted = clean;
+    autoResize();
+    elements.promptInput.focus();
     updateComposerState();
   }
 
@@ -5592,7 +5870,13 @@
          */
         if (optimisticMessages.length) {
           const stored = state.messages.filter((item) => !item.optimistic && item.role === 'user');
-          optimisticMessages = optimisticMessages.filter((item) => !stored.some((real) => real.content === item.content));
+          /*
+           * 比对**显示文本**：群里的需求落库时 `content` 是整段协议提示词，
+           * 用户看到的是 `displayContent`。拿 `content` 比会永远不相等，
+           * 于是乐观气泡永不退场 —— 同一条消息看起来发了两遍。
+           */
+          const shownText = (item) => item.displayContent ?? item.content ?? '';
+          optimisticMessages = optimisticMessages.filter((item) => !stored.some((real) => shownText(real) === item.content));
           if (sendAwaitingHost && !switchedConversation) {
             for (const item of optimisticMessages) state.messages.push(item);
           } else {
@@ -5797,7 +6081,21 @@
       case 'todos': if (message.conversationId && message.conversationId !== state.conversation?.id) break; state.todos = Array.isArray(message.todos) ? message.todos : []; state.todosInterrupted = Boolean(message.interrupted); state.todosIncomplete = Boolean(message.incomplete); renderTodos(); break;
       case 'fileReferencesVerified': applyFileReferenceVerification(message); break;
       case 'todoArchives': if (message.conversationId && message.conversationId !== state.conversation?.id) break; state.todoArchives = Array.isArray(message.todoArchives) ? message.todoArchives : []; renderArchivePanel(); renderTodoArchives(); break;
-      case 'voiceInputAllowed': startVoiceRecognition(); break;
+      case 'voiceText': applyVoiceText(message.text, message.live !== false); break;
+      /*
+       * 录音中：话筒图标换成一排跳动的音波条（用户 2026-11-25 指定：
+       * 圆角竖条、绿→蓝渐变，像实时音量）。关掉时恢复话筒图标，
+       * 同时停止跟踪上一段语音文字（之后用户改字不该再被删掉）。
+       */
+      case 'voiceState':
+        if (message.active) ensureVoiceBars();
+        elements.voiceButton.classList.toggle('voice-recording', Boolean(message.active));
+        if (!message.active) voiceInserted = '';
+        break;
+      // 装 VS Code Speech 的进度圈：installing → ready（闭环 + 亮 3 秒）→ 自动消失。
+      case 'voiceSetup': paintVoiceRing(message.phase); break;
+      // 系统听写（Win+H / Fn 两下）会把文字打进**有焦点**的输入框，所以要能主动聚焦。
+      case 'focusComposer': elements.promptInput.focus(); break;
       // 扩展要一份布局诊断（面板「右边被切 / 显示不全」时用来取证）。
       case 'layoutReportRequest': post('layoutReport', { report: collectLayoutReport() }); break;
       case 'clipboardWriteResult': finishClipboardWrite(message.requestId, Boolean(message.ok), message.error); break;
@@ -5829,5 +6127,19 @@
     return `${millions.toFixed(digits)}M`;
   }
 
+  /*
+   * 启动成功：把「界面没有加载成功」的兜底层收起来。
+   *
+   * 它是不依赖外部脚本的静态提示（见 chatPanel 里的 #bootFallback）：
+   * 脚本跑起来了就必然被移除；脚本挂了它才留在屏幕上，用户才知道该运行哪条命令。
+   */
+  document.getElementById('bootFallback')?.remove();
+  /*
+   * 心跳：告诉宿主「我还活着」。
+   *
+   * 白屏最狠的一种形态是渲染进程死了 —— 那块 iframe 会被 VS Code 留着，但不再执行任何
+   * 脚本、也不会再被重建。宿主靠这条心跳发现「它不吭声了」，然后重新赋 HTML 把它救回来。
+   */
+  setInterval(() => { try { post('heartbeat'); } catch { /* 通道没了就算了 */ } }, 5000);
   autoResize(); post('ready');
 })();

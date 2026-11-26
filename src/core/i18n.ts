@@ -89,6 +89,8 @@ const DICTIONARY: Record<string, Entry> = {
   'chat.attachFromMessageHint': { zh: '把这张图再放一份到输入框，作为新一轮的附件发出（也可以直接把图片拖进输入框）', en: 'Put another copy of this image in the composer as an attachment for a new message (you can also drag the image into the composer)' },
   'chat.copiedWithImage': { zh: '已复制文字和图片，可以直接粘贴到输入框', en: 'Copied text and image — paste it straight into the composer' },
   'chat.copyImageFirstOnly': { zh: '剪贴板一次只能放一张图片：已复制文字和第一张图', en: 'The clipboard holds one image at a time — copied the text plus the first image' },
+  'chat.copyAllDone': { zh: '已复制文字 + 全部附件（{images} 张图片、{files} 个附件）', en: 'Copied the text and every attachment ({images} images, {files} attachments)' },
+  'chat.copiedWithManifest': { zh: '已复制文字和附件清单（名称 + 路径）', en: 'Copied the text plus an attachment list (name and path)' },
   'chat.copyImageUnsupported': { zh: '这个环境没能把图片写进剪贴板，只复制了文字（可以用图片上的「添加到输入框」把图放进输入框）', en: 'This environment refused the image write, so only the text was copied (use “Add to composer” on the image to bring it in)' },
   /* 文件引用（正文里被提到的文件）。
      「文件管理器」的名字随平台变：macOS 是 Finder，Windows 是资源管理器，
@@ -350,7 +352,7 @@ const DICTIONARY: Record<string, Entry> = {
   'chat.taskStatus.cancelled': { zh: '已取消', en: 'Cancelled' },
   'chat.taskStatus.error': { zh: '失败', en: 'Failed' },
   'chat.you': { zh: '你', en: 'You' },
-  'chat.copyMessage': { zh: '复制这条消息', en: 'Copy this message' },
+  'chat.copyMessage': { zh: '复制这条消息（含全部附件）', en: 'Copy this message with all its attachments' },
   'chat.expandMessage': { zh: '展开全文', en: 'Show full message' },
   'chat.collapseMessage': { zh: '收起', en: 'Collapse' },
   'chat.expandMessageHint': {
@@ -447,6 +449,10 @@ const DICTIONARY: Record<string, Entry> = {
   'chat.toolFiles': { zh: '文件：{files}', en: 'Files: {files}' },
   'chat.toolInput': { zh: '提交内容', en: 'Input' },
   'chat.toolOutput': { zh: '返回结果', en: 'Result' },
+  'chat.toolOutputTruncated': {
+    zh: '（界面只显示前 4,000 字预览，完整输出共 {total}，存档里是全文）',
+    en: '(Showing the first 4,000 characters; the full {total} output is kept in history)',
+  },
   'chat.toolCleaned': { zh: '详细缓存已按保留策略清理，摘要仍保留。', en: 'Detailed cache was trimmed by the retention policy; the summary is kept.' },
   'chat.toolWaiting': { zh: '正在等待结果…', en: 'Waiting for the result…' },
   'chat.toolRunningSeconds': { zh: '已运行 {seconds} 秒', en: 'running {seconds}s' },
@@ -493,8 +499,8 @@ const DICTIONARY: Record<string, Entry> = {
   'chat.pastedFile': { zh: '粘贴的文件', en: 'Pasted file' },
   'chat.clipboardReadFailed': { zh: '读取剪贴板附件失败：{error}', en: 'Failed to read the clipboard attachment: {error}' },
   'chat.noSpeechRecognition': {
-    zh: '当前 VS Code/Webview 不提供语音识别。请启用系统听写或使用支持语音识别的 VS Code 版本。',
-    en: 'This VS Code build does not expose speech recognition to the webview. Enable system dictation or use a VS Code version that supports it.',
+    zh: '网页里取不到麦克风权限。请换用 Edge / Chrome / Safari，或直接用系统听写（Windows：Win+H；macOS：连按两下麦克风键）。',
+    en: 'The browser page was denied the microphone. Use Edge / Chrome / Safari, or system dictation (Windows: Win+H; macOS: press the microphone key twice).',
   },
   'chat.speechFailed': { zh: '语音输入失败：{error}', en: 'Voice input failed: {error}' },
   'chat.speechStartFailed': { zh: '无法开始语音输入：{error}', en: 'Could not start voice input: {error}' },
@@ -571,6 +577,48 @@ const DICTIONARY: Record<string, Entry> = {
     en: 'HWChat only receives the transcribed text; it never stores audio or writes it into the conversation cache. Speech recognition itself is provided by the VS Code webview and your system browser, which may process audio according to your OS settings. Transcribed text is only sent to the API after you press send.',
   },
   'notice.voiceAllow': { zh: '允许语音输入', en: 'Allow voice input' },
+  'notice.voiceBrowserOpened': {
+    zh: '已在浏览器里打开语音页：在那里点麦克风说话，说完点「发送到 VS Code」，文字会出现在输入框里。',
+    en: 'The voice page opened in your browser: tap the microphone, speak, then press “Send to VS Code” — the text appears in the input box.',
+  },
+  'notice.voiceDictationStarted': {
+    zh: '开始录音：直接说话，文字会实时出现在输入框里。说完点状态栏的「正在听写…」结束（或按 Ctrl+Alt+V）。',
+    en: 'Listening: speak and the text appears in the input box as you go. Press the “Listening…” status bar item when done (or Ctrl+Alt+V).',
+  },
+  'notice.voiceDictationFailed': {
+    zh: '没能在 VS Code 里开始录音（VS Code Speech 扩展没起来）。已改用浏览器语音页。',
+    en: 'Could not start in-editor dictation (the VS Code Speech extension did not start). Using the browser voice page instead.',
+  },
+  'notice.voiceNativeStarted': {
+    zh: '开始录音：直接说话，文字会实时出现在输入框里。说完再点一次麦克风（或点状态栏「正在录音…」）结束。',
+    en: 'Recording: speak and the text appears in the input box as you go. Tap the microphone again (or the “Recording…” status bar item) to stop.',
+  },
+  'notice.voiceNativeFailed': {
+    zh: '没能启动本机识别（{reason}）。换一条路试试。',
+    en: 'Could not start local recognition ({reason}). Trying another route.',
+  },
+  'notice.voiceNativeUnavailable': {
+    zh: '这台机器没有可用的本机离线识别器（设置里把 hwchat.voiceEngine 改回 auto 可用 VS Code Speech）。已改用其它方式。',
+    en: 'This machine has no built-in offline recognizer (set hwchat.voiceEngine back to auto to use VS Code Speech). Switching to another route.',
+  },
+  'notice.voiceInstallTitle': {
+    zh: '录音输入需要 VS Code Speech（微软官方，离线、免费）',
+    en: 'Voice input needs VS Code Speech (Microsoft, offline and free)',
+  },
+  'notice.voiceInstallDetail': {
+    zh: '装上以后点麦克风就能直接在 VS Code 里说话，识别质量与 Copilot Chat 相同；不联网、不收费、不需要账号。安装只要几秒。',
+    en: 'Once installed, the microphone records right inside VS Code with the same recognition quality as Copilot Chat — offline, free, no account needed. Installation takes a few seconds.',
+  },
+  'notice.voiceInstallAccept': { zh: '安装并开始录音', en: 'Install and start' },
+  'notice.voiceInstallDecline': { zh: '暂不安装', en: 'Not now' },
+  'notice.voiceInstallFailed': {
+    zh: '没能装上 VS Code Speech（可能被网络或扩展市场策略拦住）。已改用其它录音方式。',
+    en: 'Could not install VS Code Speech (network or marketplace policy). Falling back to another recording method.',
+  },
+  'notice.voiceBrowserFailed': {
+    zh: '没能打开浏览器。可以改用系统听写：Windows 按 Win+H；macOS 连按两下麦克风键。',
+    en: 'Could not open the browser. Use system dictation instead: Win+H on Windows, or press the microphone key twice on macOS.',
+  },
   'notice.permissionTitle': { zh: '确认更改 Agent 权限预设？', en: 'Change the agent permission preset?' },
   'notice.permissionFull': {
     zh: 'Agent 将可在受信任工作区内自动读写、移动和删除文件，自动运行只读、正常和危险命令（含提权、破坏性删除、推送远端等），读取 .env、密钥、证书等敏感文件时仍会逐次确认。工作区外路径仍被禁止。',
@@ -641,6 +689,35 @@ const DICTIONARY: Record<string, Entry> = {
   },
   'settings.collab.startGroup': { zh: '启动群聊', en: 'Start group' },
   'settings.collab.joinGroup': { zh: '加入群聊', en: 'Join group' },
+  'settings.collab.relayCreate': { zh: '新建跨网频道', en: 'New cross-network channel' },
+  'settings.collab.relayJoin': { zh: '加入跨网频道', en: 'Join cross-network channel' },
+  'settings.collab.relayStatus': { zh: '跨网状态', en: 'Cross-network status' },
+  'settings.collab.netLanTitle': { zh: '同一局域网（默认，开箱即用）', en: 'Same LAN (default, works out of the box)' },
+  'settings.collab.netLan1': {
+    zh: '两台电脑接同一个路由器 / 同一个 WiFi，或用其中一台开热点。不需要公网 IP，也不上传任何数据到服务器。',
+    en: 'Both computers on the same router / Wi-Fi, or one of them sharing a hotspot. No public IP needed, nothing is uploaded to a server.',
+  },
+  'settings.collab.netLan2': {
+    zh: '端口必须一致（默认 47821，TCP 直连 + UDP 发现）；被占用或要过公司防火墙时在设置里改成别的端口，两边同时改。',
+    en: 'The port must match on both sides (default 47821: TCP connections + UDP discovery). If it is taken or blocked by a corporate firewall, change it in settings on both machines.',
+  },
+  'settings.collab.netLan3': {
+    zh: '连不上先看这三种情况：WiFi 开了「AP 隔离」（酒店 / 公司访客网络常见）、其中一台挂着公司 VPN、两台不在同一网段。命令面板「诊断局域网连接」会逐项告诉你卡在哪。',
+    en: 'When it will not connect, check three things first: the Wi-Fi has "AP isolation" on (common on hotel/corporate guest networks), one machine is on a corporate VPN, or the two are on different subnets. Run "Diagnose LAN connection" in the command palette to see exactly which step fails.',
+  },
+  'settings.collab.netWideTitle': { zh: '跨网络（不同 WiFi / 4G，走中继）', en: 'Different networks (different Wi-Fi / mobile data, via relay)' },
+  'settings.collab.netWide1': {
+    zh: '不在同一个网络也能协作：两边各自连到中继服务器（默认 plaitcode.com），由它转发加密后的消息，不需要公网 IP、不用配端口转发。',
+    en: 'Collaboration works across networks: both sides connect out to a relay server (plaitcode.com by default) which forwards end-to-end encrypted messages — no public IP, no port forwarding.',
+  },
+  'settings.collab.netWide2': {
+    zh: '步骤：这台点「新建跨网频道」→ 把配对信息发给另一台 → 那台点「加入跨网频道」粘贴进来。手机用「手机加入团队群（二维码）」也能跨网进入。',
+    en: 'Steps: click "New cross-network channel" here, send the pairing info to the other machine, and it clicks "Join cross-network channel" to paste it. A phone can also join across networks via "Phone joins team group (QR)".',
+  },
+  'settings.collab.netWide3': {
+    zh: '代价：依赖中继的可用性与带宽（首字节比局域网慢）；企业内网可把 「协作服务地址」改成自建中继。局域网和跨网可以同时开着，谁通就走谁。',
+    en: 'Trade-offs: it depends on the relay being reachable and on its bandwidth (first byte is slower than LAN); inside a corporate network you can point "Collaboration service URL" at your own relay. LAN and relay can both be on — whichever path works is used.',
+  },
   'settings.collab.connect': { zh: '连接另一台设备', en: 'Connect another device' },
   'settings.collab.group': { zh: '打开团队群', en: 'Open team group' },
   'settings.collab.mobile': { zh: '手机遥控（扫码）', en: 'Phone control (QR)' },
@@ -651,6 +728,7 @@ const DICTIONARY: Record<string, Entry> = {
   'sync.groupChatTitle': { zh: '团队群', en: 'Team group' },
   'sync.teamTaskTitle': { zh: '团队任务', en: 'Team task' },
   'teamTask.stopLabel': { zh: '停止执行', en: 'Stop' },
+  'teamTask.stopIdle': { zh: '现在没有在运行，没有可停的任务', en: 'Nothing is running, so there is nothing to stop' },
   'sync.teamTaskReadOnly': {
     zh: '「团队任务」窗口只负责执行：指令请在团队群发。',
     en: 'The "Team task" window only executes work — send instructions in the team group.',
@@ -929,6 +1007,12 @@ const DICTIONARY: Record<string, Entry> = {
   'ext.exported': { zh: 'HWChat 对话记录已导出。', en: 'HWChat conversation history exported.' },
   'ext.layoutReportCopied': { zh: '布局诊断已复制到剪贴板，可以直接贴给开发者', en: 'Layout report copied to the clipboard — paste it wherever you need' },
   'ext.reportLayout': { zh: '复制布局诊断', en: 'Copy layout report' },
+  'ext.reloadUiDone': { zh: '已重新加载界面：对话框 {chat}，设置页 {settings}。（未打开的窗口不重建）', en: 'UI reloaded: chat panel {chat}, settings {settings}. (Panels that were not open were left alone.)' },
+  'ext.reloadUiPanelChat': { zh: '已重建', en: 'rebuilt' },
+  'ext.reloadUiPanelSettings': { zh: '已重建', en: 'rebuilt' },
+  'ext.reloadUiPanelNone': { zh: '未打开', en: 'not open' },
+  'ext.autonomyOn': { zh: '自主迭代模式已开启：两台 agent 把方案谈成后直接开工，不再等你确认。随时可以在设置里关掉。', en: 'Autonomous iteration is on: the agents will start as soon as they agree on a plan, without waiting for your confirmation. You can turn it off in settings at any time.' },
+  'ext.autonomyOff': { zh: '自主迭代模式已关闭：方案谈完会停下来等你确认。', en: 'Autonomous iteration is off: after agreeing on a plan the agents will wait for your confirmation.' },
   'ext.exportAllLabel': { zh: '导出全部对话', en: 'Export all conversations' },
 
   // 内置工具：描述与参数说明（会作为工具定义发给模型）
@@ -949,6 +1033,8 @@ const DICTIONARY: Record<string, Entry> = {
   'tool.renameFile.description': { zh: '重命名或移动工作区内的单个文件。', en: 'Rename or move a single file inside the workspace.' },
   'tool.deleteFile.description': { zh: '将工作区内的单个文件移到系统废纸篓。不能删除目录。', en: 'Move a single workspace file to the system trash. Directories cannot be deleted.' },
   'tool.playbookBlocked': { zh: '本轮任务类型已指定首选工具', en: 'This task type has a prescribed tool' },
+  'tool.planGateBlocked': { zh: '方案还没定，先别改文件', en: 'Plan not agreed yet — no file changes' },
+  'tool.teamSyncNotInGroup': { zh: '这是普通对话，没有团队群通道；内容不会发进团队群。要跟群里说话请到团队群窗口。', en: 'This is an ordinary chat with no team-group channel; nothing is posted to the team group. Use the team group window to talk to the group.' },
   'tool.runCommand.backgroundParam': { zh: '设为 true 表示这是常驻命令（静态服务器、watch、监听端口等）。宿主会立刻返回，并给出后台 id；进程不会自己结束，也不该用超时去等它。', en: 'Set to true for a long-running command (static server, watcher, port listener). The host returns immediately with a background id; the process never exits on its own, so do not wait on it with a timeout.' },
   'tool.runCommand.autoBackground': { zh: '这是常驻服务命令（{category}），宿主已自动转入后台：前台运行会在超时后被整组杀掉，端口反而空着。', en: 'This is a long-running server command ({category}); the host moved it to the background automatically. Run in the foreground it would be killed with its process group on timeout, leaving the port empty.' },
   'tool.runCommand.autoBackgroundStarted': { zh: '已在后台启动（自动：常驻服务命令，pid {pid}）', en: 'Started in the background (auto: long-running server, pid {pid})' },
@@ -1078,7 +1164,7 @@ const DICTIONARY: Record<string, Entry> = {
   'tool.runCommand.ignoredErrorExit': { zh: '（退出码 {code}：命令里写了 `-ErrorAction SilentlyContinue`，被忽略的错误仍会让 PowerShell 返回 1。上面的输出是完整的，可照常使用。）', en: '(Exit code {code}: the command used `-ErrorAction SilentlyContinue`, and an ignored error still makes PowerShell return 1. The output above is complete and usable.)' },  'tool.runCommand.powerShellCmdlet': { zh: '`{name}` 是 **PowerShell 的 cmdlet**，cmd.exe 里不存在。这条命令仍由 cmd 执行，原因是它同时用了 cmd 专属写法（`&` / `&&` / `||` 串联，或 `%变量%` 展开）—— 那套 PowerShell 不认，两种 shell 混写怎么都不对。改法二选一：① 全用 cmd 的写法（`findstr` 代替 `Select-String`、`find /c /v ""` 代替 `Measure-Object`）；② 整条都改用 PowerShell 语法（用 `;` 串联、不用 `%变量%`），执行器会自动交给 PowerShell。', en: '`{name}` is a **PowerShell cmdlet**; cmd.exe does not have it. This command still ran under cmd because it also uses cmd-only syntax (`&` / `&&` / `||` chaining, or `%VAR%` expansion), and PowerShell does not understand those — mixing the two can never work. Either rewrite it entirely with cmd tools (`findstr` instead of `Select-String`, `find /c /v ""` instead of `Measure-Object`), or rewrite it entirely as PowerShell (`;` chaining, no `%VAR%`) and it will be routed to PowerShell automatically.' },
   'tool.runCommand.cdStripped': { zh: '已去掉多余的 `cd "{dir}"`：当前工作目录本来就是 `{cwd}`，那条 cd 会去找它下面的同名子目录（必然失败）。下面执行的是去掉它之后的命令。', en: 'Dropped the redundant `cd "{dir}"`: the working directory is already `{cwd}`, so that cd looked for a same-named subdirectory inside it (which cannot exist). The command below is what actually ran.' },
   'tool.runCommand.timeoutClampedShort': { zh: '（要求 {requested} 秒，上限 {effective} 秒）', en: ' (asked {requested}s, capped at {effective}s)' },
-  'tool.runCommand.timeoutAdvice': { zh: '超时是宿主按上限 {seconds} 秒打断的，不是命令自己失败。这类耗时构建/测试这样跑：\n1. 让用户把设置 `{setting}` 调大（上限 {max} 秒）；\n2. 或者后台跑并把输出写进工作区内的日志，再分段读：先 `run_command {"command":"<原命令> > tmp/build.log 2>&1","cwd":"<项目根>","background":true}`，然后反复 `run_command {"command":"tail -n 60 tmp/build.log"}` 看进度。\n不要用 `| tail -40` 包住长构建：它会缓冲全部输出，超时后只能拿到空结果；也不要「等一会儿再试」——上限没变，重试一定同样超时。', en: 'The host stopped this at the {seconds}s cap; the command itself did not fail. For long builds/tests: (1) ask the user to raise `{setting}` (max {max}s), or (2) run it in the background with output going to a log inside the workspace — `run_command {"command":"<command> > tmp/build.log 2>&1","cwd":"<project root>","background":true}` — then poll with `run_command {"command":"tail -n 60 tmp/build.log"}`. Never wrap a long build in `| tail -40`: it buffers everything, so a timeout leaves you with no output; and retrying later cannot help, the cap has not changed.' },
+  'tool.runCommand.timeoutAdvice': { zh: '超时是宿主按上限 {seconds} 秒打断的，不是命令自己失败。这类耗时构建/测试这样跑：\n1. 让用户把设置 `{setting}` 调大（上限 {max} 秒）；\n2. 或者后台跑并把输出写进工作区内的日志，再分段读：先 `run_command {"command":"{prepare}<原命令> > {log} 2>&1","cwd":"<项目根>","background":true}`，然后用 `run_command {"command":"{poll}"}` 看进度——**先等再读**，别连续重复同一条读取命令（内容没变时会被空转守卫拦下）。\n不要用 `| tail -40` 包住长构建：它会缓冲全部输出，超时后只能拿到空结果；也不要「等一会儿再试」——上限没变，重试一定同样超时。', en: 'The host stopped this at the {seconds}s cap; the command itself did not fail. For long builds/tests: (1) ask the user to raise `{setting}` (max {max}s), or (2) run it in the background with output going to a log inside the workspace — `run_command {"command":"{prepare}<command> > {log} 2>&1","cwd":"<project root>","background":true}` — then check progress with `run_command {"command":"{poll}"}`: wait first, then read, and do not repeat the identical read (an unchanged output trips the idle-loop guard). Never wrap a long build in `| tail -40`: it buffers everything, so a timeout leaves you with no output; and retrying later cannot help, the cap has not changed.' },
   'tool.noOutput': { zh: '(无输出)', en: '(no output)' },
   'tool.commandStallHint': { zh: '已 {seconds} 秒无输出，可能在等终端输入', en: 'No output for {seconds}s — may be waiting for terminal input' },
   'tool.commandTimeoutRunning': { zh: '已超时（{seconds} 秒），正在结束进程…', en: 'Timed out ({seconds}s) — stopping the process…' },

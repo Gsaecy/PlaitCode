@@ -160,12 +160,12 @@ test('裸文件名的判定：带目录、绝对路径、点目录都不算', ()
 });
 
 test('候选顺序：项目根在前，重复的根只出现一次', () => {
-  const candidates = referenceCandidatePaths('src/a.ts', [ROOT, ROOT, OTHER], ROOT);
+  const candidates = referenceCandidatePaths('src/a.ts', [ROOT, ROOT, OTHER], ROOT, 'darwin');
   assert.deepEqual(candidates, [`${ROOT}/src/a.ts`, `${OTHER}/src/a.ts`]);
 });
 
 test('候选顺序：没有项目根时按工作区根的顺序', () => {
-  const candidates = referenceCandidatePaths('./src/a.ts', [OTHER, ROOT]);
+  const candidates = referenceCandidatePaths('./src/a.ts', [OTHER, ROOT], undefined, 'darwin');
   assert.deepEqual(candidates, [`${OTHER}/src/a.ts`, `${ROOT}/src/a.ts`]);
 });
 

@@ -70,14 +70,35 @@ export function timeoutClampSummary(
  * 三条都是实测有效的做法；同时点名两个已知的坑：
  *  - `| tail -40` 会缓冲全部输出，超时后只能拿到空结果（用户那次就是「无输出」）；
  *  - 「等一会儿再试」是纯消耗 —— 上限不变，重试一定同样超时。
+ *
+ * 轮询命令必须**按平台**给（实测翻车）：在 Windows 上教模型 `tail -n 60`，
+ * 它照抄就是「'tail' 不是内部或外部命令」；接着换 `type` 又可能因为日志还没生成
+ * 而「系统找不到指定的文件」，一路撞到空转守卫为止。
+ * 另外轮询**不能连续重复同一条命令**：内容没变时第三次会被空转守卫拦下 ——
+ * 所以给的是一条「先等、再读」的组合命令，每次输出都会变。
  */
 export function timeoutAdvice(
   plan: EffectiveTimeout,
-  deps: { t: (key: string, values?: Record<string, string | number>) => string; settingKey: string; maxSeconds: number },
+  deps: {
+    t: (key: string, values?: Record<string, string | number>) => string;
+    settingKey: string;
+    maxSeconds: number;
+    /** 目标平台，默认本机。测试要能在任何机器上验两条分支。 */
+    platform?: NodeJS.Platform;
+  },
 ): string {
+  const windows = (deps.platform ?? process.platform) === 'win32';
+  const log = windows ? 'tmp\\build.log' : 'tmp/build.log';
+  const prepare = windows ? `if not exist tmp mkdir tmp & ` : 'mkdir -p tmp && ';
   return deps.t('tool.runCommand.timeoutAdvice', {
     seconds: Math.round(plan.effective),
     setting: deps.settingKey,
     max: deps.maxSeconds,
+    log,
+    prepare,
+    // 「先等 60 秒再读最后 60 行」：输出每次都会变，不会撞上空转守卫。
+    poll: windows
+      ? 'powershell -NoProfile -Command "Start-Sleep -Seconds 60; Get-Content tmp\\build.log -Tail 60"'
+      : 'sleep 60; tail -n 60 tmp/build.log',
   });
 }

@@ -590,7 +590,7 @@ test('工具执行期间发来的新消息：这批剩下的调用立刻跳过�
 /* ── 请求体总预算：超预算时从最旧的工具输出开始折（方案 A） ─────────────── */
 import { pruneToolPayloads, requestBytes } from '../agent/agentRunner';
 
-function toolPayload(index: number, bytes: number): ChatRequestMessage {
+function toolPayload(index: number, bytes: number, path?: string): ChatRequestMessage {
   return {
     role: 'tool',
     tool_call_id: `call-${index}`,
@@ -600,6 +600,7 @@ function toolPayload(index: number, bytes: number): ChatRequestMessage {
       summary: `读取第 ${index} 个文件`,
       result: 'x'.repeat(bytes),
       changedFiles: [`file-${index}.ts`],
+      ...(path ? { path } : {}),
     }),
   };
 }
@@ -689,4 +690,28 @@ test('钉住也有字节上限：大文件不会把预算吃光', () => {
   const budget = 100_000;
   pruneToolPayloads(messages, 1, budget);
   assert.ok(requestBytes(messages) <= budget, `超预算时必须能折到装得下，实际 ${requestBytes(messages)}`);
+});
+
+/**
+ * 硬折叠：一次运行动辄几百次工具调用，折叠后的「摘要」照样线性增长。
+ *
+ * 2026-11-26 实测：一条团队任务对话跑过 7165 次工具调用，其中单次运行 552 次调用 /
+ * 6934 万 prompt tokens。按原来的规则，每条折完仍留 summary + changedFiles + 一句说明
+ * （≈250 字节），552 条就是 138 KB —— 而且**每一轮都要重发一遍**。
+ */
+test('硬折叠：超过保留线的步骤只留一行状态，请求体不再随调用次数线性膨胀', () => {
+  const messages: ChatRequestMessage[] = [];
+  for (let index = 0; index < 60; index += 1) {
+    messages.push(toolPayload(index, 200, `src/file-${index}.ts`));
+    pruneToolPayloads(messages, 3);
+  }
+  const oldest = JSON.parse(toolContentAt(messages, 0)) as { hardFolded?: boolean; summary?: string; changedFiles?: string[] };
+  assert.equal(oldest.hardFolded, true, '最早那条必须已经被硬折叠');
+  assert.equal(oldest.summary, undefined, '硬折叠后不再留 summary（结论在任务树里）');
+  assert.equal(oldest.changedFiles, undefined, '硬折叠后不再留改动文件清单');
+
+  // 最近 24 步仍然保留结论，模型不会不知道自己刚才做了什么。
+  const recent = JSON.parse(toolContentAt(messages, messages.length - 1)) as { hardFolded?: boolean; summary?: string };
+  assert.notEqual(recent.hardFolded, true);
+  assert.match(String(recent.summary), /读取第 59 个文件/);
 });

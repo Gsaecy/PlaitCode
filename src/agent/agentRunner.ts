@@ -69,6 +69,17 @@ export const MAX_TOOL_CALLS_PER_ROUND = 12;
 export { MAX_TOOL_CALLS_PER_RUN } from '../core/agentLimits';
 /** 连续多少次「完全相同的工具调用」就判定为死循环。 */
 export const MAX_IDENTICAL_TOOL_CALLS = 3;
+/**
+ * 幂等的「读」类工具：同样的参数第二次拿到同样的结果，就已经证明「再读也不会有新信息」。
+ *
+ * 2026-11-26 实测：287 步里 267 次 `read_file`，全在同一个 145.9 KB 文件上按窗口来回读。
+ * 读文件不产生副作用，第二次重复拿到的字节完全一样 —— 没必要等到第三次才拦。
+ */
+const IDEMPOTENT_READ_TOOLS = new Set(['read_file', 'list_directory', 'list_files', 'get_diagnostics', 'search_files']);
+/** 这些工具连续几次拿到逐字节相同的结果就判为「已证明跑不出新东西」。 */
+function futileThresholdFor(toolName: string): number {
+  return IDEMPOTENT_READ_TOOLS.has(toolName) ? 2 : MAX_IDENTICAL_TOOL_CALLS;
+}
 /** 连续多少轮「所有工具都失败」就停下，不再让模型空转。 */
 export const MAX_FAILED_ROUNDS_WITHOUT_PROGRESS = 3;
 /**
@@ -150,7 +161,7 @@ export class ToolLoopGuard {
    */
   futile(call: ToolCall): boolean {
     const entry = this.outputs.get(callSignature(call));
-    return Boolean(entry && entry.same >= MAX_IDENTICAL_TOOL_CALLS);
+    return Boolean(entry && entry.same >= futileThresholdFor(call.function.name));
   }
 
   /** 记录一次真实执行的结果，供 `futile()` 判定。 */
@@ -863,6 +874,27 @@ import { DEFAULT_CONTEXT_TOKEN_BUDGET } from '../core/contextBudget';
 const TOOL_PAYLOAD_KEEP = 3;
 
 /**
+ * 硬折叠：过了保留线的工具载荷只留一行状态（结论在任务树里）。
+ * 返回 true 表示这次真的折了。
+ */
+function hardFoldToolPayloadAt(messages: ChatRequestMessage[], at: number): boolean {
+  const message = messages[at];
+  if (!message || typeof message.content !== 'string') return false;
+  let payload: { status?: string; hardFolded?: boolean };
+  try {
+    payload = JSON.parse(message.content) as typeof payload;
+  } catch {
+    return false;
+  }
+  if (payload.hardFolded) return false;
+  messages[at] = {
+    ...message,
+    content: JSON.stringify({ status: payload.status, hardFolded: true, folded: true, result: HARD_FOLD_MARK }),
+  };
+  return true;
+}
+
+/**
  * 折叠一条工具载荷（保留结论与改动文件，丢掉原文）。
  * 返回 true 表示这次真的折了。
  */
@@ -943,8 +975,27 @@ function payloadPathFor(name: string, rawArguments: string): string {
  * 真的超出总预算时才会把钉住的也折掉（最后一步兜底）。
  */
 const PINNED_PATHS = 4;
-/** 被钉住的载荷总字节上限：工作集可以留在上下文里，但不能把预算吃光。 */
-const MAX_PINNED_BYTES = 64 * 1024;
+/**
+ * 被钉住的载荷总字节上限：工作集可以留在上下文里，但不能把预算吃光。
+ *
+ * 2026-11-26 调整：64 KB → 200 KB。要放得下「一个 145.9 KB 的文件按 48 KB 窗口读的 4 段」
+ * （48×4 ≈ 197 KB），否则模型又只能看见一段。
+ */
+const MAX_PINNED_BYTES = 200 * 1024;
+/**
+ * **最近这么多个载荷一律不折**（不限路径）。
+ *
+ * 真实故障（2026-11-26，287 步 / 267 次 `read_file` 全在读同一个 145.9 KB 文件）：
+ * 模型按行窗口读同一个大文件（`startLine/endLine` 每次不同），而
+ *   - 钉住是按**路径**的：同一个文件只钉住**最后一个窗口**，之前读过的窗口全被折掉；
+ *   - 活跃预算 96 KB：两个 48 KB 的窗口就超了，于是第二个一到，第一个立刻被折掉。
+ * 也就是说它**永远只能看见一个窗口**，想对照两段就必须再读一遍 —— 于是 175 → 1650 →
+ * 1790 → 1880 → 1700 → 1860 这几个窗口循环读了 267 次，一次运行烧掉几十万 token。
+ *
+ * 按「最近几个」而不是「按路径」钉住，才符合真实工作方式：正在读的那几段就是工作集。
+ * 上限由 `MAX_PINNED_BYTES` 兜住，超预算时先折最早的非钉住载荷，再折早先的钉住载荷。
+ */
+const PINNED_RECENT_WINDOWS = 6;
 /**
  * 折叠**批量**做，而不是每来一条就折一条。
  *
@@ -957,7 +1008,23 @@ const MAX_PINNED_BYTES = 64 * 1024;
  */
 const FOLD_BATCH = 6;
 /** 活跃载荷总字节上限：超过才动手，避免「每轮都在改历史」。 */
-const MAX_LIVE_TOOL_BYTES = 160 * 1024;
+const MAX_LIVE_TOOL_BYTES = 96 * 1024;
+/**
+ * **硬折叠**：只保最近这么多条工具载荷的正文，更早的连结论一起压成一行状态。
+ *
+ * 为什么还需要这一层（2026-11-26 实测）：
+ * 一条团队任务对话里跑过 **7165 次工具调用**（3245 次 `run_command` + 2654 次 `read_file`），
+ * 其中单次运行 552 次调用 / 6934 万 prompt tokens。按原来的规则，每次调用折完之后
+ * 还留着 `summary` + `changedFiles` + 一句说明（约 250 字节），552 条就是 138 KB ≈ 4.5 万
+ * tokens —— 而且**每一轮都要重发一遍**，光这一项就烧掉 2500 万 tokens。
+ *
+ * 这些步骤的事实在任务树里已经有了（做了什么、成没成、改了哪些文件），
+ * 原文随时可以重跑同一个工具拿回来。所以过了这道线的载荷只留状态：
+ * 结构不变（tool 消息仍在原位、仍回应那条 `tool_call`），但不再占预算。
+ */
+const HARD_FOLD_KEEP = 24;
+/** 硬折叠后的载荷：只留一行状态（英文短标记，比中文说明省 3 倍字节）。 */
+const HARD_FOLD_MARK = 'dropped earlier output; rerun the tool to see it';
 
 export function pruneToolPayloads(
   messages: ChatRequestMessage[],
@@ -990,8 +1057,36 @@ export function pruneToolPayloads(
   const candidates = [...latestByPath.entries()]
     .sort((a, b) => (readsByPath.get(b[0]) ?? 0) - (readsByPath.get(a[0]) ?? 0) || b[1] - a[1]);
   let pinnedBytes = 0;
+  /*
+   * 先钉「最近读的几段」（不限路径）——它们就是模型此刻的工作集。
+   *
+   * 只按路径钉会让「同一个大文件的第二个窗口」把第一个挤掉，模型于是反复重读（见
+   * `PINNED_RECENT_WINDOWS` 的实测）。倒序取最近的载荷，预算不够就跳过（宁少不留错）。
+   */
+  for (let offset = toolIndexes.length - 1; offset >= 0 && pinned.size < PINNED_RECENT_WINDOWS; offset -= 1) {
+    const at = toolIndexes[offset]!;
+    /*
+     * 最新那一条永远留（它通常正是模型下一步要用的），不参与预算判断：
+     * 单条载荷上限 48 KB，留它不会把请求撑爆，折掉它却会让下一步立刻重读。
+     */
+    if (offset === toolIndexes.length - 1) {
+      pinned.add(at);
+      pinnedBytes += toolPayloadBytes(messages[at]!);
+      continue;
+    }
+    const size = toolPayloadBytes(messages[at]!);
+    /*
+     * 这里**装满就停**（break），不是跳过再找更旧的：这一趟的目的是「最近读的几段」，
+     * 更旧的那几段价值递减，没有理由为了凑数把它们顶上来。
+     */
+    if (pinnedBytes + size > MAX_PINNED_BYTES) break;
+    pinnedBytes += size;
+    pinned.add(at);
+  }
+  /* 再按路径钉住「回头读过」的那几个文件（与上面取并集，预算共享）。 */
   for (const [, index] of candidates) {
-    if (pinned.size >= PINNED_PATHS) break;
+    if (pinned.size >= PINNED_RECENT_WINDOWS + PINNED_PATHS) break;
+    if (pinned.has(index)) continue;
     const size = toolPayloadBytes(messages[index]!);
     if (pinnedBytes + size > MAX_PINNED_BYTES) continue;
     pinnedBytes += size;
@@ -1024,6 +1119,17 @@ export function pruneToolPayloads(
     if (!foldToolPayloadAt(messages, at)) continue;
     liveBytes -= before - toolPayloadBytes(messages[at]!);
     folded += 1;
+  }
+  /*
+   * 硬折叠：更早的步骤连 `summary` / `changedFiles` 都不再留。
+   *
+   * 和上面的批量折叠一起做（同一个批次），不额外多改一次历史前缀 ——
+   * 改历史中段会打断 DeepSeek 的前缀缓存，能少改一次就少改一次。
+   */
+  const hardCutoff = toolIndexes.length - HARD_FOLD_KEEP;
+  for (let index = 0; index < hardCutoff; index += 1) {
+    if (pinned.has(toolIndexes[index]!)) continue;
+    if (hardFoldToolPayloadAt(messages, toolIndexes[index]!)) folded += 1;
   }
   if (budgetBytes <= 0) return folded;
   /*

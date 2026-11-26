@@ -27,6 +27,16 @@ import { setWorkspaceRoots } from './support/vscodeMock';
 let workspaceRoot: string;
 let auditPath: string;
 
+/**
+ * 跨平台的「一直不结束」命令。
+ *
+ * Windows 没有 `sleep`（`sleep 30` 会立刻报「不是内部或外部命令」），
+ * 于是「取消 / 停用扩展时把运行中的命令收掉」这条规则在本机一次都没被验证过。
+ *
+ * 注意**不能写箭头函数**：命令经 cmd 执行，`=>` 里的 `>` 会被当成重定向。
+ */
+const longRunning = (seconds: number): string => `node -e "setTimeout(function(){}, ${Math.round(seconds * 1000)})"`;
+
 before(async () => {
   workspaceRoot = await mkdtemp(join(tmpdir(), 'hwchat-resource-'));
   await mkdir(join(workspaceRoot, 'src'), { recursive: true });
@@ -68,7 +78,7 @@ test('spawn: cancelling kills the whole process group and settles promptly', asy
   const controller = new AbortController();
   let pid: number | undefined;
   const startedAt = Date.now();
-  const pending = spawnCommand('sleep 30', process.cwd(), 60, 10_000, undefined, {
+  const pending = spawnCommand(longRunning(30), process.cwd(), 60, 10_000, undefined, {
     signal: controller.signal,
     onSpawn: (child) => {
       pid = child.pid;
@@ -154,7 +164,7 @@ test('tool executor: aborting a running command stops it and reports cancellatio
   const controller = new AbortController();
   const startedAt = Date.now();
   const pending = executor.execute(
-    { id: 'cancel-command', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'sleep 30', timeoutSeconds: 60 }) } },
+    { id: 'cancel-command', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: longRunning(30), timeoutSeconds: 60 }) } },
     'agent',
     settings(),
     async () => true,
@@ -173,7 +183,7 @@ test('tool executor: aborting a running command stops it and reports cancellatio
 test('tool executor: dispose kills commands that are still running', async () => {
   const executor = new ToolExecutor(new AuditLog(auditPath), () => true);
   const pending = executor.execute(
-    { id: 'dispose-command', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'sleep 30', timeoutSeconds: 60 }) } },
+    { id: 'dispose-command', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: longRunning(30), timeoutSeconds: 60 }) } },
     'agent',
     settings(),
     async () => true,
@@ -279,7 +289,7 @@ test('tool executor: 停止某一次运行会同步杀光它拉起的全部进�
   const executor = new ToolExecutor(new AuditLog(auditPath), () => true);
   const controller = new AbortController();
   const pending = executor.execute(
-    { id: 'kill-run', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'sleep 30', timeoutSeconds: 60 }) } },
+    { id: 'kill-run', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: longRunning(30), timeoutSeconds: 60 }) } },
     'agent',
     settings({ permissionPreset: 'autopilot' }),
     async () => true,
@@ -307,7 +317,7 @@ test('tool executor: 杀某一次运行不影响另一次运行的进程', async
   const stopA = new AbortController();
   const keepB = new AbortController();
   const run = (id: string, signal: AbortSignal) => executor.execute(
-    { id, type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'sleep 30', timeoutSeconds: 60 }) } },
+    { id, type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: longRunning(30), timeoutSeconds: 60 }) } },
     'agent',
     settings({ permissionPreset: 'autopilot' }),
     async () => true,
@@ -339,7 +349,7 @@ test('tool executor: 杀某一次运行不影响另一次运行的进程', async
 test('停用扩展：disposeAllToolExecutors 会杀光所有执行器拉起的后台服务', async () => {
   const executor = new ToolExecutor(new AuditLog(auditPath), () => true);
   const result = await executor.execute(
-    { id: 'bg-dispose', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'sleep 30', background: true }) } },
+    { id: 'bg-dispose', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: longRunning(30), background: true }) } },
     'agent',
     settings({ permissionPreset: 'autopilot' }),
     async () => true,

@@ -21,9 +21,13 @@ import { createSocket, type Socket as UdpSocket } from 'node:dgram';
 import { hostname, networkInterfaces, platform as osPlatform } from 'node:os';
 import { readDeviceName } from './deviceInfo';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { existsSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
+  type AgentActivity,
   ALIGNMENT_FILE,
+  ASSET_CHUNK_CHARS,
+  ASSET_MAX_CHUNKS,
   MAX_DIALOGUE_NOTES,
   MAX_GROUP_MESSAGES,
   MAX_MESSAGE_BYTES,
@@ -37,6 +41,7 @@ import {
   groupAgreement,
   makeGroupMessage,
   makeNote,
+  makeReceipt,
   makeReport,
   makeRequirement,
   pairingMatches,
@@ -45,8 +50,12 @@ import {
   renderGroupLine,
   renderGroupTranscript,
   renderLedger,
-  shouldAutoRespond,
+  noteAddressedTo,
+  assignmentNotice,
+  peerGroupLineReason,
+  sortGroupTimeline,
   type GroupPhase,
+  type PeerLine,
   type ReportStatus,
   type SyncGroupMessage,
   type SyncApprovalMessage,
@@ -54,12 +63,16 @@ import {
   type RemotePreset,
   type SyncMessage,
   type SyncNote,
+  type GroupAssetRef,
+  type SyncAssetChunk,
   type SyncPeer,
   type SyncPlatform,
   type SyncReport,
   type SyncRequirement,
 } from './lanProtocol';
+import { initialTeamPhase, isTeamPhase, looksLikePlanApproval, looksLikePlanRejection, teamPhaseLabel, type TeamPhase } from './planGate';
 import { normalizeRepoUrl } from './projectRef';
+import { projectGate } from './projectGate';
 import {
   MOBILE_COOKIE,
   MOBILE_PATH,
@@ -99,6 +112,39 @@ export interface LanSyncBridge {
    * 失败不影响同步本身：记录文件照样写，用户仍能在 `docs/TEAM-CHAT.md` 里回看。
    */
   onGroupMessage?(message: SyncGroupMessage): Promise<void>;
+  /**
+   * 把**对端的内容**显示进「团队任务」对话（只显示，不额外开一轮）。
+   *
+   * 为什么必须单独有它（2026-11-26 用户实况）：「macOS 的消息，团队窗口 Windows 显示已读，
+   * 但 Windows 的团队任务对话框实际没有 macOS 的新消息进去。」
+   *
+   * 根因：群消息（`team_sync action=analysis|question|progress|result`）以前**只**记进群记录、
+   * 只画在团队群窗口，从未进过团队任务对话；只有 `send|ask`（note）才会进。
+   * 于是「谁用了哪种动作」决定了对面能不能看见 —— 跟操作系统无关，纯属两条路径不一致。
+   *
+   * 这里只**追加显示**（进对话存档，下一轮读上下文时自然带上），**不触发任何运行**：
+   * 群消息终究不是执行触发器（否则两个 agent 会互相接龙）。
+   */
+  onPeerLine?(line: PeerLine): Promise<void>;
+  /**
+   * 收到「已读回执」：有设备读到了群消息，面板要把「已读」画到对应气泡下面。
+   *
+   * 与 `onGroupMessage` 分开：回执不是发言，不追加气泡、不写群记录。
+   */
+  onGroupRead?(): Promise<void>;
+  /**
+   * 某台设备的 agent 状态变了（跑 / 停 / 出错 / 等确认）。
+   *
+   * 面板据此重画指示灯；与「已读回执」分开，便于各自节流。
+   */
+  onAgentState?(): Promise<void> | void;
+  /**
+   * 另一台发来的附件已经收齐并落到本机磁盘。
+   *
+   * 面板据此把「图片还在路上」换成真图；agent 那一轮则通过
+   * `waitForAssets()` 拿到本机路径后再读。
+   */
+  onAssetReady?(id: string, path: string): Promise<void> | void;
   /**
    * 有更新的用户消息要执行，正在跑的那条必须停下。
    *
@@ -172,6 +218,14 @@ export interface LanSyncBridge {
   /** 手机上是否允许批准工具授权（用户可在设置里关掉，关掉后手机只能看和说话）。 */
   canApproveFromPhone?(): boolean;
   /**
+   * 自主迭代模式：谈定就开工，不等甲方确认。
+   *
+   * 用户 2026-11-26：「增加一个自主迭代模式，就是 agent 相互沟通好都确认没问题不需要用户确认，
+   * 然后开始执行，适合自主迭代项目」。**只影响「要不要等甲方点头」**，
+   * 不影响「先谈、只读」——谈判阶段照样没有写工具。
+   */
+  autonomousMode?(): boolean;
+  /**
    * 本机**新产生**的一条消息（需求 / 报告 / 协作消息 / 群发言）。
    *
    * 局域网模式下它已经自己广播了；跨网中继模式下由这一条钩子把密文送去中转。
@@ -219,8 +273,17 @@ interface PersistedState {
   notes?: SyncNote[];
   /** 团队群发言。 */
   group?: SyncGroupMessage[];
+  /** 已读回执：群消息 id → 已读的设备 id。 */
+  reads?: Record<string, string[]>;
   /** 已经被用户允许过的设备 id：重连不再打扰。 */
   approved?: string[];
+  /**
+   * 方案阶段：需求 id → 阶段。
+   *
+   * **必须落盘**：阶段原本只在内存里，重载窗口 / 重启 VS Code 就退回「谈」，
+   * 甲方确认过的需求又变成「不许动手」—— 用户看到的是「确认了怎么还不动」。
+   */
+  phases?: Record<string, TeamPhase>;
   /** 上次的角色与主机地址：下次开窗口自动恢复连接。 */
   role?: 'hub' | 'peer';
   hub?: string;
@@ -243,6 +306,17 @@ interface PersistedState {
 }
 
 const STATE_LIMIT = 300;
+/**
+ * 「我在等队友回话」最多挡多久。
+ *
+ * 太短：队友在跑长任务时会被误判成「不用等了」；太长：对方离线时这一轮永远
+ * 交不出结果。10 分钟与「一轮重活」同量级，超时就按「不再等」处理。
+ */
+const ASK_WAIT_EXPIRY_MS = 10 * 60_000;
+/** 队友消息交付失败后的重投间隔：一轮收尾通常几秒内就结束。 */
+const NOTE_RETRY_MS = 4_000;
+/** 排队待交付的队友消息上限（长时间忙时兜底，不无限堆积）。 */
+const MAX_PENDING_NOTES = 40;
 const REQUEST_TIMEOUT_MS = 4_000;
 const BODY_LIMIT = MAX_MESSAGE_BYTES + 16 * 1024;
 const DISCOVER_MAGIC = 'PLAITCODE-SYNC-DISCOVER/1';
@@ -399,8 +473,87 @@ export class LanSyncService implements Disposable {
   private requirements: SyncRequirement[] = [];
   private reports: SyncReport[] = [];
   private notes: SyncNote[] = [];
+  /**
+   * **已经收到、但还没交给本机 agent 的协作消息**（队友说给本机的话）。
+   *
+   * 2026-11-26 的真实故障（日志逐条可查）：Windows 这台在 00:06→08:01 之间收到
+   * **14 条**队友消息，每一条都记了「队友消息（…）」，紧接着一行
+   * 「面板正忙，队友消息已记录（team_sync status 可查看）」—— 也就是说消息到网了、
+   * 落库了，但 `runNote()` 因为「本机正在跑」返回 false，而**没有任何重试**。
+   * 用户看到的就是：Windows 问的问题 macOS 秒回，Windows 却毫无反应。
+   *
+   * 现在改成**排队重投**：忙就先攒着，一空下来（定时重试 + 每轮结束时主动 flush）
+   * 逐条交付。交付成功才出队；同一条按 id 去重。
+   */
+  private pendingNotes: SyncNote[] = [];
+  /** 重投定时器：只在队列非空时存在。 */
+  private noteRetryTimer?: ReturnType<typeof setInterval>;
+  /**
+   * 每条需求现在走到哪一步：谈 / 等确认 / 执行。
+   *
+   * 用户 2026-11-26：「我希望他们先沟通，只读取各自设备上的文件，不修改，沟通好了必须出一份
+   * 各自都同意且认为可行的方案给用户，用户确认了再动手修改文件。」
+   * 阶段存在**服务层**而不是面板里：面板可能被关掉、被重载，而「这条需求还没批准」这件事
+   * 不能因为重启就被忘掉（忘了就等于默认批准）。
+   */
+  private phases = new Map<string, TeamPhase>();
+  /**
+   * 本机 agent 问出去、**还没等到回话**的问题。
+   *
+   * 用户实况（2026-11-25）：「每次我要求群里的 agent 互相沟通、达成一致的方案的时候，
+   * 就会有 agent 单方面读取并发出结果。我并没有看到沟通，实际上其他 agent 还没有执行完。」
+   *
+   * 根因不是提示词不够严：一轮跑完就会无条件往群里发「结果」，无论队友有没有回过话。
+   * 所以这里按事实记账 —— 有未回答的提问时，这一轮的收尾**不许自称结果**，
+   * 只能发「等对方回话」的进度；对方回话本身还会把本机叫醒去合并结论。
+   */
+  private pendingAsks: {
+    noteId: string;
+    topic: string;
+    requirementId: string;
+    at: number;
+    /** 这条提问发给了谁（群里其它每一台）。全部回话才算「谈过了」。 */
+    targets: { id: string; label: string }[];
+    /** 已经回话的 target id。 */
+    replied: string[];
+  }[] = [];
+  /** 正在 `waitForReply` 的提问：noteId → 唤醒函数。 */
+  private askWaiters = new Map<string, () => void>();
+  /** 每条提问收到的回答（按到达顺序）。 */
+  private askReplies = new Map<string, SyncNote[]>();
   /** 团队群的全部发言（需求 / 解析 / 进度 / 结果）。 */
   private group: SyncGroupMessage[] = [];
+  /**
+   * 群消息 → 已读它的设备 id。
+   *
+   * 用户要求（2026-11-25）：「我发 @所有人的消息，window 这个 agent 收到后，
+   * 这个消息下面会显示 Windows 这个 agent 已读」——否则分不清「没收到」和
+   * 「收到了但正忙」。回执独立成 `kind: 'receipt'`，不进群记录、不产生气泡。
+   */
+  private reads = new Map<string, Set<string>>();
+  /**
+   * 附件分片的收件箱：资产 id → 已到的分片。
+   *
+   * 用户 2026-11-25：「我发在群聊天的图片，没法传递到各自 agent 的设备上，
+   * 所以会显示看不到」。图片必须**真的传过去**，另一台的 agent 才看得到；
+   * 但单条消息有 80 KB 上限，所以拆成分片、到齐才落盘（缺片绝不当成完整图）。
+   */
+  private readonly assetInbox = new Map<string, {
+    name: string;
+    mimeType: string;
+    kind: 'image' | 'file';
+    total: number;
+    parts: Array<string | undefined>;
+  }>();
+  /** 已落盘的附件：资产 id → 本机文件路径。 */
+  private readonly assetPaths = new Map<string, string>();
+  /**
+   * 每台设备的 agent 状态（团队群的指示灯）。
+   *
+   * 本机由面板上报（跑没跑、是不是卡在等确认），对端通过 `agentState` 控制消息上报；
+   * 谁都不上报时按「空闲」显示，而不是瞎猜成「运行中」。
+   */
+  private readonly activities = new Map<string, { state: AgentActivity; at: number }>();
   /** 用户点过「允许」的设备。重连时直接放行，不再弹窗。 */
   private approved = new Set<string>();
   /** 上次的角色与主机：下次激活自动恢复（用户不用重复操作）。 */
@@ -494,9 +647,25 @@ export class LanSyncService implements Disposable {
       this.group = Array.isArray(parsed.group)
         ? parsed.group.map((item) => parseSyncMessage(item)).filter((item): item is SyncGroupMessage => item?.kind === 'group').slice(-MAX_GROUP_MESSAGES)
         : [];
+      this.reads = new Map(Object.entries(parsed.reads ?? {})
+        .filter(([, ids]) => Array.isArray(ids))
+        .map(([id, ids]) => [id, new Set((ids as unknown[]).filter((item): item is string => typeof item === 'string'))] as const)
+        .slice(-MAX_GROUP_MESSAGES));
       this.approved = new Set(Array.isArray(parsed.approved)
         ? parsed.approved.filter((item): item is string => typeof item === 'string').slice(0, 32)
         : []);
+      /*
+       * 阶段：只认认识的阶段名。
+       *
+       * 「谈判 / 等确认」这类状态必须以文件为准 —— 内存里丢了就成了「默认可以动手」的反面
+       * （默认是 negotiate，安全方向），但会让甲方确认过的需求突然又不动手。
+       */
+      this.phases = new Map(
+        Object.entries(parsed.phases ?? {})
+          .filter(([id, phase]) => id.length > 0 && isTeamPhase(phase))
+          .map(([id, phase]) => [id, phase as TeamPhase] as const)
+          .slice(-STATE_LIMIT * 4),
+      );
       this.lastRole = parsed.role === 'peer' ? 'peer' : 'hub';
       this.lastHub = typeof parsed.hub === 'string' ? parsed.hub : '';
       this.lastPort = typeof parsed.port === 'number' && parsed.port > 0 ? parsed.port : 0;
@@ -521,7 +690,9 @@ export class LanSyncService implements Disposable {
       reports: this.reports.slice(-STATE_LIMIT * 3),
       notes: this.notes.slice(-MAX_NOTES),
       group: this.group.slice(-MAX_GROUP_MESSAGES),
+      reads: Object.fromEntries([...this.reads.entries()].map(([id, peers]) => [id, [...peers]])),
       approved: [...this.approved],
+      phases: Object.fromEntries(this.phases),
       role: this.lastRole,
       hub: this.lastHub,
       port: this.lastPort,
@@ -701,6 +872,16 @@ export class LanSyncService implements Disposable {
      * 用户看到的正是「切换无效」。
      */
     const fromTrustedDevice = this.approved.has(message.from.id);
+    if (message.action === 'agentState') {
+      // 对端上报状态：只记下来画指示灯，不触发任何执行、也不回包（否则互相回声）。
+      if (message.agentState) {
+        const previous = this.activities.get(message.from.id)?.state;
+        this.activities.set(message.from.id, { state: message.agentState, at: message.at });
+        if (previous !== message.agentState) void this.bridge.onAgentState?.();
+        this.bridge.onState?.();
+      }
+      return;
+    }
     if (message.action === 'project') {
       if (!fromTrustedDevice) {
         this.bridge.log(`[sync] 收到远程切项目，但来源设备未被信任，已忽略`, 'warn');
@@ -926,9 +1107,56 @@ export class LanSyncService implements Disposable {
     const base = this.groupState();
     return {
       device: this.bridge.peer().name,
+      localId: this.bridge.peer().id,
       role: this.role,
       peers: base.peers,
-      messages: base.messages.slice(-60),
+      /*
+       * 按**到达顺序**排（`sortGroupTimeline`），不是按两台设备各自的时间戳。
+       *
+       * 真实故障（2026-11-26）：两台系统时钟差 123 ms，按 `at` 排会把对端的回复
+       * 排到我们刚发出的需求前面 —— 手机上看起来就是「回复在我的话上面」。
+       */
+      messages: sortGroupTimeline(base.messages).slice(-60),
+      /*
+       * 项目名与已读回执：桌面群窗口都有，手机不给就等于「看不见队友收到没有、
+       * 也不知道这一轮在哪个项目里改」。两样都是纯展示，不影响权限。
+       */
+      ...(this.activeProjectName() ? { projectName: this.activeProjectName() } : {}),
+      /* 阶段：手机顶部也显示「沟通中（只读）/ 方案待确认 / 已确认，执行中」。 */
+      ...(() => {
+        const active = this.activePhase();
+        return active ? { phase: active.phase, phaseLabel: this.phaseLabelWithMode(active.phase), autonomous: this.autonomous() } : {};
+      })(),
+      /*
+       * 已读回执**在服务端就翻成人话**。
+       *
+       * 用户 2026-11-26：「手机上显示的设备都是一串字母数字」。手机拿到的是设备 id，
+       * 而 id 只在两台机器的内存里对得上；手机既没有那台设备的历史，也拿不到
+       * `peers` 已经被裁掉的老设备 —— 于是只能原样打一串哈希。
+       * 这里直接给「已读」的名称，手机端不再需要做任何 id → 名字的猜测。
+       */
+      reads: Object.fromEntries(Object.entries(this.allReads()).map(([id, peers]) => [
+        id,
+        peers.map((peerId) => this.labelForPeerId(peerId)),
+      ])),
+      /** id → 统一标识（系统 · 设备名），手机上任何地方都不再直接显示 id。 */
+      labels: Object.fromEntries(this.allPeerIds().map((id) => [id, this.labelForPeerId(id)])),
+      /*
+       * 队友之间的往来也交给手机。
+       *
+       * 用户 2026-11-26：「让 agent 的消息也像用户消息一样，能被相互看见」——
+       * 手机上看不到 agent 讨论，甲方就无法判断两个 agent 到底谈没谈、谈到哪。
+       */
+      dialogue: base.dialogue.map((item) => ({
+        id: item.id,
+        who: item.who,
+        body: item.body,
+        at: item.at,
+        ...(item.receivedAt !== undefined ? { receivedAt: item.receivedAt } : {}),
+        replyTo: item.replyTo,
+        ...(item.to ? { to: item.to } : {}),
+        ...(item.toLabel ? { toLabel: item.toLabel } : {}),
+      })),
       ...(base.openQuestion ? { openQuestion: base.openQuestion } : {}),
       approvals: [...this.approvals.values()].map((entry) => entry.view),
       canApprove: this.bridge.canApproveFromPhone?.() ?? false,
@@ -1302,9 +1530,23 @@ export class LanSyncService implements Disposable {
       action: 'stopGroup',
       at: Date.now(),
     };
+    /*
+     * 先停**本机**。
+     *
+     * 手机上的「停止执行」走的就是这个方法：单机（`role === 'off'`，只有这台电脑）
+     * 根本没有对端可播，以前直接返回「只有本机，已停」却**什么都没停** ——
+     * 用户看到的是一句成功提示，实际任务还在跑。桌面群窗口是本机另外调的，
+     * 手机没有那条路，所以这里必须自己停。
+     */
+    const local = await this.bridge.onRemoteControl?.({ action: 'stopGroup' }).catch(() => undefined);
     // 跨网那一路（中继）；没接中继时是空操作，不影响局域网。
     void this.relayOut(control);
-    if (this.role === 'off') return { ok: true, message: '只有本机，已停。' };
+    if (this.role === 'off') {
+      return {
+        ok: local?.ok !== false,
+        message: local?.ok === false ? (local.message || '本机没停下来。') : '只有本机，已停。',
+      };
+    }
     const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: control });
     try {
       if (this.role === 'hub') {
@@ -2493,7 +2735,7 @@ export class LanSyncService implements Disposable {
       return;
     }
 
-    if (route !== `${MOBILE_PATH}/send` && route !== `${MOBILE_PATH}/approve`) {
+    if (route !== `${MOBILE_PATH}/send` && route !== `${MOBILE_PATH}/approve` && route !== `${MOBILE_PATH}/stop`) {
       send(404, { ok: false, error: 'not found' });
       return;
     }
@@ -2507,6 +2749,16 @@ export class LanSyncService implements Disposable {
      */
     if (request.headers['x-hwchat-mobile'] !== '1') {
       send(403, { ok: false, error: '缺少请求头' });
+      return;
+    }
+    /*
+     * 「停止执行」：和桌面群窗口那颗按钮**走同一条路**（`broadcastStop`），
+     * 这样手机点一下，群里所有设备都会停，而不是只停这一台。
+     * 放在解析 body 之前：停止不需要参数。
+     */
+    if (route === `${MOBILE_PATH}/stop`) {
+      const result = await this.broadcastStop();
+      send(result.ok ? 200 : 409, result);
       return;
     }
     const raw = await readBody(request);
@@ -2533,8 +2785,31 @@ export class LanSyncService implements Disposable {
         return;
       }
       const assignee = typeof parsed.assignee === 'string' ? parsed.assignee.trim().slice(0, 64) : '';
-      const result = await this.bridge.onMobileMessage(text.slice(0, 4_000), assignee || undefined);
-      send(result.ok ? 200 : 409, result);
+      /*
+       * **立刻回话，后台再跑**。
+       *
+       * 用户实况（2026-11-26）：「手机上发送消息也有延迟，或者有时候发送不出去」。
+       * 以前这里 `await` 整个 `sendGroupMessage()` —— 那里面可能要打断正在跑的一轮、
+       * 等它收尾、广播、再起新一轮，几秒到几十秒都有；手机的 HTTP 请求就干等着，
+       * 界面一直停在「发送中…」，看起来就像发不出去。
+       *
+       * 现在：请求立即返回 202（手机那条气泡已经先画出来了），真正的发送在后台进行；
+       * 失败会作为一条群消息写回群里，手机照样能看到原因，不会静默丢。
+       */
+      send(202, { ok: true, accepted: true, message: '已发出' });
+      void this.bridge.onMobileMessage(text.slice(0, 4_000), assignee || undefined)
+        .then((result) => {
+          if (!result.ok) this.bridge.log(`[mobile] 发送失败：${result.message}`, 'warn');
+        })
+        .catch((error: unknown) => {
+          const detail = error instanceof Error ? error.message : String(error);
+          this.bridge.log(`[mobile] 发送失败：${detail}`, 'warn');
+          void this.postGroup({
+            author: 'agent',
+            phase: 'progress',
+            body: `手机那条没能执行：${detail}`,
+          }).catch(() => undefined);
+        });
       return;
     }
 
@@ -2590,11 +2865,27 @@ export class LanSyncService implements Disposable {
             this.bridge.log(
               `[sync] 需求 ${message.id} 指派给 ${message.assignee}，本机只记录不执行`,
             );
-            void this.postGroup({
-              author: 'agent',
-              phase: 'progress',
-              body: `这条活由另一台执行，这台只记录、不动手。`,
+            /*
+             * 说清是 @ 了谁。
+             *
+             * 「由另一台执行」不点名，甲方看到一台干活、另一台说风凉话，会误以为两台模式不同。
+             * 需求也可能只以**群消息**的形式到达（没有独立的执行触发），所以这条说明
+             * 由 `announceAssignmentElsewhere()` 统一发，且按需求号去重，两条路径不会发两遍。
+             */
+            await this.announceAssignmentElsewhere(message.id, message.assignee);
+            /*
+             * 需求本身也要进本机对话：本机不执行它，就没有别的地方会把它写进来 ——
+             * 甲方在对话里回看时，只会看到「这条 @ 了 X」，看不到到底要做什么。
+             */
+            await this.bridge.onPeerLine?.({
+              id: message.id,
+              speaker: deviceLabel(message.from, this.peerList().map((entry) => entry.peer)),
+              phase: 'requirement',
+              body: message.detail || message.title,
+              at: message.createdAt,
+              reason: 'assigned-elsewhere',
               requirementId: message.id,
+              assigneeLabel: this.labelForPeerId(message.assignee),
             }).catch(() => undefined);
             return;
           }
@@ -2604,15 +2895,22 @@ export class LanSyncService implements Disposable {
            * 用户要求：项目唯一 ID 就是 GitHub 仓库地址。同一个仓库在不同设备上
            * 可以叫不同文件夹名 —— 那是同一个项目，不该拦；
            * 仓库不同才是真的不同，要先追问、确认后才调整。
+           *
+           * 具体判定见 `projectGate`：**本机认不出自己的仓库时不算「不同」** ——
+           * 没有依据就降成只读，会让 agent 误以为自己没有写文件能力（用户实况 2026-11-25）。
            */
           const theirRepo = normalizeRepoUrl(message.repo ?? message.from.repo ?? '');
           const myRepo = this.currentRepo();
-          const sameRepo = Boolean(theirRepo) && Boolean(myRepo) && theirRepo === myRepo;
           const required = theirRepo || message.project || message.from.project || '';
           const local = this.activeProjectName();
-          const mismatch = theirRepo
-            ? !sameRepo && !this.hasProject(theirRepo)
-            : Boolean(required) && Boolean(local) && required !== local && !this.hasProject(required);
+          const gate = projectGate({
+            theirRepo,
+            myRepo,
+            theirName: message.project || message.from.project || '',
+            myName: local,
+            hasProject: (value) => this.hasProject(value),
+          });
+          const mismatch = gate.mismatch;
           if (mismatch) {
             /*
              * 项目不一致**不再拒绝**，改成只读执行。
@@ -2623,7 +2921,7 @@ export class LanSyncService implements Disposable {
              */
             const mine = this.bridge.localLogin?.() ?? '';
             const theirs = message.from.login ?? '';
-            this.bridge.log(`[sync] 项目不一致（对方 ${theirRepo || required}），本轮按只读执行 ${message.id}`, 'warn');
+            this.bridge.log(`[sync] 项目不一致（对方 ${theirRepo || required}，依据 ${gate.reason}），本轮按只读执行 ${message.id}`, 'warn');
             void this.postGroup({
               author: 'agent',
               phase: 'progress',
@@ -2662,7 +2960,23 @@ export class LanSyncService implements Disposable {
          * 才是唯一的执行触发器。
          */
         if (!this.group.some((item) => item.id === message.id)) {
-          this.group = [...this.group, message].slice(-MAX_GROUP_MESSAGES);
+          /*
+           * 到达即盖章：`receivedAt` 是本机单调的时间线依据（见 `messageOrderKey`）。
+           * 对端时钟可能比本机慢，只按 `at` 排会把它的回复排到我们提问之前。
+           */
+          const arrived = { ...message, receivedAt: message.receivedAt ?? Date.now() };
+          this.group = [...this.group, arrived].slice(-MAX_GROUP_MESSAGES);
+          /*
+           * **阶段随消息一起过网**（2026-11-26 复查发现的缺口）。
+           *
+           * 甲方在哪一台点「确认」，另一台也必须放开写操作 —— 否则确认了只有一半的机器会动手，
+           * 看起来就像「确认没用」。所以确认 / 要求改的发言带 `meta.planPhase`，到此即落定。
+           */
+          const broadcastPhase = message.meta?.planPhase;
+          if (broadcastPhase && message.requirementId) {
+            this.setPhase(message.requirementId, broadcastPhase);
+            this.trace(`阶段同步：${message.requirementId.slice(0, 12)} → ${teamPhaseLabel(broadcastPhase)}`);
+          }
           if (message.from.id !== this.bridge.peer().id) {
             this.trace(
               `收到 ${message.from.name}：${message.author === 'user' ? '甲方' : '乙方'}·${message.phase}「${message.body.slice(0, 24)}」`,
@@ -2670,7 +2984,55 @@ export class LanSyncService implements Disposable {
           }
           await this.persist();
           this.bridge.log(`[sync] 群消息：${renderGroupLine(message)}`);
-          await this.bridge.onGroupMessage?.(message).catch(() => undefined);
+          /*
+           * **先回执，再干活。**
+           *
+           * 用户 2026-11-25：「经常遇到一个 agent 在执行任务，没回复，没参与，
+           * 团队任务对话框也没显示相关消息，导致我不知道这个 agent 是没收到消息，
+           * 还是收到了但正在执行」。回执是确定的、几乎零成本，必须在开跑之前发出去 ——
+           * 否则正忙时甲方只能干等。
+           *
+           * 只对甲方的发言回执（agent 自己的话不需要），并且只回「说给本机的」。
+           */
+          /*
+           * 回执对**所有人的发言**都发，不只对甲方的。
+           *
+           * 用户 2026-11-26：「不管是 agent 还是用户的消息气泡下面都要显示已读状态，
+           * 哪些 agent 已读了」。所以队友 agent 说的话也要有回执，界面上才会出现
+           * 「已读：Windows（本机）」这种事实。
+           */
+          if (this.addressedToLocal(message)) {
+            void this.ackGroup([message.id]);
+          }
+          /*
+           * **对端的每一条发言都要进本机对话**（用户 2026-11-26 的要求：
+           * 「让 agent 的消息也像用户消息一样，能被相互看见，唯一约束是 @」）。
+           *
+           * 以前只有 `send|ask`（note）会进对话，而 `team_sync action=progress|result|question`
+           * 只画在团队群窗口 —— 于是「谁用了哪种动作」决定了对面能不能看见，
+           * 跟操作系统一点关系都没有。这里统一补上：只追加显示，不触发运行。
+           */
+          const peerReason = peerGroupLineReason(message, this.bridge.peer().id);
+          if (peerReason) {
+            /*
+             * 指派给别人的需求：本机不执行，但群里要有一条**点名**的说明，
+             * 甲方才知道「不是这台不做，是这条 @ 了那台」。
+             */
+            if (peerReason === 'assigned-elsewhere' && message.assignee) {
+              void this.announceAssignmentElsewhere(message.requirementId, message.assignee);
+            }
+            await this.bridge.onPeerLine?.({
+              id: message.id,
+              speaker: deviceLabel(message.from, [this.bridge.peer(), ...this.peerList().map((entry) => entry.peer)]),
+              phase: message.phase,
+              body: message.body,
+              at: message.at,
+              reason: peerReason,
+              ...(message.requirementId ? { requirementId: message.requirementId } : {}),
+              ...(message.assignee ? { assigneeLabel: this.labelForPeerId(message.assignee) } : {}),
+            }).catch(() => undefined);
+          }
+          await this.bridge.onGroupMessage?.(arrived).catch(() => undefined);
           await this.refreshTranscript();
           /*
            * 甲方回答了乙方的追问 → 本机这一侧也要接着做。
@@ -2726,6 +3088,22 @@ export class LanSyncService implements Disposable {
             }
           }
         }
+      } else if (message.kind === 'asset') {
+        // 附件分片：只落盘，不进群记录、不触发任何执行。
+        await this.ingestAsset(message);
+      } else if (message.kind === 'receipt') {
+        /*
+         * 已读回执：只记状态、不产生气泡、不触发任何执行。
+         *
+         * 单独一种 kind 的原因也在这里 —— 混进群消息会把别人的「已读」
+         * 当成一条发言，对话立刻被淹没，还会被当成「回答」去开跑。
+         */
+        if (message.from.id !== this.bridge.peer().id) {
+          this.markRead(message.ids, message.from.id);
+          await this.persist();
+          await this.bridge.onGroupRead?.().catch(() => undefined);
+          this.bridge.onState?.();
+        }
       } else if (message.kind === 'note') {
         /*
          * 协作消息：先记账，再交给本机 agent。
@@ -2733,7 +3111,9 @@ export class LanSyncService implements Disposable {
          * 幂等按 id 去重 —— 同一台设备既是发起方又收到转发时会重复到达一次。
          */
         if (!this.notes.some((item) => item.id === message.id)) {
-          this.notes = [...this.notes, message].slice(-MAX_NOTES);
+          // 到达即盖章：时间线以本机到达顺序为准（对端时钟可能比本机慢）。
+          const arrived: SyncNote = { ...message, receivedAt: message.receivedAt ?? Date.now() };
+          this.notes = [...this.notes, arrived].slice(-MAX_NOTES);
           await this.persist();
           this.bridge.log(`[sync] 队友消息（${message.from.name}）：${message.body.slice(0, 80)}`);
           /*
@@ -2741,6 +3121,14 @@ export class LanSyncService implements Disposable {
            * 到上限就不再自动应答，把话抛回群里等甲方 —— 对话必须有终止条件。
            */
           const rounds = this.dialogueRounds(message.topic || '');
+          /*
+           * 这条是不是**我问出去的那个问题的回答**？
+           *
+           * 是的话必须叫醒本机 agent 去合并结论 —— 以前只按「对方在提问」叫醒，
+           * 于是回答悄悄落库、提问的那台却已经收工发过「结果」了：
+           * 用户看到的就是「单方面发出结果，实际对方还没说完」。
+           */
+          const answersMyAsk = this.settleAskFor(message);
           if (this.role !== 'off' && message.from.id !== this.bridge.peer().id && rounds > MAX_DIALOGUE_NOTES) {
             this.trace(`agent 之间已来回 ${rounds} 轮，暂停自动应答`);
             void this.postGroup({
@@ -2749,12 +3137,39 @@ export class LanSyncService implements Disposable {
               body: `我和「${deviceLabel(message.from, this.peerList().map((entry) => entry.peer))}」已经来回 ${rounds} 条还没定下来，需要你定一句再继续。`,
               options: ['继续让两台讨论', '只让一台做', '先停下'],
             }).catch(() => undefined);
-          } else if (message.from.id !== this.bridge.peer().id && shouldAutoRespond(message)) {
-            const accepted = await this.bridge.runNote?.(message).catch((error: unknown) => {
+          /*
+           * **只有 `@` 能挡**（用户 2026-11-26 的原话）：
+           * 「让 agent 的消息也像用户消息一样，能被相互看见，唯一约束看不看得见的是
+           * @某个 agent 的行为」。
+           *
+           * 以前这里还多一道「正文像不像在提问」的判断（`shouldAutoRespond`）——
+           * 于是队友一条**陈述性**的回复（「我这边已经改好了，结论如下」）只会落库、
+           * 不叫醒本机，用户看到的就是「对方回了，我这台毫无反应」。
+           * 现在：说给本机的就交付，由 agent 自己判断要不要动手（提示词里写得很清楚）。
+           * 防接龙靠的是上面的 `MAX_DIALOGUE_NOTES` 轮次上限，不是靠猜语气。
+           *
+           * 唯一例外是 `answersMyAsk === 'waiter'`：那一轮正挂起等这条回话，
+           * 它已经通过 `waitForReply` 拿到手了，再叫醒一轮只会让两个线程抢同一件事。
+           */
+          } else if (
+            message.from.id !== this.bridge.peer().id
+            && noteAddressedTo(message, this.bridge.peer().id)
+            && answersMyAsk !== 'waiter'
+          ) {
+            const accepted = await this.bridge.runNote?.(arrived).catch((error: unknown) => {
               this.bridge.log(`[sync] 交付队友消息失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
               return false;
             });
-            if (accepted === false) this.bridge.log('[sync] 面板正忙，队友消息已记录（team_sync status 可查看）', 'warn');
+            /*
+             * 交付不了（本机正在跑）就**排队**，不能丢。
+             *
+             * 2026-11-26 的现场：14 条队友消息全部止步于「面板正忙」，之后没有任何重试 ——
+             * 用户看到的就是「对方秒回了，我这台毫无反应」。
+             */
+            if (accepted === false) {
+              this.enqueuePendingNote(arrived);
+              this.bridge.log('[sync] 面板正忙，队友消息已排队（这一轮结束后立刻交付）', 'warn');
+            }
           }
         }
       } else {
@@ -2778,6 +3193,190 @@ export class LanSyncService implements Disposable {
     this.bridge.onState?.();
   }
 
+  /**
+   * 把一条暂时交付不了的协作消息排进队列，并起一个重投定时器。
+   *
+   * 重投间隔刻意短（4 秒）：一轮跑完通常只是收尾落盘，几秒内就会空出来；
+   * 队列本身有上限，不会因为长时间忙而无限堆积。
+   */
+  private enqueuePendingNote(note: SyncNote): void {
+    if (this.pendingNotes.some((item) => item.id === note.id)) return;
+    this.pendingNotes = [...this.pendingNotes, note].slice(-MAX_PENDING_NOTES);
+    if (this.noteRetryTimer) return;
+    this.noteRetryTimer = setInterval(() => {
+      void this.flushPendingNotes();
+    }, NOTE_RETRY_MS);
+    this.noteRetryTimer.unref?.();
+  }
+
+  /**
+   * 尝试把排队中的协作消息交给本机 agent；交付成功才出队。
+   *
+   * 两个触发点：重投定时器（本机忙完之后自动生效）与**每一轮结束时**的主动 flush
+   * （面板知道那一轮结束了，比等定时器更及时）。
+   */
+  async flushPendingNotes(): Promise<number> {
+    if (this.disposed || !this.pendingNotes.length) {
+      if (this.noteRetryTimer) {
+        clearInterval(this.noteRetryTimer);
+        this.noteRetryTimer = undefined;
+      }
+      return 0;
+    }
+    let delivered = 0;
+    for (const note of [...this.pendingNotes]) {
+      const accepted = await this.bridge.runNote?.(note).catch(() => false);
+      if (accepted === false) break;
+      this.pendingNotes = this.pendingNotes.filter((item) => item.id !== note.id);
+      delivered += 1;
+      this.bridge.log(`[sync] 排队的队友消息已交付（还剩 ${this.pendingNotes.length} 条）`);
+    }
+    if (!this.pendingNotes.length && this.noteRetryTimer) {
+      clearInterval(this.noteRetryTimer);
+      this.noteRetryTimer = undefined;
+    }
+    return delivered;
+  }
+
+  /** 还有几条队友消息在排队（状态栏 / 测试用）。 */
+  pendingNoteCount(): number {
+    return this.pendingNotes.length;
+  }
+
+  /** 已经通知过的「这条 @ 给了别人」（按需求号去重：需求触发与群消息两条路径不会各发一遍）。 */
+  private readonly assigneeNotices = new Set<string>();
+
+  /**
+   * 群里说一句「这条 @ 了 X，我只记录、不动手」。
+   *
+   * 不点名的话，甲方看到一台干活、另一台说风凉话，会以为两台的模式不一样（2026-11-26 现场）。
+   */
+  private async announceAssignmentElsewhere(requirementId: string, assigneeId: string): Promise<void> {
+    const key = requirementId || '';
+    if (!key || this.assigneeNotices.has(key)) return;
+    this.assigneeNotices.add(key);
+    if (this.assigneeNotices.size > 200) this.assigneeNotices.clear();
+    await this.postGroup({
+      author: 'agent',
+      phase: 'progress',
+      body: assignmentNotice({
+        targetLabel: this.labelForPeerId(assigneeId),
+        selfIsTarget: assigneeId === this.localPeer().id,
+      }),
+      requirementId: key,
+    }).catch(() => undefined);
+  }
+
+  /**
+   * 这条需求现在处于哪个阶段（谈 / 等确认 / 执行）。
+   *
+   * 没有记录就是「谈」——新需求**默认只读**，这是用户定的规矩：
+   * 「我希望他们先沟通，只读取各自设备上的文件，不修改…用户确认了再动手修改文件」。
+   */
+  phaseOf(requirementId: string): TeamPhase {
+    if (!requirementId) return initialTeamPhase();
+    const known = this.phases.get(requirementId);
+    if (known) return known;
+    return initialTeamPhase();
+  }
+
+  /** 改阶段（面板在「方案谈完」「甲方确认」两个时刻调用）。 */
+  setPhase(requirementId: string, phase: TeamPhase): void {
+    if (!requirementId) return;
+    if (this.phases.get(requirementId) === phase) return;
+    this.phases.set(requirementId, phase);
+    this.bridge.log(`[sync] 需求 ${requirementId.slice(0, 12)} 进入阶段：${teamPhaseLabel(phase)}`);
+    /*
+     * **必须落盘**。
+     *
+     * 阶段原本只在内存里：重载窗口 / 重启 VS Code 就退回「谈」，甲方确认过的需求
+     * 又变成「不许动手」—— 用户看到的是「确认了怎么还不动」，等于这条功能没做。
+     */
+    void this.persist().catch(() => undefined);
+    this.bridge.onState?.();
+  }
+
+  /** 阶段说法 + 自主迭代标记（群窗口 / 手机顶部共用）。 */
+  phaseLabelWithMode(phase: TeamPhase): string {
+    return this.autonomous() ? `${teamPhaseLabel(phase)} · 自主迭代` : teamPhaseLabel(phase);
+  }
+
+  /** 自主迭代模式是否开启（谈定就开工，不等甲方确认）。 */
+  autonomous(): boolean {
+    try {
+      return this.bridge.autonomousMode?.() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 最近一条需求的阶段（群窗口顶部 / 手机用）。 */
+  activePhase(): { requirementId: string; phase: TeamPhase } | undefined {
+    const last = this.requirements[this.requirements.length - 1];
+    if (!last) return undefined;
+    return { requirementId: last.id, phase: this.phaseOf(last.id) };
+  }
+
+  /**
+   * 甲方在群里说的话，是不是在**确认方案**（或要求改方案）。
+   *
+   * 确认 → 那条需求进入 `implement`（放开写工具）；要求改 → 退回 `negotiate`（只读重谈）。
+   * 都不是 → 返回 undefined，交给原来的「新需求 / 回答追问」判断。
+   */
+  applyPlanDecision(text: string): { requirementId: string; phase: TeamPhase } | undefined {
+    const awaiting = [...this.phases.entries()]
+      .filter(([, phase]) => phase === 'awaiting-approval')
+      .map(([requirementId]) => requirementId);
+    /*
+     * 没有「等确认」的记录时，允许用**群里的方案**兜底。
+     *
+     * 为什么要这道兜底：阶段推进依赖上一轮正常收尾；那一轮被新消息顶掉 / 被停止时，
+     * 阶段会停在「谈」——甲方明明已经看到方案、回了「确认」，却什么都没发生，
+     * 看起来就是「确认没用」。判据必须具体：群里真的有一条写着「方案待甲方确认」的发言。
+     */
+    const latest = this.requirements[this.requirements.length - 1];
+    const planPosted = latest
+      ? this.group.some((message) => message.requirementId === latest.id
+        && message.author === 'agent'
+        && /待甲方确认|请甲方确认|等你确认|请确认方案/.test(message.body))
+      : false;
+    const target = awaiting[awaiting.length - 1]
+      ?? (planPosted && latest && this.phaseOf(latest.id) === 'negotiate' ? latest.id : undefined);
+    /* 既没有待确认的方案、群里也没有方案：这句话跟阶段无关，别抢着解释。 */
+    if (!target) return undefined;
+    const requirementId = target;
+    if (looksLikePlanApproval(text)) {
+      this.setPhase(requirementId, 'implement');
+      return { requirementId, phase: 'implement' };
+    }
+    if (looksLikePlanRejection(text)) {
+      this.setPhase(requirementId, 'negotiate');
+      return { requirementId, phase: 'negotiate' };
+    }
+    return undefined;
+  }
+
+  /**
+   * 设备 id → 给人看的统一标识（系统 · 设备名）。
+   *
+   * 手机端拿不到也不需要拿到 id：它只认名字。认不出来的 id（对端已经离开、或旧存档里
+   * 留下的）给一个可读的兜底，绝不把一串哈希丢到界面上。
+   */
+  labelForPeerId(peerId: string): string {
+    if (!peerId) return '未知设备';
+    if (peerId === this.bridge.peer().id) return `${this.bridge.peer().name}（本机）`;
+    const roster = [this.bridge.peer(), ...this.peerList().map((entry) => entry.peer)];
+    const peer = roster.find((item) => item.id === peerId);
+    return peer ? deviceLabel(peer, roster) : '已离开的设备';
+  }
+
+  /** 群里出现过的所有设备 id（本机 + 在线对端 + 已读记录里出现过的）。 */
+  private allPeerIds(): string[] {
+    const ids = new Set<string>([this.bridge.peer().id, ...this.peerList().map((entry) => entry.peer.id)]);
+    for (const peers of this.reads.values()) for (const id of peers) ids.add(id);
+    return [...ids];
+  }
+
   /** 把账本写进仓库：这是「对齐」的可见产物，人和模型都能读。 */
   private async refreshLedger(): Promise<void> {
     const rows = buildLedger(this.requirements, this.reports);
@@ -2797,12 +3396,18 @@ export class LanSyncService implements Disposable {
    * 顺序很重要 —— 先本地开跑，用户立刻看到自己的设备动起来了；广播失败也只影响对端，
    * 不会让本机白等一次网络超时。
    */
-  async shareRequirement(text: string, assignee = ''): Promise<{ ok: boolean; message: string; requirement?: SyncRequirement }> {
+  async shareRequirement(
+    text: string,
+    assignee = '',
+    assets?: readonly GroupAssetRef[],
+  ): Promise<{ ok: boolean; message: string; requirement?: SyncRequirement }> {
     // 用逻辑时钟而不是本机 Date.now()：多设备并发时才能排出全序。
     const requirement = makeRequirement(this.localPeer(), text, this.nextClock());
     if (!requirement) return { ok: false, message: '需求内容为空。' };
       // 只在指定了某台设备时才带 assignee：留空表示「谁都可以接」。
       if (assignee) requirement.assignee = assignee;
+      // 附件元信息：接收方据此等分片到齐，把本机路径交给自己的 agent。
+      if (assets?.length) requirement.assets = assets.slice(0, 8);
       // 带上本机选中的项目：对方据此判断「是不是同一个项目」。
       const project = this.activeProjectName();
       if (project) requirement.project = project;
@@ -2874,7 +3479,7 @@ export class LanSyncService implements Disposable {
    * 与 `shareRequirement` 的区别：需求一定会开跑一轮；协作消息只是把一段话送给
    * 对端 agent，由它判断要不要动手、要不要回。这也是「不要为了回应而改代码」的落点。
    */
-  async shareNote(input: { body: string; topic?: string; replyTo?: string }): Promise<{ ok: boolean; message: string }> {
+  async shareNote(input: { body: string; topic?: string; replyTo?: string; to?: string }): Promise<{ ok: boolean; message: string; note?: SyncNote; delivered: boolean }> {
     /*
      * 自动成线程：没指定 replyTo 时，接在「最近一条别人发来的消息」之后。
      *
@@ -2886,13 +3491,15 @@ export class LanSyncService implements Disposable {
       ...input,
       replyTo: input.replyTo || lastOther?.id || '',
     });
-    if (!note) return { ok: false, message: '消息内容为空。' };
+    if (!note) return { ok: false, message: '消息内容为空。', delivered: false };
+    // 本地产生：到达时刻就是它被造出来的时刻（对端按自己的到达时刻盖章）。
+    note.receivedAt = note.at;
     this.notes = [...this.notes, note].slice(-MAX_NOTES);
     await this.persist();
     void this.relayOut(note);
     if (this.role === 'off') {
       this.bridge.onState?.();
-      return { ok: true, message: '本机已记录。局域网同步未启用，没有发出。' };
+      return { ok: true, message: '本机已记录。局域网同步未启用，没有发出。', note, delivered: false };
     }
     const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: note });
     if (this.role === 'hub') {
@@ -2903,6 +3510,8 @@ export class LanSyncService implements Disposable {
       return {
         ok: targets.length === 0 || delivered > 0,
         message: targets.length ? `已发给 ${delivered}/${targets.length} 台设备。` : '已记录，当前没有其它设备加入。',
+        note,
+        delivered: delivered > 0,
       };
     }
     const response = await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', {
@@ -2911,7 +3520,149 @@ export class LanSyncService implements Disposable {
       message: note,
     }).catch(() => undefined);
     this.bridge.onState?.();
-    return { ok: Boolean(response?.ok), message: response?.ok ? '已发给对端。' : '记录成功，但发送失败（主机没响应）。' };
+    return {
+      ok: Boolean(response?.ok),
+      message: response?.ok ? '已发给对端。' : '记录成功，但发送失败（主机没响应）。',
+      note,
+      delivered: Boolean(response?.ok),
+    };
+  }
+
+  /**
+   * 记下「我刚刚问了队友一个问题」，并返回等待句柄。
+   *
+   * 只在 `action=ask` 时调用 —— 普通 `send` 是同步进展，不算在等回话。
+   *
+   * **收件人是「群里其它每一台」，不是某一台**：协作群可以有三台以上设备，
+   * 只记第一台会让第二台的回答被当成「还没回话」，收尾永远降级成进度。
+   */
+  noteAskSent(note: SyncNote, requirementId: string, delivered = true, targets?: readonly SyncPeer[]): void {
+    /*
+     * 没真的发出去（同步没开 / 群里只有本机 / 发送失败）就不算「在等回话」：
+     * 没人会回答，记下来只会让这一轮永远交不出结果。
+     */
+    if (!delivered) return;
+    const roster = [...(targets ?? this.peerList().map((entry) => entry.peer))];
+    const recipients = roster.map((peer) => ({ id: peer.id, label: deviceLabel(peer, roster) }));
+    if (!recipients.length) return;
+    this.pendingAsks = [
+      ...this.pendingAsks.filter((item) => item.noteId !== note.id),
+      {
+        noteId: note.id,
+        topic: note.topic,
+        requirementId,
+        at: Date.now(),
+        targets: recipients,
+        replied: [],
+      },
+    ].slice(-8);
+    this.askReplies.delete(note.id);
+    this.bridge.onState?.();
+  }
+
+  /**
+   * 等这条提问的回答（**所有**收件人都回话才算齐）。
+   *
+   * 有上限的原因：队友可能正在跑长任务。等一会儿是「真的沟通」，
+   * 无限等就是卡死 —— 超时后把已经收到的回答交回去，并如实说还差谁。
+   */
+  waitForReply(noteId: string, timeoutMs: number): Promise<SyncNote[]> {
+    /*
+     * 同一段时间里连问好几个问题时，后面的等待要缩短：每个都等 90 秒，
+     * 一轮下来能把界面卡住好几分钟 —— 沟通要真等，但不能等到用户以为死机。
+     */
+    const recent = this.pendingAsks.filter((item) => Date.now() - item.at < 5 * 60_000).length;
+    const budget = recent > 1 ? Math.min(timeoutMs, 20_000) : timeoutMs;
+    const collected = (): SyncNote[] => this.askReplies.get(noteId) ?? [];
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        this.askWaiters.delete(noteId);
+        resolve(collected());
+      };
+      // 已经问过的那个问题可能早就被回答完了（同一轮里重复等）。
+      if (!this.pendingAsks.some((item) => item.noteId === noteId)) {
+        if (collected().length) { resolve(collected()); return; }
+      }
+      this.askWaiters.set(noteId, finish);
+      setTimeout(finish, Math.max(1_000, budget));
+    });
+  }
+
+  /** 这条提问还在等谁回话（标签）。 */
+  pendingAskPeers(noteId: string): string[] {
+    const ask = this.pendingAsks.find((item) => item.noteId === noteId);
+    if (!ask) return [];
+    return ask.targets.filter((target) => !ask.replied.includes(target.id)).map((target) => target.label);
+  }
+
+  /** 还在等谁回话（群里收尾据此判断「能不能算结果」）。 */
+  pendingAsksFor(requirementId: string): { toId: string; label: string; at: number }[] {
+    /*
+     * 过期的提问不再挡收尾：队友可能已经离线 / 换群 / 单方面放弃。
+     * 用它挡一辈子，任务就永远交不出结果 —— 那比「单方面宣布完成」更糟。
+     */
+    const present = new Set(this.peerList().map((entry) => entry.peer.id));
+    /*
+     * 只有**确认过群里有谁**（peerList 非空）时才按「对方已离群」删收件人。
+     * peerList 暂时为空（刚重载 / 网络抖动）时不能当成「都走了」—— 那会把
+     * 还在等的提问悄悄清掉，于是这一轮被当成跑完。
+     */
+    const known = present.size > 0;
+    const kept = this.pendingAsks
+      .filter((item) => Date.now() - item.at < ASK_WAIT_EXPIRY_MS)
+      .map((item) => ({
+        ...item,
+        targets: known ? item.targets.filter((target) => present.has(target.id)) : item.targets,
+      }))
+      .filter((item) => item.targets.length > 0);
+    this.pendingAsks = kept;
+    const key = requirementId || '';
+    return kept
+      .filter((item) => !key || item.requirementId === key || item.requirementId === '')
+      .flatMap((item) => item.targets
+        .filter((target) => !item.replied.includes(target.id))
+        .map((target) => ({ toId: target.id, label: target.label, at: item.at })));
+  }
+
+  /** 收到一条协作消息：如果它回答了我问出去的问题，就算「这一台回话了」。 */
+  private settleAskFor(note: SyncNote): 'waiter' | 'pending' | false {
+    /*
+     * 判据：显式回复这条提问（`replyTo` 对得上），或同一主题下队友主动回了话。
+     * 只认「我问出去的那个主题」，不把无关进展当成回答 —— 否则一次闲聊就会
+     * 让「还在等」变假。
+     */
+    const matched = this.pendingAsks.filter((item) => item.targets.some((target) => target.id === note.from.id))
+      .filter((item) => note.replyTo === item.noteId || (note.topic && item.topic === note.topic));
+    if (!matched.length) return false;
+    let resolvedWaiter = false;
+    let fullySettled = false;
+    for (const ask of matched) {
+      if (!ask.replied.includes(note.from.id)) {
+        ask.replied = [...ask.replied, note.from.id];
+        this.askReplies.set(ask.noteId, [...(this.askReplies.get(ask.noteId) ?? []), note]);
+      }
+      // 还有收件人没回话：这条提问继续挂着，但不需要把本机再叫醒一轮。
+      if (ask.targets.every((target) => ask.replied.includes(target.id))) {
+        this.pendingAsks = this.pendingAsks.filter((item) => item.noteId !== ask.noteId);
+        const waiter = this.askWaiters.get(ask.noteId);
+        if (waiter) {
+          resolvedWaiter = true;
+          waiter();
+        } else {
+          fullySettled = true;
+        }
+      }
+    }
+    this.bridge.onState?.();
+    /*
+     * 没人等在等（那一轮已经收工）时才需要新起一轮合并结论 ——
+     * 只有「所有收件人都回完」才算「新起一轮去合并」的时机。
+     */
+    if (resolvedWaiter) return 'waiter';
+    return fullySettled ? 'pending' : false;
   }
 
   /**
@@ -2931,6 +3682,14 @@ export class LanSyncService implements Disposable {
     to?: string;
     options?: readonly string[];
     meta?: import('./lanProtocol').GroupMessageMeta;
+    /** 这条发言自带的附件（字节已经通过 `shareAsset` 发出去）。 */
+    assets?: GroupAssetRef[];
+    /**
+     * 不挂在任何需求上（报数这类群口令）。
+     *
+     * 否则会自动关联「最近一条需求」，把那条需求的状态又拉回「待解析」。
+     */
+    detached?: boolean;
   }): Promise<{ ok: boolean; message: string; group?: SyncGroupMessage }> {
     /*
      * 关联需求：没指定就用最近的一条。
@@ -2938,12 +3697,15 @@ export class LanSyncService implements Disposable {
      * 模型经常只写 `action=analysis` 而忘了带需求号 —— 让它自己再猜一次毫无价值，
      * 而「最近一条需求」在真实使用里几乎总是对的。
      */
-    const requirementId = input.requirementId
-      || this.requirements[this.requirements.length - 1]?.id
-      || '';
-    const group = makeGroupMessage(this.localPeer(), { ...input, requirementId });
+    const { detached, ...message } = input;
+    const requirementId = detached
+      ? ''
+      : input.requirementId || this.requirements[this.requirements.length - 1]?.id || '';
+    const group = makeGroupMessage(this.localPeer(), { ...message, requirementId });
     if (!group) return { ok: false, message: '群消息内容为空。' };
-    this.group = [...this.group, group].slice(-MAX_GROUP_MESSAGES);
+    // 本机发出的消息：到达时刻就是它被造出来的时刻（对端则以到达它的时刻为准）。
+    const local: typeof group = { ...group, receivedAt: group.at };
+    this.group = [...this.group, local].slice(-MAX_GROUP_MESSAGES);
     this.trace(`本机发出：${input.author === 'user' ? '甲方' : '乙方'}·${input.phase}「${input.body.slice(0, 24)}」`);
     // 正式那条已经进群了，临时回显就地消失（不额外刷一次界面）。
     this.clearPendingGroup();
@@ -2954,12 +3716,25 @@ export class LanSyncService implements Disposable {
      * 群消息越多写盘越久，Windows 上还要过一遍杀毒扫描，用户看到的就是「发完半天才出现」。
      * 内存里已经 push 过了，界面读的就是这份数据；落盘紧跟其后，语义不变。
      */
-    await this.bridge.onGroupMessage?.(group).catch(() => undefined);
+    await this.bridge.onGroupMessage?.(local).catch(() => undefined);
+    /*
+     * 本机也要算「已读」——甲方的、乙方的都一样。
+     *
+     * 用户实况（2026-11-25）：「我发的消息没有 @ 任何 agent，默认是所有人都收到消息，
+     * 但是显示只有『已读：macOS …』」——因为以前只有**收到别人消息**时才回执，
+     * 自己发的那条永远没有自己的回执。可本机确实是收到并要处理这条的（它就在本机
+     * 的群记录里），所以按同一条规则补上：说给本机的，自己也记一次已读。
+     *
+     * 2026-11-26 再放宽到所有作者：agent 自己的发言同样要显示「哪些 agent 已读」。
+     */
+    if (this.addressedToLocal(local)) {
+      this.markRead([local.id], this.localPeer().id);
+    }
     await this.persist();
     await this.refreshTranscript();
     void this.relayOut(group);
     this.bridge.onState?.();
-    if (this.role === 'off') return { ok: true, message: '已记入团队群（未启用局域网同步，没有发给队友）。', group };
+    if (this.role === 'off') return { ok: true, message: '已记入团队群（未启用局域网同步，没有发给队友）。', group: local };
 
     const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message: group });
     if (this.role === 'hub') {
@@ -2968,12 +3743,272 @@ export class LanSyncService implements Disposable {
     } else {
       await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.credential(), port: this.port, message: group }).catch(() => undefined);
     }
-    return { ok: true, message: '已发到团队群。', group };
+    return { ok: true, message: '已发到团队群。', group: local };
   }
 
   /** 群里的最近发言（`team_sync status` 与面板用）。 */
   recentGroup(limit = 12): SyncGroupMessage[] {
     return this.group.slice(-Math.max(1, limit));
+  }
+
+  /**
+   * 把一条网络消息发给群里其它设备（与 `postGroup` 相同的传输路径）。
+   *
+   * 回执要快、要轻，但不能走 `/deliver` 之外的另一条路 —— 两台之间的
+   * 信任与端口规则只有一套，另开一条迟早会出现「群消息能到、回执到不了」。
+   */
+  private async sendToPeers(message: SyncMessage): Promise<void> {
+    void this.relayOut(message);
+    if (this.role === 'off') return;
+    const payload = JSON.stringify({ protocol: SYNC_PROTOCOL_VERSION, code: this.credential(), port: this.port, message });
+    if (this.role === 'hub') {
+      const targets = this.peerList().filter((entry) => entry.address);
+      await Promise.allSettled(targets.map((entry) => postRaw(entry.address, '/hwchat-sync/v1/deliver', payload)));
+      return;
+    }
+    await this.postJson(this.hubAddress, '/hwchat-sync/v1/message', { code: this.credential(), port: this.port, message })
+      .catch(() => undefined);
+  }
+
+  /**
+   * 告诉群里：这些消息我已经收到了（已读）。
+   *
+   * 与「答一句」分开：收到是确定的、几乎零成本，而回答要跑一轮模型。
+   * 甲方因此能立刻区分「没收到」和「收到了但正忙」。
+   */
+  async ackGroup(ids: readonly string[]): Promise<void> {
+    const receipt = makeReceipt(this.localPeer(), ids);
+    if (!receipt) return;
+    // 自己也记一份：本机面板靠它显示「哪台已读」。
+    this.markRead(receipt.ids, receipt.from.id);
+    await this.sendToPeers(receipt);
+  }
+
+  /** 记下「这些消息被这台设备读到了」。 */
+  private markRead(ids: readonly string[], peerId: string): void {
+    if (!peerId) return;
+    let changed = false;
+    for (const id of ids) {
+      const set = this.reads.get(id) ?? new Set<string>();
+      if (set.has(peerId)) continue;
+      set.add(peerId);
+      this.reads.set(id, set);
+      changed = true;
+    }
+    if (!changed) return;
+    // 只留还在群里的消息，避免无限增长。
+    const alive = new Set(this.group.map((item) => item.id));
+    for (const id of [...this.reads.keys()]) {
+      if (!alive.has(id)) this.reads.delete(id);
+    }
+  }
+
+  /** 某条群消息已被哪些设备读到了（设备 id）。 */
+  readsOf(messageId: string): string[] {
+    return [...(this.reads.get(messageId) ?? [])];
+  }
+
+  /** 全部已读回执（面板一次取完）。 */
+  allReads(): Record<string, string[]> {
+    return Object.fromEntries([...this.reads.entries()].map(([id, peers]) => [id, [...peers]]));
+  }
+
+  /** 附件落盘目录（与同步状态文件同一层，重载窗口后仍然在）。 */
+  private assetsDir(): string {
+    return join(dirname(this.storagePath), 'assets');
+  }
+
+  /**
+   * 把一个附件发给群里其它设备，返回它的元信息。
+   *
+   * 本机也留一份（写进 `assets/`）：**发消息的那台 agent 同样要能读到**，
+   * 而面板渲染图片需要真实文件路径。
+   */
+  async shareAsset(input: {
+    name: string;
+    mimeType: string;
+    kind: 'image' | 'file';
+    dataBase64: string;
+  }): Promise<GroupAssetRef | undefined> {
+    const dataBase64 = (input.dataBase64 ?? '').replace(/\s+/g, '');
+    if (!dataBase64) return undefined;
+    if (dataBase64.length > ASSET_CHUNK_CHARS * ASSET_MAX_CHUNKS) {
+      this.bridge.log('[sync] 附件过大，没有随群消息转发（本机仍可用）', 'warn');
+      return undefined;
+    }
+    const id = `a${randomBytes(6).toString('hex')}`;
+    const safe = input.name.replace(/[^\w.\-\u4e00-\u9fa5]+/g, '_').slice(-60) || 'attachment';
+    const path = join(this.assetsDir(), `${id}-${safe}`);
+    const bytes = Buffer.from(dataBase64, 'base64');
+    try {
+      await mkdir(this.assetsDir(), { recursive: true });
+      await writeFile(path, bytes);
+      this.assetPaths.set(id, path);
+    } catch (error) {
+      this.bridge.log(`[sync] 附件落盘失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+    }
+    const ref: GroupAssetRef = {
+      id,
+      name: input.name,
+      mimeType: input.mimeType,
+      kind: input.kind,
+      bytes: bytes.byteLength,
+    };
+    if (this.role === 'off') return ref;
+    const total = Math.ceil(dataBase64.length / ASSET_CHUNK_CHARS);
+    const message = (index: number): SyncAssetChunk => ({
+      kind: 'asset',
+      id,
+      from: this.localPeer(),
+      index,
+      total,
+      name: ref.name,
+      mimeType: ref.mimeType,
+      assetKind: ref.kind,
+      dataBase64: dataBase64.slice(index * ASSET_CHUNK_CHARS, (index + 1) * ASSET_CHUNK_CHARS),
+      at: Date.now(),
+    });
+    /*
+     * 分片**顺序发**：并发几十个 HTTP 会互相抢带宽，局域网里也更容易出现
+     * 「前一片到了、后一片超时」，看起来就是「图片一直收不全」。
+     */
+    void (async () => {
+      for (let index = 0; index < total; index += 1) {
+        await this.sendToPeers(message(index)).catch(() => undefined);
+      }
+    })();
+    return ref;
+  }
+
+  /**
+   * 上报本机 agent 的状态（指示灯），并广播给群里的其它设备。
+   *
+   * 只在**真的变化**时才广播：状态是低频事件，但一次任务里收尾/重试会连着触发几次，
+   * 每次都发等于把群当成心跳通道。
+   */
+  reportAgentState(state: AgentActivity): void {
+    const me = this.bridge.peer().id;
+    const previous = this.activities.get(me)?.state;
+    if (previous === state) return;
+    this.activities.set(me, { state, at: Date.now() });
+    void this.broadcastAgentState(state);
+    this.bridge.onState?.();
+  }
+
+  private async broadcastAgentState(state: AgentActivity): Promise<void> {
+    const control: SyncControlMessage = {
+      kind: 'control',
+      id: `ctl-agent-${this.bridge.peer().id.slice(0, 8)}-${Date.now().toString(36)}`,
+      from: this.localPeer(),
+      action: 'agentState',
+      agentState: state,
+      running: state === 'running',
+      at: Date.now(),
+    };
+    void this.relayOut(control);
+    await this.sendToPeers(control).catch(() => undefined);
+  }
+
+  /** 每台设备当前状态（面板据此画指示灯）。 */
+  agentStates(): Record<string, AgentActivity> {
+    return Object.fromEntries([...this.activities.entries()].map(([id, value]) => [id, value.state]));
+  }
+
+  /** 附件落盘目录（群消息里的图片就在这儿；面板要把 `webviewSrc` 建在这个根下）。 */
+  assetDirectory(): string {
+    return this.assetsDir();
+  }
+
+  /** 附件在本机的路径（还没收齐 / 没这个 id 时返回空串）。 */
+  assetPath(id: string): string {
+    /*
+     * 先查内存表，再按文件名前缀在磁盘上找一遍。
+     *
+     * 用户实况（2026-11-25）：「贴进团队群对话框和团队任务对话框里面的图片，只显示占位图」——
+     * 图片其实已经落盘（`assets/<id>-<name>`），但 `assetPaths` 只在内存里，
+     * 重载窗口 / 换进程之后 id → 路径就查不到了，界面只能画占位。
+     */
+    const known = this.assetPaths.get(id);
+    if (known ? existsSync(known) : false) return known!;
+    if (!id) return '';
+    try {
+      const dir = this.assetsDir();
+      if (!existsSync(dir)) return '';
+      const hit = readdirSync(dir).find((name) => name.startsWith(`${id}-`));
+      if (!hit) return '';
+      const path = join(dir, hit);
+      this.assetPaths.set(id, path);
+      return path;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * 等这些附件落到本机（最多 `timeoutMs`），返回 资产 id → 本机路径。
+   *
+   * 甲方的消息先到、分片后到，所以跑 agent 之前要**等一下**：
+   * 直接开跑会得到「看不到图片」的回答，而这正是用户报的问题。
+   */
+  async waitForAssets(ids: readonly string[], timeoutMs = 4_000): Promise<Record<string, string>> {
+    const wanted = ids.filter(Boolean);
+    if (!wanted.length) return {};
+    const done = (): Record<string, string> => Object.fromEntries(
+      wanted.filter((id) => this.assetPaths.has(id)).map((id) => [id, this.assetPaths.get(id)!]),
+    );
+    let result = done();
+    for (let waited = 0; waited < timeoutMs && Object.keys(result).length < wanted.length; waited += 100) {
+      if (this.role === 'off') break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      result = done();
+    }
+    return result;
+  }
+
+  /** 收一片附件；到齐了就落盘并通知面板。 */
+  private async ingestAsset(chunk: SyncAssetChunk): Promise<void> {
+    if (chunk.from.id === this.bridge.peer().id) return;
+    if (this.assetPaths.has(chunk.id)) return;
+    const box = this.assetInbox.get(chunk.id) ?? {
+      name: chunk.name,
+      mimeType: chunk.mimeType,
+      kind: chunk.assetKind,
+      total: chunk.total,
+      /*
+       * 必须 `fill(undefined)`：`new Array(n)` 是**稀疏数组**，`some()` 会跳过空槽，
+       * 于是「只到了第一片」也会被判成「到齐了」，落盘成一张半截图。
+       * 这个坑是用真实分片传输的端到端测试抓出来的。
+       */
+      parts: new Array<string | undefined>(chunk.total).fill(undefined),
+    };
+    if (box.total !== chunk.total) return;
+    box.parts[chunk.index] = chunk.dataBase64;
+    this.assetInbox.set(chunk.id, box);
+    if (box.parts.filter((part) => part !== undefined).length < box.total) return;
+    this.assetInbox.delete(chunk.id);
+    const safe = box.name.replace(/[^\w.\-\u4e00-\u9fa5]+/g, '_').slice(-60) || 'attachment';
+    const path = join(this.assetsDir(), `${chunk.id}-${safe}`);
+    try {
+      await mkdir(this.assetsDir(), { recursive: true });
+      await writeFile(path, Buffer.from(box.parts.join(''), 'base64'));
+      this.assetPaths.set(chunk.id, path);
+      this.trace(`收到附件「${box.name}」：${path}`);
+      await this.bridge.onAssetReady?.(chunk.id, path);
+      this.bridge.onState?.();
+    } catch (error) {
+      this.bridge.log(`[sync] 保存收到的附件失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+    }
+  }
+
+  /**
+   * 这条群消息是不是说给本机的。
+   *
+   * 判据与接收端处理一致：`to` 空 = 所有人、`assignee` 空 = 谁都能接。
+   * 派给别人的消息不该回「已读」—— 否则甲方会以为那台也要做。
+   */
+  private addressedToLocal(message: SyncGroupMessage): boolean {
+    const me = this.bridge.peer().id;
+    return (!message.to || message.to === me) && (!message.assignee || message.assignee === me);
   }
 
   /**
@@ -3005,8 +4040,14 @@ export class LanSyncService implements Disposable {
      * 这些消息以前只写进账本 / 日志，界面上看不到。现在一起交给面板，
      * 按时间合进同一条时间线，并标出「回复的是哪一条」。
      */
-    dialogue: { id: string; who: string; body: string; at: number; replyTo: string }[];
+    dialogue: { id: string; who: string; body: string; at: number; receivedAt?: number; replyTo: string; to?: string; toLabel?: string }[];
     pending?: { body: string; time: string };
+    /** 当前阶段（谈 / 等确认 / 执行）。群窗口顶部要显示，甲方才知道现在能不能动手。 */
+    phase?: TeamPhase;
+    phaseLabel?: string;
+    phaseRequirementId?: string;
+    /** 自主迭代模式：谈定就开工，不会停下来等甲方确认。 */
+    autonomous?: boolean;
     /**
      * 「乙方在等你回答」那条追问：**必须带上是哪台在问**。
      *
@@ -3027,8 +4068,16 @@ export class LanSyncService implements Disposable {
       ? [...this.group].reverse().find((message) => message.requirementId === questionId && message.phase === 'question')
       : undefined;
     const roster = [this.localPeer(), ...this.peerList().map((entry) => entry.peer)];
+    const active = this.activePhase();
     return {
       role: this.role,
+      /*
+       * 当前阶段（谈 / 等确认 / 执行）：群窗口和手机都要能一眼看出
+       * 「现在是还在谈、还是已经开干」——否则甲方会以为 agent 又擅自动手了。
+       */
+      ...(active ? { phase: active.phase, phaseLabel: this.phaseLabelWithMode(active.phase), phaseRequirementId: active.requirementId } : {}),
+      /** 自主迭代模式（群窗口顶部显示一个标记，甲方才知道不会来问自己）。 */
+      autonomous: this.autonomous(),
       peers: [this.localPeer(), ...this.peerList().map((entry) => entry.peer)],
       messages: this.group,
       dialogue: this.notes.slice(-40).map((note) => ({
@@ -3036,7 +4085,10 @@ export class LanSyncService implements Disposable {
         who: deviceLabel(note.from, roster),
         body: note.body,
         at: note.at,
+        ...(note.receivedAt !== undefined ? { receivedAt: note.receivedAt } : {}),
         replyTo: note.replyTo ?? '',
+        ...(note.to ? { to: note.to } : {}),
+        ...(note.to ? { toLabel: deviceLabel(roster.find((peer) => peer.id === note.to) ?? { id: note.to }, roster) } : {}),
       })),
       ...(this.pendingGroup
         ? { pending: { body: this.pendingGroup.body, time: new Date(this.pendingGroup.at).toTimeString().slice(0, 5) } }
@@ -3068,8 +4120,18 @@ export class LanSyncService implements Disposable {
     const question = [...this.group].reverse()
       .find((message) => message.requirementId === questionId && message.phase === 'question');
     if (!question) return undefined;
+    /*
+     * **没有真实提问方就不算追问。**
+     *
+     * `from.id` 为空的消息（老版本对端 / 中继页补的消息）如果被当成追问，
+     * 之后的回答只会发出一条没有 `to`、没有 `assignee` 的群消息：
+     * 群里看起来「没 @ 任何人」，所有设备都当它是说给所有人的，而提问方反而收不到。
+     * 宁可退化成普通需求（会正常广播 + 指派），也不要发一条谁也接不住的消息。
+     */
+    const askerId = (question.from?.id ?? '').trim();
+    if (!askerId) return undefined;
     const roster = [this.localPeer(), ...this.peerList().map((entry) => entry.peer)];
-    return { requirementId: questionId, askerId: question.from.id, askerLabel: deviceLabel(question.from, roster) };
+    return { requirementId: questionId, askerId, askerLabel: deviceLabel(question.from, roster) };
   }
 
   /**
@@ -3079,9 +4141,17 @@ export class LanSyncService implements Disposable {
    * 还是一条**新需求**（新开一条、再广播给对端）。判错会让追问永远收不了尾。
    */
   openQuestionRequirement(): string | undefined {
-    for (let index = this.requirements.length - 1; index >= 0; index -= 1) {
-      const requirement = this.requirements[index]!;
-      if (groupAgreement(this.group, requirement.id) === 'awaiting-user') return requirement.id;
+    /*
+     * 从最新一条往前找：**甲方只要再说过话，之前的追问就不再「在等」**。
+     *
+     * 用户实况（2026-11-25）：「我没 @ 谁，直接发的消息却显示 @windows」——
+     * 以前按需求逐个查 `awaiting-user`，于是旧需求上那条追问永远算「在等」，
+     * 甲方之后每一句话都被它劫走（只发给提问的那台）。
+     */
+    for (let index = this.group.length - 1; index >= 0; index -= 1) {
+      const message = this.group[index]!;
+      if (message.author === 'user') return undefined;
+      if (message.phase === 'question') return message.requirementId;
     }
     return undefined;
   }
@@ -3298,6 +4368,10 @@ export class LanSyncService implements Disposable {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.noteRetryTimer) {
+      clearInterval(this.noteRetryTimer);
+      this.noteRetryTimer = undefined;
+    }
     this.stopPeerHeartbeat();
     for (const id of [...this.approvals.keys()]) this.resolveApproval(id, false);
     this.gate.revokeAll();

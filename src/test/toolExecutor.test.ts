@@ -103,6 +103,16 @@ function call(name: string, args: Record<string, unknown>): ToolCall {
   return { id: `call-${name}`, type: 'function', function: { name, arguments: JSON.stringify(args) } };
 }
 
+/**
+ * 真实执行用的「危险命令」：两个平台各有一个会被 `classifyCommandTier` 判成 severe 的写法。
+ * Windows 没有 `chmod`；`rd /s` 在分类表里有对应规则（见 `core/permissions.ts`），
+ * 且 `HWChat/sandbox` 在夹具里真的存在，所以它既能被判危险，也能真的执行成功。
+ */
+const SEVERE_COMMAND = process.platform === 'win32' ? 'del /f /q sandbox\\*' : 'chmod 777 ./sandbox';
+
+/** 读父目录里的文件：Windows 用 `type`（没有 `cat`）。 */
+const READ_PARENT = process.platform === 'win32' ? 'type ..\\package.json' : 'cat ../package.json';
+
 function recorder(decision: boolean | ((request: ToolApprovalRequest) => boolean) = true) {
   const seen: ToolApprovalRequest[] = [];
   const requestApproval = async (request: ToolApprovalRequest): Promise<boolean> => {
@@ -167,7 +177,7 @@ test('list_directory 不传 path 时列出所有工作区根目录，而不是�
 // ── 3. 命令里的 `..` 应按 cwd 解析后判界，而不是一律拒绝 ─────────────────
 test('命令中使用 .. 但解析后仍在工作区内时应允许', async () => {
   const { result } = await run('run_command', {
-    command: 'cat ../package.json',
+    command: READ_PARENT,
     cwd: 'HWChat/src',
   });
   assert.equal(result.status, 'success', `实际：${result.status} / ${result.summary}`);
@@ -205,7 +215,7 @@ test('askAll 预设：读取也要逐次确认，拒绝后不执行', async () =
 });
 
 test('review 预设：危险命令逐次确认，拒绝后不执行', async () => {
-  const { result, requests } = await run('run_command', { command: 'chmod 777 ./sandbox', cwd: 'HWChat' }, { approve: false });
+  const { result, requests } = await run('run_command', { command: SEVERE_COMMAND, cwd: 'HWChat' }, { approve: false });
   assert.equal(requests.length, 1);
   assert.match(requests[0]!.detail, /严重风险命令/);
   assert.equal(result.status, 'denied');
@@ -217,7 +227,7 @@ test('危险命令的审批请求带 dangerous 标记（面板据此改走原生
    * `approvalResponse` 就等于自己批准自己。所以危险档必须能在宿主侧被认出来，
    * 改走不经过 webview 的原生模态框（架构评审 ⑫）。
    */
-  const { requests } = await run('run_command', { command: 'chmod 777 ./sandbox', cwd: 'HWChat' }, { approve: true });
+  const { requests } = await run('run_command', { command: SEVERE_COMMAND, cwd: 'HWChat' }, { approve: true });
   assert.equal(requests.length, 1);
   assert.equal(requests[0]!.dangerous, true, '严重风险命令必须打上 dangerous');
 });
@@ -229,13 +239,13 @@ test('普通操作的审批请求不带 dangerous（不要把所有确认都变�
 });
 
 test('askAll 预设：危险命令直接拒绝，不弹确认', async () => {
-  const { result, requests } = await run('run_command', { command: 'chmod 777 ./sandbox', cwd: 'HWChat' }, { preset: 'askAll' });
+  const { result, requests } = await run('run_command', { command: SEVERE_COMMAND, cwd: 'HWChat' }, { preset: 'askAll' });
   assert.equal(requests.length, 0);
   assert.equal(result.status, 'denied');
 });
 
 test('autopilot 预设：危险命令自动执行，不再确认', async () => {
-  const { result, requests } = await run('run_command', { command: 'chmod 777 ./sandbox', cwd: 'HWChat' }, { preset: 'autopilot' });
+  const { result, requests } = await run('run_command', { command: SEVERE_COMMAND, cwd: 'HWChat' }, { preset: 'autopilot' });
   assert.equal(requests.length, 0, 'autopilot 不应再询问');
   assert.equal(result.status, 'success', `${result.status} / ${result.summary}`);
 });
@@ -268,7 +278,7 @@ const ACTIONS: Array<{
   },
   { label: '只读命令（git status）', tool: 'run_command', args: { command: 'git status', cwd: 'HWChat' }, column: 'readOnlyCommandPolicy' },
   { label: '常规命令（npm run compile）', tool: 'run_command', args: { command: 'npm run compile', cwd: 'HWChat' }, column: 'commandPolicy' },
-  { label: '危险命令（chmod 777）', tool: 'run_command', args: { command: 'chmod 777 ./sandbox', cwd: 'HWChat' }, column: 'dangerousCommandPolicy' },
+  { label: '危险命令（真实执行用的那一条）', tool: 'run_command', args: { command: SEVERE_COMMAND, cwd: 'HWChat' }, column: 'dangerousCommandPolicy' },
 ];
 
 test('预设与表现逐项一致（四个预设 × 七类动作）', async () => {
@@ -337,7 +347,7 @@ test('一条对话里读过外部网页，不会改变任何后续动作的权�
 });
 
 test('预设说「禁止」就是拒绝，不会退化成「再问一次」', async () => {
-  const { result, requests } = await run('run_command', { command: 'chmod 777 ./sandbox', cwd: 'HWChat' }, { preset: 'askAll' });
+  const { result, requests } = await run('run_command', { command: SEVERE_COMMAND, cwd: 'HWChat' }, { preset: 'askAll' });
   assert.equal(requests.length, 0);
   assert.equal(result.status, 'denied');
 });

@@ -64,6 +64,11 @@ export interface ResolveReferencesOptions {
   exists: (candidate: string) => boolean;
   /** 执行一次搜索，返回命中的绝对路径；失败/取消时返回 undefined。 */
   search: (request: ReferenceSearchRequest) => Promise<string[] | undefined>;
+  /**
+   * 拼候选路径用的平台（默认本机）。
+   * 显式传进来，才能验证「对端报上来的另一套路径」以及让测试在任何机器上跑同一分支。
+   */
+  platform?: string;
   now?: () => number;
   maxItems?: number;
   maxMergedNames?: number;
@@ -150,6 +155,7 @@ export async function resolveFileReferences(
       roots: options.roots,
       preferred: query.preferred,
       exists: options.exists,
+      ...(options.platform ? { platform: options.platform } : {}),
     });
     if (match) {
       resolved[query.index] = match;
@@ -233,6 +239,7 @@ async function searchAndApply(
         preferred: query.preferred,
         exists: options.exists,
         searchMatches: matches,
+        ...(options.platform ? { platform: options.platform } : {}),
       });
       if (!value) {
         remainingIndices.push(index);

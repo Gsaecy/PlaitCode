@@ -48,12 +48,30 @@ test('boundary: workspace.findFiles is only called by the search scheduler entry
 
 test('boundary: child processes are only spawned by the command executor', async () => {
   /*
-   * `sync/deviceInfo.ts` 是**唯一的例外**：它要读「用户在系统设置里看到的那台设备名」
-   * （macOS 只有 `scutil --get ComputerName` 拿得到）。
-   * 约束仍然是硬的：只读、固定参数、无 shell、1.5s 超时、结果只用于显示。
+   * 两个例外，都是「扩展自己要跟系统说话」，不是替 agent 跑命令：
+   *
+   *  - `sync/deviceInfo.ts`：读「用户在系统设置里看到的那台设备名」
+   *    （macOS 只有 `scutil --get ComputerName` 拿得到）；
+   *  - `core/voiceWinRecognition.ts`：Windows 语音输入。麦克风只能由原生进程采集，
+   *    而 VS Code 的 webview 没有麦克风权限（用户 2026-11-25 的 `not-allowed`）。
+   *
+   * 约束仍然是硬的：固定可执行文件、固定参数、**不拼 shell**、不吞用户输入、
+   * 有超时/有上限，失败就如实上报。
    */
-  assert.deepEqual(await filesMatching(/\bspawn\s*\(/), ['agent/toolExecutor.ts']);
-  assert.deepEqual(await filesMatching(/from 'node:child_process'/), ['agent/toolExecutor.ts', 'sync/deviceInfo.ts']);
+  assert.deepEqual(
+    await filesMatching(/\bspawn\s*\(/),
+    ['agent/toolExecutor.ts', 'core/voiceWinRecognition.ts'],
+  );
+  assert.deepEqual(
+    await filesMatching(/from 'node:child_process'/),
+    ['agent/toolExecutor.ts', 'core/voiceWinRecognition.ts', 'sync/deviceInfo.ts'],
+  );
+
+  // 语音那条路必须守住「固定参数、无 shell」：否则等于给 agent 开了一个后门。
+  const voice = await readFile(join(sourceRoot, 'core/voiceWinRecognition.ts'), 'utf8');
+  assert.match(voice, /spawn\('powershell\.exe', \['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file\]/);
+  assert.doesNotMatch(voice, /shell:\s*true/, '语音子进程绝不允许走 shell');
+  assert.doesNotMatch(voice, /exec\s*\(|execSync\s*\(/, '不要用 exec 把命令拼成字符串');
 });
 
 test('boundary: recursive file watching stays confined to the skill registry', async () => {

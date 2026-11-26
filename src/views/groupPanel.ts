@@ -15,13 +15,11 @@
  * 群窗口刻意做到极简：三条信息一眼可见 —— 有几个人、谁在等你回答、最近发生了什么。
  */
 
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import * as vscode from 'vscode';
-import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import type { LanSyncService } from '../sync/lanSync';
-import { deviceLabel, groupSpeaker, platformLabel, type SyncGroupMessage, type SyncPeer } from '../sync/lanProtocol';
+import { deviceLabel, groupSpeaker, platformLabel, sortGroupTimeline, type SyncGroupMessage, type SyncPeer } from '../sync/lanProtocol';
 import { projectMismatchText } from '../sync/projectRef';
 import { TASK_STATUS_LABEL, buildTaskBoard, groupTasksByStatus } from '../sync/tasks';
 import { mediaUri } from './webview';
@@ -36,28 +34,229 @@ const PHASE_LABEL: Record<string, string> = {
   result: '结果',
 };
 
+/** 附件扩展名 → MIME（复制进剪贴板时要标对类型）。 */
+function mimeOfPath(path: string): string {
+  const extension = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
+  const table: Record<string, string> = {
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+    gif: 'image/gif', bmp: 'image/bmp', svg: 'image/svg+xml', avif: 'image/avif',
+    txt: 'text/plain', md: 'text/markdown', json: 'application/json', csv: 'text/csv',
+    pdf: 'application/pdf', zip: 'application/zip', log: 'text/plain',
+  };
+  return table[extension] ?? 'application/octet-stream';
+}
+
+/** 群里一条消息的时间：当天只显示时分，跨天带日期。 */
+function timeLabel(atMs: number, now = Date.now()): string {
+  const at = new Date(atMs);
+  const clock = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`;
+  return new Date(now).toDateString() === at.toDateString() ? clock : `${at.getMonth() + 1}/${at.getDate()} ${clock}`;
+}
+
 /** 群窗口里一条发言的紧凑描述（测试直接钉这段）。 */
 export function compactGroupLine(message: SyncGroupMessage, now = Date.now(), roster?: readonly SyncPeer[]): {
   who: string;
   phase: string;
   body: string;
   time: string;
+  /** 排序用的原始时间戳。 */
+  at: number;
+  /** 本机收到它的时刻（排序的第一依据：两台机器的时钟不一定一致）。 */
+  receivedAt?: number;
   /** 甲方在自己这边（右侧气泡），乙方在左侧。 */
   side: 'user' | 'agent';
   phaseKey: string;
 } {
-  const at = new Date(message.at);
-  const sameDay = new Date(now).toDateString() === at.toDateString();
   return {
     who: groupSpeaker(message, roster),
     phase: PHASE_LABEL[message.phase] ?? message.phase,
     body: message.body.replace(/\s+/g, ' ').trim(),
-    time: sameDay
-      ? `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
-      : `${at.getMonth() + 1}/${at.getDate()} ${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`,
+    time: timeLabel(message.at, now),
+    at: message.at,
+    ...(message.receivedAt !== undefined ? { receivedAt: message.receivedAt } : {}),
     side: message.author === 'user' ? 'user' : 'agent',
     phaseKey: message.phase,
   };
+}
+
+export interface GroupTimelineLine {
+  kind: 'group' | 'note';
+  id: string;
+  who: string;
+  phase: string;
+  phaseKey: string;
+  body: string;
+  full: string;
+  time: string;
+  /** 排序用的原始时间戳。 */
+  at: number;
+  /** 本机收到它的时刻（排序的第一依据，见 `messageOrderKey`）。 */
+  receivedAt?: number;
+  side: 'user' | 'agent';
+  replyTo: string;
+  requirementId?: string;
+  options?: readonly string[];
+  meta?: import('../sync/lanProtocol').GroupMessageMeta | null;
+  device: { id: string; name: string; isLocal: boolean };
+  /** 这条消息指派给哪台（显示成 `@设备`，让甲方一眼确认发对了没有）。 */
+  assigneeLabel?: string;
+  /** 已读这条的设备标识（甲方自己的发言才有意义）。 */
+  readBy?: string[];
+  /** 还没收到任何回执（界面上提示「等待对方确认收到」）。 */
+  ackPending?: boolean;
+  /** 说给谁：这条消息的收件设备（`@所有人` 就是群里每一台，含本机）。 */
+  addressed?: string[];
+  /** 点名了但**还没回执**的设备（界面上显示「未读：…」）。 */
+  unreadBy?: string[];
+  /** 这条消息自带的附件（图片有 `src` 时直接画出来）。 */
+  assets?: { id: string; name: string; kind: 'image' | 'file'; src?: string; path?: string; ready: boolean }[];
+}
+
+/** 「等待对方确认收到」只提示最近这几分钟，旧消息不再挂着。 */
+const ACK_PENDING_WINDOW_MS = 5 * 60_000;
+
+/**
+ * 群发言 + 「队友之间的往来」合成**一条时间线**。
+ *
+ * 用户 2026-11-25：「队友之间的往来的对话消息将对话框下半部分占据了。
+ * 消息没有按照时间顺序在对话框里显示」——以前往来自成一块追加在最后，
+ * 不管时间多早都压在所有群消息下面。现在按 `at` 排序，和群消息交错出现。
+ */
+export function buildGroupTimeline(
+  messages: readonly SyncGroupMessage[],
+  notes: readonly { id: string; who: string; body: string; at: number; replyTo: string }[],
+  options: {
+    now?: number;
+    roster?: readonly SyncPeer[];
+    labelOf: (peer: SyncPeer | undefined) => string;
+    localId: string;
+    /** 设备 id → 统一标识（没有就退回 id）。 */
+    labelForId?: (id: string) => string;
+    /** 已读回执：群消息 id → 已读的设备 id。 */
+    reads?: Record<string, readonly string[]>;
+    /** 群里除本机之外还有几台（决定「等待对方确认收到」是否有意义）。 */
+    otherDeviceCount?: number;
+    /** 附件是否已经落到本机、对应的本地图片地址（没到齐就没有 src）。 */
+    assetView?: (id: string) => { src?: string; path?: string; ready: boolean };
+  },
+): GroupTimelineLine[] {
+  const now = options.now ?? Date.now();
+  const hasOthers = (options.otherDeviceCount ?? Math.max(0, (options.roster?.length ?? 1) - 1)) > 0;
+  /**
+   * 设备 id → 界面上显示的名字。
+   *
+   * 本机额外标「（本机）」：回执列表里出现两台同名设备时，用户得能看出哪一行是自己。
+   */
+  const labelFor = (id: string): string => {
+    const label = options.labelForId?.(id) || id;
+    return id && id === options.localId ? `${label}（本机）` : label;
+  };
+  const lines: GroupTimelineLine[] = messages.map((message) => {
+    const mine = message.from?.id === options.localId;
+    /*
+     * 收件人：明确说了给某台就是那一台；否则（`@所有人` / 没点名）= 群里每一台，**含本机**。
+     *
+     * 用户实况（2026-11-25）：「我发的消息没有 @ 任何 agent，默认是所有人都收到消息，
+     * 但是显示只有『已读：macOS …』，别的 agent 没有显示已读未读状态」——
+     * 以前只画「已读」，没人回执的那台就从列表里**消失**，看起来像不存在。
+     */
+    const addressedIds = message.to
+      ? [message.to]
+      : message.assignee
+        ? [message.assignee]
+        : (options.roster ?? []).map((peer) => peer.id);
+    /*
+     * 自己发的、又说给本机的消息：本机**一定**有这条（它就在本机的群记录里）。
+     *
+     * 用户实况（2026-11-25，0.10.17 之后仍然复现）：「Windows（输入对话的设备）团队任务
+     * 对话框显示收到了消息，但团队群只显示 macmini 已读」。回执按「已收到」记，
+     * 那就不该等服务端那条自回执 —— 事实本身就说明本机读到了。
+     */
+    const readIds = [...new Set([
+      ...(options.reads?.[message.id] ?? []),
+      ...(mine && message.author === 'user' && addressedIds.includes(options.localId) ? [options.localId] : []),
+    ])];
+    const unreadIds = addressedIds
+      .filter((id) => id && !readIds.includes(id))
+      .map((id) => labelFor(id));
+    const reads = readIds.map((id) => labelFor(id));
+    return {
+      ...compactGroupLine(message, now, options.roster),
+      kind: 'group',
+      id: message.id,
+      requirementId: message.requirementId,
+      replyTo: message.replyTo ?? '',
+      options: message.options ?? [],
+      meta: message.meta ?? null,
+      device: {
+        id: message.from?.id ?? '',
+        name: options.labelOf(message.from),
+        isLocal: mine,
+      },
+      ...(message.assignee ? { assigneeLabel: options.labelForId?.(message.assignee) || message.assignee } : {}),
+      /*
+       * 已读状态对**每一条气泡**都给（用户 2026-11-26：「不管是 agent 还是用户的消息
+       * 气泡下面都要显示已读状态，哪些 agent 已读了」）。
+       *
+       * 以前只给「我自己说的甲方需求」算，于是 agent 的进度 / 结果下面永远空白 ——
+       * 甲方根本看不出队友到底收到没有。
+       */
+      readBy: reads,
+      addressed: addressedIds.map((id) => labelFor(id)),
+      // 未读不设时间窗：只要那台还在群里、还没回执，就如实列出来（离线时一直未读才是真相）。
+      ...(unreadIds.length ? { unreadBy: unreadIds } : {}),
+      ackPending: hasOthers && !reads.length && now - message.at < ACK_PENDING_WINDOW_MS,
+      ...(message.assets?.length
+        ? {
+          assets: message.assets.slice(0, 8).map((asset) => {
+            const view = options.assetView?.(asset.id);
+            return {
+              id: asset.id,
+              name: asset.name,
+              kind: asset.kind,
+              ...(view?.src ? { src: view.src } : {}),
+              ...(view?.path ? { path: view.path } : {}),
+              ready: view?.ready ?? false,
+            };
+          }),
+        }
+        : {}),
+      // 群消息正文上限是 4 000 字（协议层）。复制要拿到**完整的**正文，别再截一刀。
+      full: message.body.slice(0, 4_000),
+    };
+  });
+  for (const note of notes) {
+    lines.push({
+      kind: 'note',
+      id: note.id,
+      who: note.who,
+      phase: note.replyTo ? '回复队友' : '队友对话',
+      phaseKey: 'note',
+      body: note.body,
+      full: note.body,
+      time: timeLabel(note.at, now),
+      at: note.at,
+      side: 'agent',
+      replyTo: note.replyTo,
+      device: { id: note.id, name: note.who, isLocal: false },
+    });
+  }
+  /*
+   * 按**到达顺序**排，不是按两台设备各自的时间戳。
+   *
+   * 真实故障（2026-11-26）：macOS 那台的时钟比 Windows 慢 123 ms，于是
+   * 「Windows 发出的需求 07:41:40.015」排在了「Mac 回复的进度 07:41:39.892」之后 ——
+   * 回复跑到提问上面。`sortGroupTimeline` 用本机到达时刻兜底（见 `messageOrderKey`），
+   * 手机页与群记录也走同一个函数，三处不会再各排一套。
+   *
+   * 同时锚定「甲方需求排在回应它的乙方发言之前」：需求先在协议层到达、agent 立刻回话，
+   * 而需求气泡是发送方随后才广播过来的 —— 只按到达顺序会看到「乙方先说话」。
+   */
+  return sortGroupTimeline(lines, {
+    requirementIdOf: (line) => (line.kind === 'note' ? undefined : line.requirementId),
+    isUserRequirement: (line) => line.kind === 'group' && line.side === 'user' && line.phaseKey === 'requirement',
+    isAgentLine: (line) => line.kind === 'note' || line.side === 'agent',
+  });
 }
 
 export interface GroupHeaderInput {
@@ -65,6 +264,14 @@ export interface GroupHeaderInput {
   relay?: { connected: boolean; peers: number; url: string };
   /** 除本机以外的设备数：从机要确认「主机真的在」才敢说已连接。 */
   peerCount?: number;
+  /**
+   * 当前阶段（谈 / 等确认 / 执行）与自主迭代标记。
+   *
+   * 用户 2026-11-26 定的流程：先只读谈判 → 出一份双方同意的方案 → 甲方确认 → 才动手；
+   * 开了自主迭代则谈成即开工。这两个状态必须**顶部可见**，否则甲方不知道现在该不该说话。
+   */
+  phaseLabel?: string;
+  autonomous?: boolean;
 }
 
 /**
@@ -91,6 +298,13 @@ export function groupHeader(state: GroupHeaderInput): {
    * 把「主机（等待队友）」这类字眼露出来，会让人以为某台电脑是"上级"。
    */
   if (lanOn) {
+    /*
+     * 阶段优先：谈的时候要让人知道「现在还不能动手」，等确认时要让人知道「该我说话了」。
+     * 自主迭代额外标一句 —— 否则甲方会一直等一个永远不会来的「请确认」。
+     */
+    const phase = state.phaseLabel
+      ? `${state.phaseLabel}${state.autonomous ? '（自主迭代：谈成就开工）' : ''}`
+      : '';
     if (members !== undefined && members < 1) {
       return {
         status: '群聊已开 · 等对方加入',
@@ -100,7 +314,7 @@ export function groupHeader(state: GroupHeaderInput): {
     }
     return {
       status: members === undefined ? '群聊中' : `群聊中 · ${members + 1} 台设备`,
-      sub: '每台设备上有一位甲方（你）和一个乙方（agent）。你在哪天说需求都行，群里的乙方先解析、必要时追问，达成一致后才动手。',
+      sub: phase || '每台设备上有一位甲方（你）和一个乙方（agent）。你在哪天说需求都行，群里的乙方先解析、必要时追问，达成一致后才动手。',
       on: true,
     };
   }
@@ -127,9 +341,30 @@ export class GroupPanel implements vscode.Disposable {
     private readonly service: LanSyncService,
     private readonly callbacks: {
       /** 在群里发一句话（需求或回答）—— 由面板决定走哪条路径。 */
-      send: (text: string, assignee?: { id: string; name: string }) => Promise<void>;
+      send: (text: string, assignee?: { id: string; name: string }, attachmentIds?: string[]) => Promise<void>;
+      /**
+       * 群窗口里的附件：交给主面板按统一规则解析。
+       *
+       * 用户 2026-11-25：「团队群需要有普通对话框的文件附件读取图片输出等全部功能，不要砍功能」。
+       * 所以群窗口不再自己把文件写到临时目录再把路径拼进正文 —— 那等于告诉模型
+       * 「有这么个文件」，图片它根本看不到。这里返回 id，发消息时随正文一起交给 agent。
+       */
+      attach?: (file: { name: string; mimeType: string; dataBase64: string }) => Promise<{
+        ok: boolean;
+        id?: string;
+        name?: string;
+        kind?: string;
+        reason?: string;
+      }>;
       /** 远程控制：目前只用到「停止当前执行」。 */
       control?: (action: 'stop') => Promise<{ ok: boolean; message: string }>;
+      /**
+       * 语音输入：交给主面板开「真实浏览器」的一次性语音页。
+       *
+       * 群窗口的 webview 同样没有麦克风权限，原来那句「这个环境不支持语音输入」
+       * 就是点了没反应的根源（用户 2026-11-25）。
+       */
+      voice?: () => void | Promise<void>;
       log: (line: string) => void;
       /**
        * 中继状态。跨网协作时局域网根本没连上（`role === 'off'`），
@@ -158,11 +393,27 @@ export class GroupPanel implements vscode.Disposable {
       await this.refresh();
       return;
     }
+    /*
+     * 附件目录必须进 `localResourceRoots`，否则 `asWebviewUri` 生成的地址会被
+     * 资源服务拒绝，`<img>` 只剩 alt 文字（用户 2026-11-25：图片只显示占位）。
+     * 附件不在扩展目录里（globalStorage/assets），所以只能显式加进去。
+     */
+    const assetRoot = (() => {
+      try {
+        return vscode.Uri.file(this.service.assetDirectory());
+      } catch {
+        return undefined;
+      }
+    })();
     const panel = vscode.window.createWebviewPanel(
       'hwchat.teamGroup',
       '团队群',
       vscode.ViewColumn.Beside,
-      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [this.extensionUri] },
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [this.extensionUri, ...(assetRoot ? [assetRoot] : [])],
+      },
     );
     this.panel = panel;
     panel.webview.html = this.html(panel.webview);
@@ -175,20 +426,35 @@ export class GroupPanel implements vscode.Disposable {
         url?: unknown;
         name?: unknown;
         dataBase64?: unknown;
+        mimeType?: unknown;
         attachments?: unknown;
+        id?: unknown;
+        requestId?: unknown;
       };
       if (record.type === 'ready') await this.refresh();
-      /* 附件：存到本机临时目录，把路径带回给面板（群消息只带文字，路径给本机 agent 用）。 */
+      /*
+       * 附件：交给主面板按**和普通对话框完全相同的规则**处理（图片 → 视觉内容，
+       * 文本 → 正文内容，大小 / 敏感文件策略一致），只带回一个 id。
+       *
+       * 以前是写进临时目录、把路径拼进正文：模型只看到一行路径，图片根本读不到；
+       * 另一台更是完全看不到。
+       */
       if (record.type === 'attach' && typeof record.name === 'string' && typeof record.dataBase64 === 'string') {
         try {
-          if (record.dataBase64.length > 9 * 1024 * 1024) throw new Error('附件太大');
-          const safeName = record.name.replace(/[^\w.\-]+/g, '_').slice(-80) || 'attachment';
-          const dir = join(tmpdir(), 'hwchat-attachments', randomUUID().slice(0, 8));
-          await mkdir(dir, { recursive: true });
-          const path = join(dir, safeName);
-          await writeFile(path, Buffer.from(record.dataBase64, 'base64'));
-          await panel.webview.postMessage({ type: 'attached', item: { name: record.name, path } });
-          this.callbacks.log(`[group] 附件已保存：${path}`);
+          const staged = await this.callbacks.attach?.({
+            name: record.name,
+            mimeType: typeof record.mimeType === 'string' ? record.mimeType : '',
+            dataBase64: record.dataBase64,
+          });
+          if (!staged || !staged.ok || !staged.id) {
+            await panel.webview.postMessage({ type: 'attachFailed', reason: staged?.reason ?? '这个附件没法添加' });
+            return;
+          }
+          await panel.webview.postMessage({
+            type: 'attached',
+            item: { id: staged.id, name: staged.name ?? record.name, kind: staged.kind ?? 'file' },
+          });
+          this.callbacks.log(`[group] 已添加附件：${staged.name ?? record.name}`);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           await panel.webview.postMessage({ type: 'attachFailed', reason });
@@ -212,18 +478,54 @@ export class GroupPanel implements vscode.Disposable {
           })()
           : undefined;
         /*
-         * 附件：只在这台机器上落盘，路径随正文给本机 agent 用。
-         * 群消息本身仍然只有文字（另一台读不到本机临时文件），所以正文里写明这一点，
-         * 免得对面 agent 以为附件在它那儿。
+         * 附件只传 id：正文不再拼路径。真正的内容（图片字节 / 文件正文）由主面板
+         * 按普通对话框的规则交给 agent，并**分片传给另一台**，两边的 agent 都能读到。
          */
-        const attachments = Array.isArray(record.attachments)
+        const attachmentIds = Array.isArray(record.attachments)
           ? record.attachments.filter((item): item is string => typeof item === 'string' && item.length > 0).slice(0, 20)
           : [];
-        const body = attachments.length
-          ? `${text}\n\n附件（本机文件，另一台看不到）：\n${attachments.map((path) => `- ${path}`).join('\n')}`
-          : text;
-        await this.callbacks.send(body, assignee);
+        await this.callbacks.send(text, assignee, attachmentIds);
         await this.refresh();
+      }
+      /*
+       * 复制：富格式（文字 + 全部图片）由面板自己写；宿主只负责两件它做不到的事 ——
+       * 读附件字节、以及在富格式不可用时写纯文本。
+       */
+      if (record.type === 'copyText' && typeof record.text === 'string') {
+        await vscode.env.clipboard.writeText(record.text);
+        this.callbacks.log('[group] 已复制消息（纯文本 + 附件清单）');
+        return;
+      }
+      if (record.type === 'voice') {
+        await this.callbacks.voice?.();
+        return;
+      }
+      if (record.type === 'requestAssetData' && typeof record.id === 'string' && typeof record.requestId === 'string') {
+        const path = this.service.assetPath(record.id);
+        try {
+          if (!path || !existsSync(path)) throw new Error('附件还没收齐');
+          const bytes = await readFile(path);
+          await panel.webview.postMessage({
+            type: 'assetData',
+            requestId: record.requestId,
+            ok: true,
+            dataBase64: bytes.toString('base64'),
+            mimeType: mimeOfPath(path),
+          });
+        } catch (error) {
+          await panel.webview.postMessage({
+            type: 'assetData',
+            requestId: record.requestId,
+            ok: false,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return;
+      }
+      if (record.type === 'openAsset' && typeof record.id === 'string') {
+        const path = this.service.assetPath(record.id);
+        if (path && existsSync(path)) await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(path));
+        return;
       }
       if (record.type === 'copyInvite') {
         const text = typeof record.text === 'string' && record.text ? record.text : this.service.currentInviteText();
@@ -267,6 +569,36 @@ export class GroupPanel implements vscode.Disposable {
   }
 
   /** 有新发言 / 状态变化时刷新。窗口没开着就什么也不做（零开销）。 */
+  /**
+   * 把语音识别结果放进群输入框（由主面板的语音页 / VS Code 内听写回传）。
+   *
+   * `live: true` 表示还在说：**替换**上一次插入的那段，而不是再追加一遍
+   * （听写是实时整段重发，直接 append 会把一句话重复十几遍）。
+   */
+  async insertVoiceText(text: string, live = false): Promise<void> {
+    const clean = String(text || '').trim();
+    if (!clean || !this.panel) return;
+    await this.panel.webview.postMessage({ type: 'voiceText', text: clean, live });
+  }
+
+  /** 把焦点放回群输入框（系统听写 / 听写结束后要用）。 */
+  async focusComposer(): Promise<void> {
+    if (!this.panel) return;
+    await this.panel.webview.postMessage({ type: 'focusComposer' });
+  }
+
+  /** 麦克风开关状态（原生录音时按钮要高亮）。 */
+  async setVoiceActive(active: boolean): Promise<void> {
+    if (!this.panel) return;
+    await this.panel.webview.postMessage({ type: 'voiceState', active });
+  }
+
+  /** 安装 VS Code Speech 的进度（麦克风按钮周围的绿圈）。 */
+  async setVoiceSetup(phase: 'installing' | 'ready' | 'failed'): Promise<void> {
+    if (!this.panel) return;
+    await this.panel.webview.postMessage({ type: 'voiceSetup', phase });
+  }
+
   async refresh(): Promise<void> {
     if (!this.panel) return;
     const state = this.service.groupState();
@@ -290,6 +622,12 @@ export class GroupPanel implements vscode.Disposable {
     })();
     const labelOf = (peer: { id?: string; name?: string; platform?: string; version?: string; host?: string } | undefined): string =>
       deviceLabel(peer, roster);
+    const labelForId = (id: string): string => {
+      const peer = state.peers.find((item) => item.id === id)
+        ?? relay?.devices?.find((item) => item.id === id);
+      // 设备信息已经不在群里（换过设备 / 旧消息）时给个可读短码，不把原始 id 甩给用户。
+      return peer ? labelOf(peer) : `设备 ${id.slice(0, 6)}`;
+    };
     await this.panel.webview.postMessage({
       type: 'state',
       /* 本机设备 id：界面据此判断"这条是谁发的、要不要加本机白边"。 */
@@ -343,7 +681,11 @@ export class GroupPanel implements vscode.Disposable {
           .filter((peer) => peer.version && peer.version !== mine)
           .map((peer) => `${labelOf(peer)} 是 ${peer.version}`);
         if (!others.length) return '';
-        return `本机是 ${mine}，${others.join('；')} —— 两台行为会不一样，请把两台都更新到同一版本，并各自重载窗口（Developer: Reload Window）。`;
+        /*
+         * 版本不一致时**必须点名 @ 指派会失效**：用户 2026-11-25 就是在旧版本上
+         * 「@ 了 macmini，那边没收到」，而界面上只有一句笼统的「行为会不一样」。
+         */
+        return `本机是 ${mine}，${others.join('；')} —— 两台行为会不一样，**@ 指派在旧版本上会失效（消息可能只发给其中一台）**。请把两台都更新到同一版本，并各自重载窗口（Developer: Reload Window）。`;
       })(),
       /* 邀请码（只有主机有）：一直显示在窗口顶部，并带可复制的整串。 */
       invite: this.service.currentInviteCode(),
@@ -353,6 +695,8 @@ export class GroupPanel implements vscode.Disposable {
         role: state.role,
         peerCount: this.service.remotePeers().length,
         ...(relayState ? { relay: relayState } : {}),
+        ...(state.phaseLabel ? { phaseLabel: state.phaseLabel } : {}),
+        ...(state.autonomous ? { autonomous: true } : {}),
       }),
       peers: (() => {
         const local = this.service.localPeer();
@@ -425,6 +769,29 @@ export class GroupPanel implements vscode.Disposable {
         return out;
       })(),
       canStop: state.role !== 'off' || Boolean(this.callbacks.relay?.()?.connected),
+      /*
+       * 每台设备的 agent 状态（指示灯）：本机由面板上报，对端通过 `agentState` 上报。
+       * 谁都没上报时按「空闲」——绝不把没消息当成「正在运行」。
+       */
+      statuses: (() => {
+        const states = this.service.agentStates();
+        const seen = new Map<string, { id: string; label: string; state: string; isLocal: boolean }>();
+        const add = (peer: { id?: string; name?: string; platform?: string } | undefined): void => {
+          const id = typeof peer?.id === 'string' ? peer.id : '';
+          if (!id || seen.has(id)) return;
+          seen.set(id, {
+            id,
+            label: labelOf(peer as SyncPeer),
+            state: states[id] ?? 'idle',
+            isLocal: id === localId,
+          });
+        };
+        add(this.service.localPeer());
+        for (const peer of state.peers) add(peer);
+        for (const message of state.messages) add(message.from);
+        for (const device of this.callbacks.relay?.()?.devices ?? []) add(device);
+        return [...seen.values()];
+      })(),
       taskGroups: groupTasksByStatus(buildTaskBoard(state.messages)).map((group) => ({
         status: group.status,
         label: TASK_STATUS_LABEL[group.status],
@@ -438,30 +805,31 @@ export class GroupPanel implements vscode.Disposable {
           lastLine: task.lastLine,
         })),
       })),
-      lines: state.messages.map((message) => ({
-        ...compactGroupLine(message, now, roster),
-        kind: 'group',
-        requirementId: message.requirementId,
-        /* 结构化附加信息：选项与元信息由界面渲染，不再写进正文。 */
-        replyTo: message.replyTo ?? '',
-        options: message.options ?? [],
-        meta: message.meta ?? null,
-        /* 谁发的：头像按设备上色，本机加白边。 */
-        device: { id: message.from?.id ?? '', name: labelOf(message.from), isLocal: message.from?.id === localId },
-        // 结果/未执行要保留换行：压成一行会把「改了哪些文件」挤成不可读的长句
-        full: message.body.slice(0, 2_000),
-      })),
       /*
-       * 两个 agent 的往来合进同一条时间线（按时间排序），标签是「队友对话」。
-       * 以前这些只在账本里，界面上就是「各干各的」。
+       * 群发言和「队友之间的往来」合成一条按时间排序的时间线。
+       *
+       * 以前往来自成一块追加在最后 —— 不管时间多早都占着对话框下半部分，
+       * 而且完全不在时间顺序上（用户 2026-11-25 反馈）。
        */
-      dialogue: (state.dialogue ?? []).map((note) => ({
-        id: note.id,
-        who: note.who,
-        body: note.body,
-        at: note.at,
-        replyTo: note.replyTo,
-      })),
+      lines: buildGroupTimeline(state.messages, state.dialogue ?? [], {
+        now,
+        roster,
+        labelOf,
+        localId,
+        labelForId,
+        reads: this.service.allReads(),
+        otherDeviceCount: roster.length - 1,
+        assetView: (id) => {
+          const path = this.service.assetPath(id);
+          const view = this.panel?.webview;
+          if (!path || !existsSync(path)) return { ready: false };
+          return {
+            ready: true,
+            path,
+            ...(view ? { src: view.asWebviewUri(vscode.Uri.file(path)).toString() } : {}),
+          };
+        },
+      }),
       /* 刚输入、还没判定完的那句话：先画出来，判定完被正式消息替换。 */
       pending: state.pending,
     });
@@ -471,6 +839,8 @@ export class GroupPanel implements vscode.Disposable {
     const nonce = [...Array(32)].map(() => 'abcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 36)]).join('');
     // 富文本渲染（markdown）：代码块、表格、列表、链接、图片 —— 群里的发言不再是一坨纯文本。
     const richScript = mediaUri(webview, this.extensionUri, 'richtext.js');
+    // 群窗口自己的脚本：真文件，测试可以挂到 DOM 上执行（以前是内联脚本，只能读源码断言）。
+    const groupScript = mediaUri(webview, this.extensionUri, 'group.js');
     const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src ${webview.cspSource} data: https:;`;
     return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -549,6 +919,17 @@ export class GroupPanel implements vscode.Disposable {
     background: transparent; color: inherit; }
   .banner-opts button:hover { background: var(--vscode-inputValidation-warningBorder, rgba(215,166,0,.35)); }
   .banner-hint { margin-top: 6px; font-size: 11px; opacity: .75; }
+  /*
+   * 追问正文默认**只显示前三行**（用户 2026-11-25：「这个消息这么长一块消息」——
+   * agent 一次问好几段，提醒条能占满半个窗口，反而看不到群里的对话）。
+   * 展开后最多占 40% 高度，自己滚动，绝不再把整个界面顶下去。
+   */
+  .banner-text { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; white-space: pre-wrap; word-break: break-word; }
+  .banner-text.open { display: block; -webkit-line-clamp: unset; overflow: auto; max-height: 40vh; }
+  .banner-more { margin-top: 6px; padding: 0; border: 0; background: transparent; color: inherit;
+    font: inherit; font-size: 11px; opacity: .8; cursor: pointer; text-decoration: underline; }
+  .banner-more:hover { opacity: 1; }
 
   /* 消息区 */
   main { flex: 1; overflow-y: auto; padding: 14px 16px 18px; }
@@ -573,6 +954,8 @@ export class GroupPanel implements vscode.Disposable {
   .msg.user .bubble .tag { color: var(--vscode-button-foreground, #fff); }
   .msg.user .bubble .meta { opacity: .82; }
   .msg.user .bubble .tag { opacity: .9; border-color: currentColor; }
+  /* 气泡上的指派对象：一眼看出这条发给了哪台。 */
+  .meta .assignee { padding: 0 6px; border-radius: 999px; border: 1px solid currentColor; opacity: .9; }
   .tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid currentColor; opacity: .9; }
   .tag.analysis { color: var(--vscode-charts-blue, #4a8fe0); }
   .tag.question { color: var(--vscode-charts-yellow, #d7a600); font-weight: 700; }
@@ -580,6 +963,9 @@ export class GroupPanel implements vscode.Disposable {
   .tag.progress { color: var(--vscode-charts-purple, #9a6ee0); }
   .tag.result { color: var(--vscode-charts-green, #1a7f37); font-weight: 700; }
   .tag.requirement { color: inherit; opacity: .75; }
+  /* 队友之间的往来：和群发言同一条时间线，用橙色标签 + 虚线气泡区分。 */
+  .tag.note { color: var(--vscode-charts-orange, #d97706); }
+  .bubble.note { border-style: dashed; opacity: .92; }
   .bubble.question { border-color: var(--vscode-charts-yellow, #d7a600); }
   /*
    * 富文本（markdown）样式：气泡里现在是结构化的内容，不是一整段等宽文字。
@@ -618,6 +1004,99 @@ export class GroupPanel implements vscode.Disposable {
   .md-table th { background: rgba(128,128,128,.14); font-weight: 600; }
   .md-img { max-width: 100%; border-radius: 6px; }
   /* 结构化元信息（项目 / 用时 / 改动文件 / 被停止）：小标签，不再是正文里的括号文字 */
+  /*
+   * 每台设备的 agent 状态灯（替换原来的操作提示文案）。
+   *
+   * 用户 2026-11-25：「团队群需要能显示设备 agent 运行状态……正常运行中显示成闪动频率
+   * 合适的绿色圆点、运行结束显示成灰色圆点、异常中断显示成红色圆点、需要确认卡住了
+   * 就显示闪动的黄色圆点」。
+   */
+  .agent-status { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px;
+    font-size: 11px; line-height: 1.5; color: var(--muted); }
+  .agent-status .who { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .agent-status .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: #8b949e; }
+  .agent-status .dot.running { background: #3fb950; animation: agent-pulse 1.6s ease-in-out infinite; }
+  .agent-status .dot.waiting { background: #d7a600; animation: agent-pulse 1.1s ease-in-out infinite; }
+  .agent-status .dot.error { background: #f85149; }
+  .agent-status .dot.idle { background: #8b949e; }
+  @keyframes agent-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.86); } }
+  @media (prefers-reduced-motion: reduce) {
+    .agent-status .dot.running, .agent-status .dot.waiting { animation: none; }
+  }
+  /* 气泡上的「复制」：小、淡，鼠标移上去才明显 */
+  .meta .msg-copy { margin-left: auto; border: 0; background: transparent; color: inherit; opacity: .55;
+    font: inherit; font-size: 10.5px; padding: 0 4px; cursor: pointer; }
+  .msg:hover .meta .msg-copy { opacity: .9; }
+  .meta .msg-copy:hover { background: rgba(128,128,128,.22); border-radius: 4px; }
+  /* 群里的附件：图片直接显示，文件是一行小卡片 */
+  .msg-assets { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .msg-image { max-width: 240px; max-height: 180px; border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in; }
+  .msg-file { padding: 3px 8px; border-radius: 8px; border: 1px solid var(--line); font-size: 11px; opacity: .85; }
+  /* 已读 / 等待确认：气泡下方的细字，不抢正文 */
+  .receipt { margin-top: 5px; font-size: 10.5px; opacity: .72; }
+  .receipt-unread { color: #e0a33e; opacity: .95; }
+  .receipt.pending { opacity: .5; font-style: italic; }
+  /*
+   * 麦克风周围那圈安装进度（装了 VS Code Speech 才会出现）。
+   * 一次性特效：安装中转圈填充 → 装好闭环、亮 3 秒 → 由脚本移除节点。
+   */
+  .tool.has-ring { position: relative; }
+  .voice-ring {
+    position: absolute; inset: -3px; width: calc(100% + 6px); height: calc(100% + 6px);
+    pointer-events: none; transform: rotate(-90deg); overflow: visible;
+  }
+  .voice-ring circle { fill: none; stroke-width: 6; }
+  .voice-ring .track { stroke: rgba(46, 204, 113, .18); }
+  .voice-ring .bar {
+    stroke: #2ecc71; stroke-linecap: round;
+    stroke-dasharray: 100; stroke-dashoffset: 100;
+    transition: stroke-dashoffset .35s ease-out;
+  }
+  .voice-ring.installing .bar { animation: voice-ring-fill 22s cubic-bezier(.2, .7, .3, 1) forwards; }
+  .voice-ring.ready .bar {
+    stroke-dashoffset: 0;
+    filter: drop-shadow(0 0 4px rgba(46, 204, 113, .85));
+    animation: voice-ring-flash 3s ease-out forwards;
+  }
+  @keyframes voice-ring-fill { from { stroke-dashoffset: 100; } to { stroke-dashoffset: 12; } }
+  @keyframes voice-ring-flash {
+    0% { opacity: 1; }
+    70% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+  /* 录音中：话筒图标换成跳动的音波条（用户 2026-11-25 指定的效果）。 */
+  .tool.voice-recording { color: #2ecc71; display: grid; place-items: center; }
+  .tool.voice-recording .ico-mic { display: none; }
+  /* 细线条 + 严格收在按钮圆角矩形内部（同主对话框；尺寸用百分比，两种按钮比例一致）。 */
+  .voice-bars {
+    display: none; align-items: center; justify-content: center;
+    width: 62%; height: 42%; gap: 15%;
+    max-height: calc(100% - 16px); max-width: calc(100% - 8px);
+    overflow: hidden; pointer-events: none;
+    animation: voice-bars-breathe 2.2s ease-in-out infinite;
+  }
+  .tool.voice-recording .voice-bars { display: inline-flex; }
+  /*
+   * 纯绿实色条（不渐变）+ 高度按相位起伏（行进波）；
+   * 明暗交给整排的透明度呼吸（黑 → 绿 → 黑），像呼吸灯。
+   */
+  .voice-bars i {
+    display: block; flex: 0 0 8%; min-width: 1px; border-radius: 1px; height: var(--h, 100%);
+    background: #3ee089;
+    transform-origin: center; transform: scaleY(.45);
+    animation: voice-bar-level 1.1s ease-in-out infinite var(--d, 0ms);
+  }
+  .voice-bars i:nth-child(1) { --h: 52%; --d: 0ms; }
+  .voice-bars i:nth-child(2) { --h: 80%; --d: -220ms; }
+  .voice-bars i:nth-child(3) { --h: 100%; --d: -440ms; }
+  .voice-bars i:nth-child(4) { --h: 76%; --d: -660ms; }
+  .voice-bars i:nth-child(5) { --h: 50%; --d: -880ms; }
+  @keyframes voice-bar-level { 0%, 100% { transform: scaleY(.45); } 50% { transform: scaleY(1); } }
+  @keyframes voice-bars-breathe { 0%, 100% { opacity: .1; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    .voice-bars { animation: none; opacity: 1; }
+    .voice-bars i { animation: none; transform: scaleY(.6); }
+  }
   .msg-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; font-size: 10.5px; opacity: .75; }
   .msg-meta span { padding: 1px 7px; border-radius: 999px; background: rgba(128,128,128,.18); }
   .msg-options { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -757,7 +1236,7 @@ export class GroupPanel implements vscode.Disposable {
   <div class="banner" id="versionWarn" style="display:none"></div>
   <div class="banner" id="projectWarn" style="display:none"></div>
 </header>
-<div class="banner" id="banner"><b id="bannerWho">乙方在等你回答</b><button class="banner-close" id="bannerClose" type="button" title="先不回答（收起这条提醒）">×</button><span id="bannerText"></span><div class="banner-opts" id="bannerOpts"></div><div class="banner-hint" id="bannerHint"></div></div>
+<div class="banner" id="banner"><b id="bannerWho">乙方在等你回答</b><button class="banner-close" id="bannerClose" type="button" title="先不回答（收起这条提醒）">×</button><div class="banner-text" id="bannerText"></div><button class="banner-more" id="bannerMore" type="button">展开全文</button><div class="banner-opts" id="bannerOpts"></div><div class="banner-hint" id="bannerHint"></div></div>
 <section id="board" class="board" style="display:none">
   <div class="board-head" id="boardHead"><span class="chev">▸</span><b>任务看板</b><span id="boardHint"></span></div>
   <div class="board-cols" id="boardCols"></div>
@@ -776,869 +1255,10 @@ export class GroupPanel implements vscode.Disposable {
     <textarea id="text" rows="2" placeholder="说需求，或回答乙方的追问… 输入 @ 指定设备"></textarea>
     <button class="send" id="send">发送</button>
   </div>
-  <div class="hint">Enter 发送 · Shift+Enter 换行 · ＋ 加图片/文件 · 语音输入 · 输入 @ 选设备（不选就是所有人）</div>
+  <div class="agent-status" id="agentStatus"></div>
 </footer>
 <script nonce="${nonce}" src="${richScript}"></script>
-<script nonce="${nonce}">
-const vscode = acquireVsCodeApi();
-/* 富文本模块要往宿主发消息（复制代码 / 打开链接）；webview 里只有 vscode.postMessage 能到宿主机。 */
-window.HwPost = function (message) { vscode.postMessage(message); };
-const el = (id) => document.getElementById(id);
-const feed = el('feed'), members = el('members'), status = el('status'), sub = el('sub');
-const banner = el('banner'), bannerText = el('bannerText'), text = el('text');
-/**
- * 「等你回答」提醒上的 ×：只在本机收起这条提醒。
- *
- * 用户 2026-11-24：「这种弹出提示也需要增加关闭按钮，不想回答，
- * 或另外有安排，就不用一直显示占空间」。
- */
-const bannerClose = el('bannerClose');
-if (bannerClose) {
-  bannerClose.addEventListener('click', function () {
-    const question = lastState && lastState.openQuestion;
-    dismissedQuestion = question
-      ? (typeof question === 'string' ? question : [question.requirementId, question.body].join('|'))
-      : '';
-    banner.style.display = 'none';
-  });
-}
-/** 最近一次渲染的状态：@ 候选和正文解析都要用。 */
-let lastState = null;
-
-/**
- * 设备 id → 稳定色相（0–359）。
- *
- * 用 djb2 散列而不是随机：同一台设备每次打开、在对方窗口里，都必须是同一个颜色，
- * 否则「颜色」本身就成了新的混乱来源。
- */
-function hueOf(id) {
-  const text = String(id || 'unknown');
-  let hash = 5381;
-  for (let i = 0; i < text.length; i += 1) hash = ((hash * 33) ^ text.charCodeAt(i)) >>> 0;
-  // 避开红/橙靠得太近的一段，让相邻色相的设备也容易分辨
-  const hue = hash % 300;
-  return hue < 15 ? hue + 300 : hue;
-}
-
-function avatar(who, side, device) {
-  const node = document.createElement('div');
-  node.className = 'avatar ' + side;
-  const id = device && device.id ? device.id : '';
-  node.style.setProperty('--hue', String(hueOf(id)));
-  if (device && device.isLocal) node.classList.add('local');
-  // 角色固定：用户=甲方，agent=乙方。不按平台取首字母，否则每个方块都是 W/M。
-  node.textContent = side === 'user' ? '甲' : '乙';
-  node.title = device && device.name ? device.name + (device.isLocal ? '（本机）' : '') : '';
-  return node;
-}
-
-let boardCollapsed = true;
-/** 邀请码默认收起（等对方加入时展开一次，之后不占地方）。 */
-let inviteCollapsed = false;
-/** 群信息（成员 / 操作 / 项目 / 邀请码）默认收起：只留一行摘要。 */
-let drawerOpen = false;
-/** 被收起的那条「等你回答」提醒（只影响本机显示，不影响问题本身）。 */
-let dismissedQuestion = '';
-function paintInvite() {
-  el('invite').classList.toggle('collapsed', inviteCollapsed);
-}
-function paintDrawer() {
-  el('drawer').style.display = drawerOpen ? 'block' : 'none';
-  el('moreBtn').classList.toggle('on', drawerOpen);
-}
-/** 当前选中的执行设备；null = 所有人（旧行为）。 */
-let assignee = null;
-/** 当前输入框开头的 @ 前缀（用于判断用户是否手动删掉了它）。 */
-let lastPrefix = '';
-/**
- * 设备名里的 @ token。
- *
- * 设备名形如「192.168.0.8 · darwin」，带空格和间隔号；直接塞进 @xxx 会让
- * @ 前缀在第一个空格处断开（剥离时只剩半截）。所以只取第一段并去掉空格。
- */
-function mentionToken(name) {
-  const first = String(name || '').split(' · ')[0];
-  return first.split('·')[0].replace(/\\s+/g, '').trim();
-}
-/** 「由谁执行」对应的 @ 前缀：没选就是所有人。 */
-function prefixFor(target) {
-  return target ? '@' + mentionToken(target.name) + ' ' : '@所有人 ';
-}
-/**
- * 把输入框开头的 @ 前缀换成当前选中的设备。
- *
- * 用户要求：选中 A 再去打字，输入框就显示 @A；选中 B 就显示 @B；没选就是 @所有人。
- * 只改开头那一段，后面的正文原样保留。
- */
-function syncPrefixToAssignee(target) {
-  const prefix = prefixFor(target);
-  const rest = text.value.replace(/^@[^\\s@]*\\s*/, '');
-  text.value = prefix + rest;
-  lastPrefix = prefix;
-  autosize();
-  const caret = text.value.length;
-  // 有些环境（测试用的轻量 DOM）没有 setSelectionRange，别让它把整个渲染打断。
-  if (typeof text.setSelectionRange === 'function') text.setSelectionRange(caret, caret);
-}
-
-/*
- * @ 选择设备。
- *
- * 用户要求：输入 @ 弹出选项；不选继续输入或删掉 @ 就消失；
- * 选中就只让那台执行；不选 = 所有人（旧行为）。
- */
-let mentionItems = [];
-let mentionIndex = 0;
-let mentionStart = -1;
-function mentionCandidates(query) {
-  // @ 候选与「由谁执行」同源：都用 state.peers，不再有第二份 devices。
-  const peers = (lastState && Array.isArray(lastState.peers)) ? lastState.peers : [];
-  const all = [{ id: null, name: '所有人', label: '所有人', platform: '' }].concat(
-    peers.map(function (peer) { return { id: peer.id, name: peer.name, label: peer.label || peer.name, isLocal: peer.isLocal }; }),
-  );
-  const q = String(query || '').toLowerCase();
-  return all.filter(function (item) {
-    return !q || String(item.name).toLowerCase().indexOf(q) >= 0
-      || String(item.label).toLowerCase().indexOf(q) >= 0;
-  });
-}
-function paintMention() {
-  const box = el('mention');
-  if (!mentionItems.length) { box.style.display = 'none'; return; }
-  box.style.display = 'block';
-  box.textContent = '';
-  mentionItems.forEach(function (item, index) {
-    const row = document.createElement('div');
-    row.className = 'item' + (index === mentionIndex ? ' on' : '');
-    row.textContent = item.label || item.name;
-    const tag = document.createElement('small');
-    tag.textContent = item.id === null ? '全部设备' : (item.isLocal ? '本机' : '队友');
-    row.appendChild(tag);
-    row.addEventListener('mousedown', function (event) {
-      event.preventDefault();
-      chooseMention(item);
-    });
-    box.appendChild(row);
-  });
-}
-function closeMention() {
-  mentionItems = [];
-  mentionStart = -1;
-  el('mention').style.display = 'none';
-}
-function chooseMention(item) {
-  if (mentionStart < 0) return;
-  const before = text.value.slice(0, mentionStart);
-  const after = text.value.slice(text.selectionStart);
-  const inserted = item.id === null ? '@所有人 ' : '@' + mentionToken(item.name) + ' ';
-  text.value = before + inserted + after;
-  assignee = item.id === null ? null : { id: item.id, name: item.name };
-  lastPrefix = inserted;
-  closeMention();
-  if (typeof text.focus === 'function') text.focus();
-  const caret = (before + inserted).length;
-  if (typeof text.setSelectionRange === 'function') text.setSelectionRange(caret, caret);
-  autosize();
-}
-/** 光标前是不是一个「刚落下的 @」；是就开列表。 */
-function syncMention() {
-  const caret = text.selectionStart;
-  const before = text.value.slice(0, caret);
-  const at = before.lastIndexOf('@');
-  // 删掉 @ 或者 @ 后面有空格 → 关掉（用户要求：不选继续输入就消失）
-  if (at < 0) { closeMention(); return; }
-  const prevOk = at === 0 || /\\s/.test(before[at - 1]);
-  const query = before.slice(at + 1);
-  if (!prevOk || /\\s/.test(query)) { closeMention(); return; }
-  mentionStart = at;
-  mentionItems = mentionCandidates(query);
-  mentionIndex = 0;
-  paintMention();
-}
-/** 句子里带了 @某台 就用它当指派对象。 */
-function mentionAssignee(value) {
-  const match = String(value || '').match(/@([^\\s@]+)/);
-  if (!match) return null;
-  const name = match[1];
-  const devices = (lastState && lastState.devices) || [];
-  const hit = devices.find(function (item) {
-    return String(item.name).indexOf(name) >= 0 || String(item.name).split(' · ')[0] === name;
-  });
-  return hit ? { id: hit.id, name: hit.name } : null;
-}
-function renderBoard(groups) {
-  const board = el('board'), cols = el('boardCols'), hint = el('boardHint');
-  const total = groups.reduce((sum, group) => sum + group.tasks.length, 0);
-  if (!total) { board.style.display = 'none'; return; }
-  board.style.display = 'block';
-  board.classList.toggle('open', !boardCollapsed);
-  el('boardHead').onclick = () => {
-    boardCollapsed = !boardCollapsed;
-    board.classList.toggle('open', !boardCollapsed);
-    paintHint();
-  };
-  function paintHint() {
-    const counts = groups.map(function (group) { return group.label + ' ' + group.tasks.length; }).join(' · ');
-    hint.textContent = boardCollapsed ? counts : total + ' 条（点击标题折叠）';
-  }
-  paintHint();
-  cols.textContent = '';
-  for (const group of groups) {
-    const col = document.createElement('div');
-    col.className = 'board-col';
-    const headNode = document.createElement('b');
-    headNode.textContent = group.label + ' · ' + group.tasks.length;
-    col.appendChild(headNode);
-    for (const task of group.tasks) {
-      const card = document.createElement('div');
-      card.className = 'task';
-      const title = document.createElement('div');
-      title.className = 't';
-      title.textContent = task.title;
-      card.appendChild(title);
-      const meta = document.createElement('div');
-      meta.className = 'm';
-      const parts = [];
-      if (task.project) parts.push(task.project);
-      parts.push(task.assigneeName ? '指派：' + task.assigneeName : '全部设备');
-      meta.textContent = parts.join(' · ');
-      card.appendChild(meta);
-      if (task.lastLine) {
-        const last = document.createElement('div');
-        last.className = 'm';
-        last.textContent = task.lastLine;
-        card.appendChild(last);
-      }
-      col.appendChild(card);
-    }
-    cols.appendChild(col);
-  }
-}
-
-function render(state) {
-  lastState = state;
-  // 第一次渲染时给输入框写上默认的 @所有人（用户要求：默认就显示 @内容）。
-  if (!text.dataset.prefixed) {
-    text.dataset.prefixed = '1';
-    if (!text.value.trim()) syncPrefixToAssignee(assignee);
-  }
-  const head = state.header || { status: '未连接', sub: '', on: false };
-  status.textContent = head.status;
-  status.classList.toggle('on', head.on);
-  sub.textContent = head.sub;
-  /*
-   * 一行摘要：成员 + 项目，超长省略。
-   *
-   * 详细的成员卡、四个操作按钮、项目框、邀请码都在「群信息」里展开看 ——
-   * 之前它们全摊在顶部，把对话区挤得只剩一条缝。
-   */
-  const names = state.peers.map((peer) => peer.name).join('、');
-  /*
-   * 摘要里先写项目名，再写仓库 ID —— 只写仓库 ID 会和「群信息」里的名字对不上，
-   * 看起来像两套说法。
-   */
-  const projectBit = state.projectName
-    ? (state.projectRepo ? state.projectName + '（' + state.projectRepo + '）' : state.projectName)
-    : '';
-  el('peek').textContent = [names, projectBit].filter(Boolean).join('  ·  ');
-  paintDrawer();
-
-  /*
-   * 邀请码：主机才显示，一直挂在窗口顶部。
-   *
-   * 用户之前只能在「右下角一闪而过」的通知里看到它，错过就得重开群（码会变）。
-   * 这里同时给出可复制的整串（带地址），对方粘贴即可，不依赖广播。
-   */
-  if (state.projectRows && state.projectRows.length) {
-    const rows = el('projectRows');
-    rows.textContent = '';
-    for (const row of state.projectRows) {
-      const line = document.createElement('div');
-      line.className = 'prow';
-      const who = document.createElement('span');
-      who.className = 'pwho';
-      who.textContent = row.isLocal ? row.device + '（本机）' : row.device;
-      const name = document.createElement('span');
-      name.className = 'pname';
-      name.textContent = row.project || '（未选）';
-      const repo = document.createElement('span');
-      repo.className = 'how';
-      repo.textContent = row.repo || '未绑定 GitHub 仓库';
-      line.appendChild(who); line.appendChild(name); line.appendChild(repo);
-      rows.appendChild(line);
-    }
-    el('projectBox').style.display = 'block';
-  } else {
-    el('projectBox').style.display = 'none';
-  }
-  /*
-   * 项目对不上时**必须醒目**。
-   *
-   * 真机踩过：Windows 在做 deepseek-hwchat、mac 在做 personal_workstation，
-   * 两台都显示「群聊中 · 2 台设备」，看着一切正常，但任务一律被门禁拦下 ——
-   * 用户只会觉得「根本没法执行任务」。
-   */
-  const versionWarn = el('versionWarn');
-  if (state.versionWarning) {
-    versionWarn.style.display = 'block';
-    versionWarn.textContent = '版本不一致：' + state.versionWarning;
-  } else {
-    versionWarn.style.display = 'none';
-  }
-
-  const warn = el('projectWarn');
-  if (state.projectMismatch) {
-    warn.style.display = 'block';
-    warn.textContent = '两台在做不同的项目：' + state.projectMismatch
-      + '。在群里说话照常能听到、照常能回；只有「会改代码」的任务需要先对齐项目。';
-  } else {
-    warn.style.display = 'none';
-  }
-
-  const inviteBox = el('invite');
-  const inviteText = state.inviteText || '';
-  if (inviteText) {
-    inviteBox.style.display = 'block';
-    el('inviteCode').textContent = state.invite || '';
-    el('inviteHow').textContent = state.inviteWaiting
-      ? '正在等对方填码…（点「复制邀请码」把整串发给对方）'
-      : '';
-    inviteBox.dataset.text = inviteText;
-    /*
-     * 已经有人加入了就自动收起：这时邀请码没用了，不该继续占地方。
-     * 用户也可以点标题自己展开/收起。
-     */
-    if (!state.inviteWaiting) inviteCollapsed = true;
-    paintInvite();
-  } else {
-    inviteBox.style.display = 'none';
-  }
-
-  members.textContent = '';
-  for (const peer of state.peers) {
-    const node = document.createElement('div');
-    node.className = 'member';
-    node.appendChild(avatar(peer.label || peer.name, 'agent', peer));
-    const label = document.createElement('span');
-    /*
-     * 统一身份标识：系统类型 · 设备名（两台同名时自动带 IP）。
-     * 以前这里直接显示 peer.name，一台是「Windows」、另一台是「MagicBookV14 · win32」，
-     * 看不出是同一种东西，两台都是 Windows 时更分不清。
-     */
-    label.textContent = peer.label || peer.name;
-    /*
-     * 每台设备上都有一位甲方（用户）和一个乙方（agent）。
-     * 标清角色，用户才不会以为另一台只有"一台机器"在跟他协作。
-     */
-    const tag = document.createElement('small');
-    tag.textContent = peer.isLocal ? '本机 · 甲方(你) + 乙方' : '队友 · 甲方 + 乙方';
-    node.appendChild(label);
-    node.appendChild(tag);
-    members.appendChild(node);
-  }
-
-  /*
-   * 追问提示条：**写清是哪台在问**，并给出可点的现成答案 + 自定义回答。
-   *
-   * 点选项 = 直接发出这条回答，而且只回给问话的那台（assignee），
-   * 不会让群里其它 agent 也收到一份回答去重复执行。
-   */
-  const question = state.openQuestion;
-  /*
-   * 关掉的是**这条提醒**，不是把问题撤掉。
-   *
-   * 用户 2026-11-24：「这种弹出提示也需要增加关闭按钮，不想回答，或另外有安排，
-   * 就不用一直显示占空间」。所以只在本机收起；同一台再提新问题
-   * （正文变了）会重新弹出来，别人那台也不受影响。
-   */
-  const signature = question
-    ? (typeof question === 'string' ? question : [question.requirementId, question.body].join('|'))
-    : '';
-  if (question && dismissedQuestion !== signature) {
-    const info = typeof question === 'string' ? { body: question, askerLabel: '', options: [] } : question;
-    banner.style.display = 'block';
-    const whoNode = el('bannerWho');
-    if (whoNode) whoNode.textContent = info.askerLabel
-      ? info.askerLabel + ' 的乙方在等你回答'
-      : '乙方在等你回答';
-    bannerText.textContent = info.body;
-    const opts = el('bannerOpts');
-    if (opts) {
-      opts.textContent = '';
-      (info.options || []).forEach(function (option) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.textContent = option;
-        button.addEventListener('click', function () {
-          vscode.postMessage({
-            type: 'send',
-            text: option,
-            assignee: info.askerId ? { id: info.askerId, name: info.askerLabel || info.askerId } : undefined
-          });
-        });
-        opts.appendChild(button);
-      });
-      opts.style.display = (info.options || []).length ? 'flex' : 'none';
-    }
-    const hintNode = el('bannerHint');
-    if (hintNode) hintNode.textContent = (info.options || []).length
-      ? '点一个答案直接发送；也可以在下面输入自己的回答（同样只回给这一台）。'
-      : '在下面输入回答即可，只会发给提问的这一台。';
-  } else {
-    banner.style.display = 'none';
-  }
-
-  renderBoard(state.taskGroups || []);
-  renderAssign(state);
-
-  feed.textContent = '';
-  let lastRequirement = '';
-  for (const line of state.lines) {
-    if (line.phaseKey === 'requirement' && line.requirementId !== lastRequirement) {
-      lastRequirement = line.requirementId;
-      const divider = document.createElement('div');
-      divider.className = 'divider';
-      divider.textContent = '需求 ' + line.requirementId.slice(0, 12);
-      feed.appendChild(divider);
-    }
-    const row = document.createElement('div');
-    row.className = 'msg ' + line.side;
-    row.appendChild(avatar(line.who, line.side, line.device));
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble ' + line.phaseKey;
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    const tag = document.createElement('span');
-    tag.className = 'tag ' + line.phaseKey;
-    tag.textContent = line.phase;
-    const who = document.createElement('span');
-    who.textContent = line.who;
-    const time = document.createElement('span');
-    time.textContent = line.time;
-    meta.appendChild(tag); meta.appendChild(who); meta.appendChild(time);
-    const body = document.createElement('div');
-    /*
-     * 按 markdown 渲染，而不是原样贴一大坨。
-     *
-     * 用户 2026-11-24：「不要用你规定的输出格式限定输出…我需要它和飞书、微信、
-     * copilotchat 等对话框一样，能支持多种方式的输入输出，而不是规定死的模板」。
-     */
-    const bodyText = (line.phaseKey === 'result' || line.phaseKey === 'blocked')
-      ? (line.full || line.body)
-      : line.body;
-    if (window.HwRichText) window.HwRichText.render(body, bodyText);
-    else body.textContent = bodyText;
-    bubble.appendChild(meta);
-    bubble.appendChild(body);
-    /*
-     * 结构化信息（项目 / 用时 / 改动文件 / 被停止）：由界面画成小标签。
-     * 以前这些是拼在正文里的「【项目 X】…用时 12s…改动文件：a、b」，
-     * 看着就是程序在说话。
-     */
-    if (line.meta) {
-      const chips = [];
-      if (line.meta.stopped) chips.push('被停止');
-      if (line.meta.project) chips.push(line.meta.project);
-      if (typeof line.meta.seconds === 'number') chips.push('用时 ' + line.meta.seconds + 's');
-      if (line.meta.files && line.meta.files.length) chips.push(line.meta.files.length + ' 个文件');
-      if (chips.length) {
-        const metaLine = document.createElement('div');
-        metaLine.className = 'msg-meta';
-        chips.forEach(function (text) {
-          const chip = document.createElement('span');
-          chip.textContent = text;
-          metaLine.appendChild(chip);
-        });
-        if (line.meta.files && line.meta.files.length) metaLine.title = line.meta.files.join('\\n');
-        bubble.appendChild(metaLine);
-      }
-    }
-    /* 追问的可点答案：点了直接发出（只发给问话的那台）。 */
-    if (line.options && line.options.length) {
-      const opts = document.createElement('div');
-      opts.className = 'msg-options';
-      line.options.forEach(function (option) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.textContent = option;
-        button.addEventListener('click', function () {
-          vscode.postMessage({
-            type: 'send',
-            text: option,
-            assignee: line.device && line.device.id && !line.device.isLocal
-              ? { id: line.device.id, name: line.device.name }
-              : undefined
-          });
-        });
-        opts.appendChild(button);
-      });
-      bubble.appendChild(opts);
-    }
-    row.appendChild(bubble);
-    feed.appendChild(row);
-  }
-  /*
-   * 两个 agent 之间的往来：单独一段，标成「队友对话」。
-   *
-   * 用户 2026-11-24：「没有实现两个 agent 在团队群自己沟通任务的功能，还是各干各的」。
-   * 这些消息以前只进账本，界面看不到；现在照着线程显示，谁回谁一眼可见。
-   */
-  if (state.dialogue && state.dialogue.length) {
-    const divider = document.createElement('div');
-    divider.className = 'divider';
-    divider.textContent = '队友之间的往来';
-    feed.appendChild(divider);
-    state.dialogue.forEach(function (note) {
-      const row = document.createElement('div');
-      row.className = 'msg agent note';
-      row.appendChild(avatar(note.who, 'agent', { id: note.id, name: note.who }));
-      const bubble = document.createElement('div');
-      bubble.className = 'bubble analysis';
-      const meta = document.createElement('div');
-      meta.className = 'meta';
-      const tag = document.createElement('span');
-      tag.className = 'tag';
-      tag.textContent = note.replyTo ? '回复队友' : '队友对话';
-      const who = document.createElement('span');
-      who.textContent = note.who;
-      const at = new Date(note.at);
-      const time = document.createElement('span');
-      time.textContent = ('0' + at.getHours()).slice(-2) + ':' + ('0' + at.getMinutes()).slice(-2);
-      meta.appendChild(tag); meta.appendChild(who); meta.appendChild(time);
-      const body = document.createElement('div');
-      if (window.HwRichText) window.HwRichText.render(body, note.body);
-      else body.textContent = note.body;
-      bubble.appendChild(meta);
-      bubble.appendChild(body);
-      row.appendChild(bubble);
-      feed.appendChild(row);
-    });
-  }
-  if (!state.lines.length && !state.pending) {
-    const empty = document.createElement('div');
-    empty.className = 'empty';
-    empty.innerHTML = '<b>群里还没有发言</b><br>在下面发一条需求，频道里的乙方会各自给出解析；<br>有不清楚的地方它们会追问，你回答后才会开始动手。';
-    feed.appendChild(empty);
-  }
-  /*
-   * 刚发出去、还在判断「这是闲聊还是任务」的那句话。
-   *
-   * 判断要问一次模型，一两秒；这段时间必须先看到自己说的话，
-   * 否则用户会以为没发出去、又发一遍。
-   */
-  if (state.pending) {
-    const row = document.createElement('div');
-    row.className = 'msg user pending';
-    row.appendChild(avatar('你', 'user', { id: state.localId, name: '你', isLocal: true }));
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble analysis';
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    const tag = document.createElement('span');
-    tag.className = 'tag';
-    tag.textContent = '发送中';
-    const who = document.createElement('span');
-    who.textContent = '你';
-    const time = document.createElement('span');
-    time.textContent = state.pending.time || '';
-    meta.appendChild(tag); meta.appendChild(who); meta.appendChild(time);
-    const body = document.createElement('div');
-    body.textContent = state.pending.body;
-    bubble.appendChild(meta);
-    bubble.appendChild(body);
-    row.appendChild(bubble);
-    feed.appendChild(row);
-  }
-  feed.scrollTop = feed.scrollHeight;
-}
-
-function renderAssign(state) {
-  const box = el('assign');
-  box.textContent = '';
-  const label = document.createElement('span');
-  label.className = 'label';
-  label.textContent = '由谁执行';
-  box.appendChild(label);
-
-  /*
-   * 候选**只用 state.peers**（唯一来源）。
-   *
-   * 以前另有一份 state.devices（先局域网再中继去重），两份数据只要一份构造出问题，
-   * 这一行就整个空掉、连设备都选不了。peers 一定包含本机，所以这里不会为空。
-   */
-  const devices = (Array.isArray(state.peers) ? state.peers : []).map(function (peer) {
-    return {
-      id: peer.id,
-      /* name 只用来拼 @ 前缀（设备名，不带系统类型）；label 是给人看的统一标识。 */
-      name: peer.name,
-      label: peer.label || peer.name,
-      isLocal: peer.isLocal
-    };
-  });
-  const chips = [{ id: null, name: '所有人', label: '所有人' }].concat(devices);
-  // 选中的设备掉线了就退回「所有人」，否则会发出一条谁都接不到的需求
-  if (assignee && !chips.some(function (item) { return item.id === assignee.id; })) assignee = null;
-  for (const item of chips) {
-    const chip = document.createElement('button');
-    chip.className = 'chip' + ((assignee ? assignee.id : null) === item.id ? ' on' : '');
-    chip.textContent = item.id === null ? item.name : (item.label + (item.isLocal ? '（本机）' : ''));
-    chip.title = item.id === null ? '不指定设备：每台都做' : ('@' + mentionToken(item.name) + ' · ' + item.label);
-    chip.addEventListener('click', () => {
-      assignee = item.id === null ? null : { id: item.id, name: item.name };
-      // 选中谁，输入框开头就写 @谁（没选就是 @所有人）。
-      syncPrefixToAssignee(assignee);
-      renderAssign(state);
-    });
-    box.appendChild(chip);
-  }
-
-  if (state.canStop) {
-    const stop = document.createElement('button');
-    stop.className = 'chip stop';
-    stop.textContent = '停止执行';
-    stop.addEventListener('click', () => vscode.postMessage({ type: 'control', command: 'stop' }));
-    box.appendChild(stop);
-  }
-}
-
-function send() {
-  const raw = text.value;
-  /*
-   * **永远不能因为解析前缀而阻止发送。**
-   *
-   * 0.9.5 加过一条「只写了 @设备、没有正文就不发」的判断，结果两台的发送全被吃掉 ——
-   * 用户打了字却发不出去，这是最不可接受的失败方式。
-   * 现在：能剥就剥，剥完是空的就按原文发，绝不 return。
-   */
-  const stripped = raw.replace(/^@[^\\s@]*\\s*/, '');
-  /*
-   * 只写了 @设备 而没写正文：不发（这是明确的空输入）。
-   * 但**只要还有别的字**，就按原文发 —— 绝不吃掉用户打的内容。
-   */
-  if (!stripped.trim() && /^@[^\\s@]*\\s*$/.test(raw)) return;
-  const body = (stripped.trim() ? stripped : raw).trim();
-  if (!body) return;
-  /*
-   * 指派对象：正文里的 @设备 优先，其次「由谁执行」的选择。
-   * 前缀里的「@所有人」不算指派。
-   */
-  const fromText = mentionAssignee(raw);
-  const target = fromText || assignee;
-  const files = attached.map(function (item) { return item.path; }).filter(Boolean);
-  text.value = '';
-  autosize();
-  closeMention();
-  lastPrefix = '';
-  assignee = null;
-  if (lastState) renderAssign(lastState);
-  /* 附件随这条消息一起给本机 agent（路径由扩展保存后返回）。 */
-  vscode.postMessage({ type: 'send', text: body, assignee: target || undefined, attachments: files });
-  attached.length = 0;
-  paintAttachments();
-}
-
-/* ---------------- 附件与语音（和主对话框同一套能力） ---------------- */
-/** 已附加到这条消息的文件；路径由扩展保存到磁盘后返回。 */
-const attached = [];
-function paintAttachments() {
-  const box = el('attachList');
-  if (!box) return;
-  box.textContent = '';
-  if (!attached.length) { box.style.display = 'none'; return; }
-  box.style.display = 'flex';
-  attached.forEach(function (item, index) {
-    const chip = document.createElement('div');
-    chip.className = 'attach-chip';
-    const name = document.createElement('span');
-    name.textContent = item.name;
-    name.title = item.path || item.name;
-    const remove = document.createElement('button');
-    remove.type = 'button';
-    remove.textContent = '×';
-    remove.addEventListener('click', function () { attached.splice(index, 1); paintAttachments(); });
-    chip.appendChild(name);
-    chip.appendChild(remove);
-    box.appendChild(chip);
-  });
-}
-function readAsBase64(file, done) {
-  const reader = new FileReader();
-  reader.onload = function () {
-    const result = String(reader.result || '');
-    done(result.slice(result.indexOf(',') + 1));
-  };
-  reader.onerror = function () { done(''); };
-  reader.readAsDataURL(file);
-}
-function attachFiles(fileList) {
-  Array.prototype.slice.call(fileList || []).forEach(function (file) {
-    // 6 MB 上限和主对话框一致：再大就不是「顺手贴一张图」了。
-    if (!file || file.size > 6 * 1024 * 1024) {
-      vscode.postMessage({ type: 'toast', text: '附件超过 6 MB，没有添加' });
-      return;
-    }
-    readAsBase64(file, function (dataBase64) {
-      if (!dataBase64) return;
-      vscode.postMessage({
-        type: 'attach',
-        name: file.name || 'attachment',
-        mimeType: file.type || '',
-        dataBase64: dataBase64
-      });
-    });
-  });
-}
-if (el('attachBtn')) {
-  el('attachBtn').addEventListener('click', function () { el('fileInput').click(); });
-  el('fileInput').addEventListener('change', function (event) {
-    attachFiles(event.target.files);
-    event.target.value = '';
-  });
-  /* 直接粘贴图片：和主对话框一致 */
-  text.addEventListener('paste', function (event) {
-    const items = (event.clipboardData && event.clipboardData.items) || [];
-    const files = [];
-    for (let i = 0; i < items.length; i += 1) {
-      if (items[i].kind === 'file') {
-        const file = items[i].getAsFile();
-        if (file) files.push(file);
-      }
-    }
-    if (files.length) { event.preventDefault(); attachFiles(files); }
-  });
-  /* 语音输入：用浏览器自带的识别，识别结果直接追加到输入框，可再修改。 */
-  let voice = null;
-  el('voiceBtn').addEventListener('click', function () {
-    const button = el('voiceBtn');
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!Recognition) {
-      vscode.postMessage({ type: 'toast', text: '这个环境不支持语音输入，请用键盘输入' });
-      return;
-    }
-    if (voice) { try { voice.stop(); } catch (ignored) {} voice = null; button.classList.remove('active'); return; }
-    const recognition = new Recognition();
-    voice = recognition;
-    button.classList.add('active');
-    recognition.lang = navigator.language || 'zh-CN';
-    recognition.interimResults = true;
-    recognition.continuous = false;
-    recognition.onresult = function (event) {
-      let spoken = '';
-      for (let i = event.resultIndex; i < event.results.length; i += 1) spoken += event.results[i][0].transcript;
-      const clean = spoken.trim();
-      if (!clean) return;
-      text.value = (text.value.replace(/\\s+$/, '') ? text.value.replace(/\\s+$/, '') + ' ' : '') + clean;
-      autosize();
-    };
-    recognition.onerror = function (event) {
-      vscode.postMessage({ type: 'toast', text: '语音识别失败：' + (event.error || '未知原因') });
-    };
-    recognition.onend = function () { voice = null; button.classList.remove('active'); };
-    try { recognition.start(); } catch (error) { voice = null; button.classList.remove('active'); }
-  });
-}
-
-function autosize() {
-  text.style.height = 'auto';
-  text.style.height = Math.min(text.scrollHeight, Math.round(window.innerHeight * 0.4)) + 'px';
-}
-
-el('send').addEventListener('click', send);
-text.addEventListener('input', () => {
-  autosize();
-  syncMention();
-  /*
-   * 用户手动删掉了开头的 @：选择跟着回到「所有人」。
-   *
-   * 这是用户定的规则：「不选继续输入或者删掉 @，选择会消失，就默认是所有设备」。
-   */
-  const hasPrefix = /^@[^\\s@]*\\s/.test(text.value);
-  if (lastPrefix && !hasPrefix) {
-    lastPrefix = '';
-    assignee = null;
-    if (lastState) renderAssign(lastState);
-  } else if (hasPrefix) {
-    lastPrefix = (text.value.match(/^@[^\\s@]*\\s/) ?? [''])[0];
-  }
-});
-/* 光标移动（点别处、按方向键）也要同步，否则删掉 @ 后列表还挂着。 */
-text.addEventListener('click', syncMention);
-text.addEventListener('keyup', (event) => {
-  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'Home' || event.key === 'End') syncMention();
-});
-text.addEventListener('blur', () => { setTimeout(closeMention, 120); });
-text.addEventListener('keydown', (event) => {
-  if (mentionItems.length) {
-    if (event.key === 'ArrowDown') {
-      event.preventDefault();
-      mentionIndex = (mentionIndex + 1) % mentionItems.length;
-      paintMention();
-      return;
-    }
-    if (event.key === 'ArrowUp') {
-      event.preventDefault();
-      mentionIndex = (mentionIndex - 1 + mentionItems.length) % mentionItems.length;
-      paintMention();
-      return;
-    }
-    if (event.key === 'Enter' || event.key === 'Tab') {
-      event.preventDefault();
-      chooseMention(mentionItems[mentionIndex]);
-      return;
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      closeMention();
-      return;
-    }
-  }
-  if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); }
-});
-for (const button of document.querySelectorAll('.toolbar button')) {
-  button.addEventListener('click', () => vscode.postMessage({ type: 'command', command: button.dataset.command }));
-}
-el('copyInvite').addEventListener('click', () => {
-  const button = el('copyInvite');
-  // 立刻给出可见结果：以前点了完全没反应，用户不知道复制成没成。
-  button.classList.add('copied');
-  button.textContent = '已复制';
-  vscode.postMessage({ type: 'copyInvite', text: el('invite').dataset.text || el('inviteCode').textContent || '' });
-  setTimeout(() => {
-    button.classList.remove('copied');
-    button.textContent = '复制邀请码';
-  }, 1400);
-});
-el('copyInviteInline').addEventListener('click', (event) => {
-  // 收起状态下也能直接复制，不必先展开。
-  event.stopPropagation();
-  const button = event.currentTarget;
-  button.textContent = '已复制';
-  vscode.postMessage({ type: 'copyInvite', text: el('invite').dataset.text || el('inviteCode').textContent || '' });
-  setTimeout(() => { button.textContent = '复制'; }, 1400);
-});
-el('inviteToggle').addEventListener('click', (event) => {
-  if (event.target === el('copyInviteInline')) return;
-  inviteCollapsed = !inviteCollapsed;
-  paintInvite();
-});
-el('moreBtn').addEventListener('click', () => {
-  drawerOpen = !drawerOpen;
-  paintDrawer();
-});
-window.addEventListener('message', (event) => {
-  const data = event.data || {};
-  if (data.type === 'state') render(data);
-  /* 附件保存结果：拿到磁盘路径后挂到这条消息上。 */
-  if (data.type === 'attached' && data.item) {
-    attached.push(data.item);
-    paintAttachments();
-  }
-  if (data.type === 'attachFailed') {
-    vscode.postMessage({ type: 'toast', text: '附件保存失败：' + (data.reason || '未知原因') });
-  }
-});
-vscode.postMessage({ type: 'ready' });
-</script>
+<script nonce="${nonce}" src="${groupScript}"></script>
 </body></html>`;
   }
 

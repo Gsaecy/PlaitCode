@@ -75,6 +75,40 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   outline-offset: 2px;
 }
 
+/*
+ * 「界面没有加载成功」的兜底层。
+ *
+ * 不依赖任何外部脚本：脚本跑起来会自己移除它（见 chat.js 末尾）。
+ * 目的只有一个——界面出问题时屏幕上必须有**可读的说明**，而不是纯白。
+ */
+.boot-fallback {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+  z-index: 999;
+}
+.boot-fallback-card {
+  max-width: 460px;
+  padding: 20px;
+  border: 1px solid var(--vscode-panel-border, rgba(0, 0, 0, .12));
+  border-radius: 12px;
+  line-height: 1.6;
+  font-size: 13px;
+}
+.boot-fallback-card strong { display: block; margin-bottom: 8px; font-size: 15px; }
+.boot-fallback-card p { margin: 6px 0; }
+.boot-fallback-card kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--vscode-panel-border, rgba(0, 0, 0, .2));
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.boot-fallback-hint { color: var(--muted); font-size: 12px; }
+
 .app-shell {
   display: grid;
   grid-template-columns: 268px minmax(0, 1fr);
@@ -1445,6 +1479,77 @@ body.vscode-high-contrast .todo-panel { --todo-green: #3fb950; }
   .runtime-field.permission-field > span { display: none; }
 }
 .runtime-icon-button { display: grid; place-items: center; width: 30px; height: 28px; padding: 0; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); background: var(--dropdown-bg); cursor: pointer; }
+/*
+ * 麦克风周围那圈「安装 VS Code Speech」的进度环。
+ * 一次性特效：安装中转到 ~88% → 装好闭环 + 亮 3 秒 → 脚本移除节点。
+ */
+.runtime-icon-button.has-ring { position: relative; }
+.voice-ring {
+  position: absolute; inset: -3px; width: calc(100% + 6px); height: calc(100% + 6px);
+  pointer-events: none; transform: rotate(-90deg); overflow: visible;
+}
+.voice-ring circle { fill: none; stroke-width: 6; }
+.voice-ring .track { stroke: rgba(46, 204, 113, .18); }
+.voice-ring .bar {
+  stroke: #2ecc71; stroke-linecap: round;
+  stroke-dasharray: 100; stroke-dashoffset: 100;
+  transition: stroke-dashoffset .35s ease-out;
+}
+.voice-ring.installing .bar { animation: voice-ring-fill 22s cubic-bezier(.2, .7, .3, 1) forwards; }
+.voice-ring.ready .bar {
+  stroke-dashoffset: 0;
+  filter: drop-shadow(0 0 4px rgba(46, 204, 113, .85));
+  animation: voice-ring-flash 3s ease-out forwards;
+}
+@keyframes voice-ring-fill { from { stroke-dashoffset: 100; } to { stroke-dashoffset: 12; } }
+@keyframes voice-ring-flash { 0% { opacity: 1; } 70% { opacity: 1; } 100% { opacity: 0; } }
+/*
+ * 录音中：麦克风变成**跳动的音波条**（用户 2026-11-25 指定的效果：
+ * 一排圆角竖条，绿→蓝渐变，像实时音量）。
+ * 只动图标本身（不动按钮底色），避免和「录音/停止」的文字提示抢注意力。
+ */
+.runtime-icon-button.voice-recording { color: #2ecc71; }
+/* 录音时把静态话筒图标让位给音波条。 */
+.runtime-icon-button.voice-recording > svg { display: none; }
+/*
+ * 细线条 + 严格收在按钮圆角矩形内部。
+ * 尺寸全部用**百分比**：整排占按钮 62% 宽、42% 高，每根条厚 8%、间距 15%
+ * —— 换算下来 26px 按钮里条约 1.2px、34px 里约 1.6px，两种按钮观感一致。
+ * 不动渐变：纯绿色实色条，靠整个音波条的**透明度呼吸**（黑 → 绿 → 黑）出效果。
+ * max-height/max-width + overflow:hidden 兜底：按钮再小也不会顶出边框。
+ */
+.voice-bars {
+  display: none; align-items: center; justify-content: center;
+  width: 62%; height: 42%; gap: 15%;
+  max-height: calc(100% - 14px); max-width: calc(100% - 6px);
+  overflow: hidden; pointer-events: none;
+  animation: voice-bars-breathe 2.2s ease-in-out infinite;
+}
+.runtime-icon-button.voice-recording .voice-bars { display: inline-flex; }
+/*
+ * 只保留两件事：
+ *   1) 高度按相位起伏 → 形成从左扫到右的行进波（traveling wave）
+ *   2) 整排一起明暗呼吸（breathing / luminance pulse）→ 黑底上像呼吸灯一样浮出来
+ */
+.voice-bars i {
+  display: block; flex: 0 0 8%; min-width: 1px; border-radius: 1px; height: var(--h, 100%);
+  background: #3ee089;
+  transform-origin: center; transform: scaleY(.45);
+  animation: voice-bar-level 1.1s ease-in-out infinite var(--d, 0ms);
+}
+.voice-bars i:nth-child(1) { --h: 52%; --d: 0ms; }
+.voice-bars i:nth-child(2) { --h: 80%; --d: -220ms; }
+.voice-bars i:nth-child(3) { --h: 100%; --d: -440ms; }
+.voice-bars i:nth-child(4) { --h: 76%; --d: -660ms; }
+.voice-bars i:nth-child(5) { --h: 50%; --d: -880ms; }
+@keyframes voice-bar-level { 0%, 100% { transform: scaleY(.45); } 50% { transform: scaleY(1); } }
+/* 黑 → 绿 → 黑：整排在黑色底上像呼吸灯一样浮出来（不是渐变、不是变色） */
+@keyframes voice-bars-breathe { 0%, 100% { opacity: .1; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  /* 关掉动效时保留一排静态音波条（仍能看出在录），只是不跳、不呼吸。 */
+  .voice-bars { animation: none; opacity: 1; }
+  .voice-bars i { animation: none; transform: scaleY(.6); }
+}
 .runtime-icon-button:hover, .runtime-icon-button.active { color: var(--surface-hover-fg); background: var(--surface-hover); }
 .runtime-icon-button.active { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
 .runtime-icon-button:disabled { opacity: .45; cursor: default; }
@@ -1599,3 +1704,18 @@ body.team-task #composer { display: none !important; }
 .team-task-bar .tt-project { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .team-task-bar .tt-task { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .9; }
 .team-task-bar .stop-button { align-self: flex-start; margin-top: 6px; }
+/*
+ * 团队任务的「停止执行」：空闲 = 灰色、不闪、点不动；运行中才红色呼吸。
+ *
+ * 用户 2026-11-25：「只有在运行的时候显示闪动的红色，没运行的时候显示成灰色，且不可点击」。
+ * 它以前直接套用输入框那颗 `.stop-button`（红色 + 呼吸一直在跑），空闲时看着像还有活可停。
+ */
+.team-task-bar .stop-button:disabled,
+.team-task-bar .stop-button[aria-disabled="true"] {
+  color: var(--muted);
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  animation: none;
+  cursor: default;
+  opacity: .8;
+}

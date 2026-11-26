@@ -97,7 +97,9 @@ export const SYNC_READ_ONLY_PLAYBOOK: ToolPlaybook = {
   preferred: [],
   blocked: ['write_file', 'delete_file', 'apply_patch', 'run_command', 'run_in_terminal'],
   allowed: [...ALWAYS_ALLOWED],
-  directive: '本轮是**只读**：可以读代码、回答、给依据，但绝不修改任何文件、不执行会改文件的命令。',
+  directive: '本轮是**只读**（两台当前选的项目不是同一个）：可以读代码、回答、给依据，但绝不修改任何文件、不执行会改文件的命令。'
+    + '写工具这一档被收走了，不是权限不足、不是配置坏了、也不是甲方没授权；不要索取授权、不要说「没有写文件能力」。'
+    + '解锁办法只有一个：让甲方把本机切到需求所属项目后重发这条需求。',
   narrowWrites: false,
 };
 
@@ -131,8 +133,13 @@ function isImageGenerationRequest(text: string, looksLikeImage: (value: string) 
 
 /** 「git 写操作」：用户明确要求提交 / 推送 / 打 tag。 */
 function isGitWriteRequest(text: string): boolean {
-  return /(?:提交|推送|commit|push|打\s*tag|打个\s*tag|发布到\s*github)/i.test(text)
-    && !/(?:不要|别|不用|无需)\s*(?:提交|推送|commit|push)/i.test(text);
+  /*
+   * 否定要吞得宽一点：`不要`/`别` 与动词之间常夹着别的词。
+   * 真实踩坑（2026-11-25）：「不要主动汇报分支 / 提交 / 工作区状态」被当成
+   * 「要提交」，于是每条群需求都命中 git-write 预案。
+   */
+  if (/(?:不要|别|不用|无需|不许)[^。\n]{0,10}(?:提交|推送|commit|push)/i.test(text)) return false;
+  return /(?:提交|推送|commit|push|打\s*tag|打个\s*tag|发布到\s*github)/i.test(text);
 }
 
 /** 「跑测试」：判据最硬的一类 —— 用户就是要执行项目自己的测试。 */
@@ -392,10 +399,28 @@ export function blockedToolReason(
   // 显式的「绝不该用」优先，文案更具体（例如桥接终端工具）。
   for (const playbook of narrowing) {
     if (playbook.blocked.includes(name)) {
-      return `本轮任务类型是「${playbook.kind}」，不该用 ${name}；请改用 ${playbook.preferred.join(' → ')}。`;
+      /*
+       * 只读档单独给文案（用户 2026-11-26 反问：「为什么要把风险留给我，不提前处理掉？」）。
+       *
+       * 这段是**模型真的伸手去写**时的兜底：必须一次说清「不是权限问题、不要索取授权、
+       * 不要报告没有写文件能力」，否则 agent 会在群里把这当成故障讲一遍，甲方还得替它兜。
+       */
+      if (playbook.kind === 'sync-readonly') {
+        return `本轮是**只读**（两台当前选的项目不是同一个）：${name} 这一档被收走了，`
+          + '不是权限不足、不是配置坏了、也不是甲方没授权 —— 不要索取授权，也不要说「没有写文件能力」。'
+          + '请用 read_file / search_files / get_diagnostics 这类只读工具继续；'
+          + '要动手改，让甲方把本机切到需求所属项目后重发这条需求。';
+      }
+      // `preferred` 为空时不能说「请改用 。」这种半截话。
+      const fallback = playbook.preferred.join(' → ');
+      return fallback
+        ? `本轮任务类型是「${playbook.kind}」，不该用 ${name}；请改用 ${fallback}。`
+        : `本轮任务类型是「${playbook.kind}」，不该用 ${name}；请改用只读工具继续。`;
     }
   }
   const preferred = [...new Set(narrowing.flatMap((playbook) => playbook.preferred))];
-  return `本轮任务类型是「${narrowing.map((playbook) => playbook.kind).join(' + ')}」，${name} 不在允许范围内；`
-    + `请改用 ${preferred.join(' → ')}（只读工具与清单工具仍然可用）。`;
+  const hint = preferred.length
+    ? `请改用 ${preferred.join(' → ')}（只读工具与清单工具仍然可用）。`
+    : '请改用只读工具继续（只读工具与清单工具仍然可用）。';
+  return `本轮任务类型是「${narrowing.map((playbook) => playbook.kind).join(' + ')}」，${name} 不在允许范围内；${hint}`;
 }

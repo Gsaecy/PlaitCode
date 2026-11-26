@@ -1,7 +1,7 @@
 import { fetchUrl, searchGitHubRepos, searchWeb } from './webResearch';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { basename, dirname, extname, resolve, join } from 'node:path';
+import { basename, dirname, extname, resolve, join, posix, win32 } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import * as vscode from 'vscode';
 import { readSettings } from '../core/settings';
@@ -2277,6 +2277,11 @@ function shellQuote(value: string): string {
   return /[^\w@%+=:,./-]/.test(value) ? `'${value.replaceAll("'", `'\\''`)}'` : value;
 }
 
+/** cmd 的引号：只在有空格 / 引号时才加；引号本身按 cmd 的约定翻倍。 */
+function quoteForCmd(value: string): string {
+  return /[\s"]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+}
+
 /**
  * 命令里的 bash 专有语法。
  *
@@ -2366,7 +2371,16 @@ const CMD_ONLY_CHAIN = /&&|\|\||(?:^|[^>&])&(?!>|&)/;
  *    `fatal: '3;': not an integer`（真实故障 2026-11-19，连着三条命令都栽在这上面）。
  *    依赖 cmd 变量展开（`%VAR%`）的命令例外 —— PowerShell 不认 `%VAR%`。
  */
-export function shellFor(command: string, platform: string = process.platform): string | true {
+export function shellFor(
+  command: string,
+  platform: string = process.platform,
+  /*
+   * 本机有没有 `/bin/bash`。作为参数传进来，测试才能在 Windows 上验证 darwin 分支 ——
+   * 否则「需要 bash 才切 /bin/bash」这条规则在本机永远测不到（真机没有 /bin/bash，
+   * 函数返回默认 shell，测试看着像坏了，其实只是没被测过）。
+   */
+  hasBash: boolean = existsSync('/bin/bash'),
+): string | true {
   if (platform === 'win32') {
     const trimmed = command.trim();
     const outsideQuotes = withoutQuoted(trimmed);
@@ -2386,7 +2400,7 @@ export function shellFor(command: string, platform: string = process.platform): 
     return true;
   }
   if (!bashOnlySyntax(command)) return true;
-  return existsSync('/bin/bash') ? '/bin/bash' : true;
+  return hasBash ? '/bin/bash' : true;
 }
 
 /**
@@ -2498,8 +2512,18 @@ export function noMatchExit(
  *
  * 做法：把最外层的临时目录（`/tmp`、`$TMPDIR`、`~/…`）替换成工作区内的 `tmp/`。
  * 其它情况返回空串（不瞎猜）。
+ *
+ * `platform` 显式参数（默认当前系统）：Windows 上不能用 `mkdir -p '…'` ——
+ * cmd 不认 `-p`，单引号也只是普通字符，照抄会建出一个叫 `-p` 的目录；
+ * 而且工作区的 `tmp` 用 `\`、原命令的尾巴用 `/`，混在一起更难读。
+ * 平台作为参数传进来，两条分支才能在任何机器上都跑得到（否则 Windows 分支在本机永远测不到）。
  */
-export function pathRewriteSuggestion(command: string, roots: readonly string[], cwd?: string): string {
+export function pathRewriteSuggestion(
+  command: string,
+  roots: readonly string[],
+  cwd?: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
   /*
    * 临时目录必须落在**命令实际所在的那个工作区根**里。
    *
@@ -2514,7 +2538,10 @@ export function pathRewriteSuggestion(command: string, roots: readonly string[],
     ?? roots.find((item) => cwd !== undefined && samePath(item, cwd))
     ?? roots[0];
   if (!root) return '';
-  const directory = join(root, 'tmp');
+  const windows = platform === 'win32';
+  // 分隔符必须跟**目标平台**一致：在 Windows 上跑这段（默认参数）也不能拼出 `/`。
+  const pathOps = windows ? win32 : posix;
+  const directory = pathOps.join(root, 'tmp');
   /*
    * 前缀（空白 / 引号 / `=`）必须**原样保留**。
    * 第一版把它吞掉了，于是 `tar czf /tmp/x.tgz` 被建议成 `tar czf/var/…/x.tgz` ——
@@ -2541,7 +2568,17 @@ export function pathRewriteSuggestion(command: string, roots: readonly string[],
     const index = match.index ?? 0;
     rewritten += command.slice(lastIndex, index);
     const tail = (path ?? '').replace(/^(?:\/tmp|\/var\/tmp|\$TMPDIR|~)/, '');
-    rewritten += `${prefix}${directory}${tail}`;
+    // Windows 上尾巴统一成 `\`：`…\tmp/x.log` 这种混用虽然能跑，但让人以为是两条路径。
+    const tailPath = windows ? tail.replaceAll('/', '\\') : tail;
+    /*
+     * 带空格必须加引号。
+     *
+     * 真实情况：工作区路径几乎都带空格（`D:\AI projects\…`、`/Users/x/AI projects/…`），
+     * 不加引号时 `cd D:\AI projects\proj\tmp` 会被拆成两个参数，照抄就报
+     * 「系统找不到指定的路径」—— 又变成一条「改了但没用」的建议。
+     */
+    const fullPath = `${directory}${tailPath}`;
+    rewritten += `${prefix}${windows ? quoteForCmd(fullPath) : shellQuote(fullPath)}`;
     lastIndex = index + whole.length;
     replaced += 1;
   }
@@ -2554,8 +2591,15 @@ export function pathRewriteSuggestion(command: string, roots: readonly string[],
    * 真实故障（2026-11-08）：`<工作区根>/tmp` 并不存在，建议里直接 `> …/tmp/x.txt`
    * 会以 `No such file or directory` 收场 —— 又是一条「照抄也没用」的建议。
    * `mkdir -p` 是幂等的，放在最前面不影响原有语义。
+   *
+   * Windows 上没有 `mkdir -p`（cmd 不认 `-p`，单引号也是普通字符），
+   * 改用 cmd 的 `if not exist … md …`，并在后面用 `&` 而不是 `&&`：
+   * `md` 在目录已存在时会报错，用 `&&` 会让后半条命令静默不执行 —— 那正是
+   * 「建议改了但没用」的另一种写法。
    */
-  const prepared = `mkdir -p ${shellQuote(directory)} && ${rewritten}`;
+  const prepared = windows
+    ? `if not exist "${directory}" md "${directory}" & ${rewritten}`
+    : `mkdir -p ${shellQuote(directory)} && ${rewritten}`;
   return tt('path.blockedSuggestion', { command: prepared, directory });
 }
 
@@ -2973,10 +3017,15 @@ export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): vo
     /*
      * Windows 没有进程组信号：`child.kill()` 只结束直接子进程，
      * 它派生的 `node`/`npm` 子进程会留下来占端口（真实表现就是「点了停止，服务还在」）。
-     * `taskkill /T` 才会连整棵树一起收掉；`/F` 对应 SIGKILL。
+     * `taskkill /T` 才会连整棵树一起收掉。
+     *
+     * 而且**必须带 `/F`**：不带 `/F` 的 taskkill 只是给窗口发 WM_CLOSE，
+     * 控制台程序（node / python / npm）根本不响应 —— 实测「停止后台服务」后端口
+     * 还占着 5 秒，要等 SIGKILL 兜底才真的释放。Windows 上没有温和的信号可用，
+     * 所以两个信号都按强制终止处理。
      */
     try {
-      spawnSync('taskkill', ['/pid', String(pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])], { windowsHide: true });
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
     } catch {
       /* taskkill 不在 PATH 时退回下面的 child.kill */
     }

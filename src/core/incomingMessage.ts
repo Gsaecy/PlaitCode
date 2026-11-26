@@ -48,6 +48,17 @@ const REASONING_EFFORTS: readonly string[] = ['default', 'none', 'low', 'medium'
  */
 export const INCOMING_MESSAGE_SPECS: Record<string, IncomingMessageSpec> = {
   ready: {},
+  /**
+   * 界面心跳：每 5 秒一次，宿主据此发现「渲染进程死了」并重建 iframe。
+   *
+   * 带 `webviewGeneration`：重建后的新界面才能证明自己活着，旧 iframe 的迟到心跳不会被
+   * 当成新界面的（两者是同一个页面，但代次不同 —— 留着这个字段便于排查）。
+   */
+  heartbeat: {},
+  /** 界面里的未捕获错误：`kind` / `message` / `detail` 都可缺省，乱填也只会写一行日志。 */
+  webviewError: {
+    optional: { kind: 'string', message: 'string', detail: 'string' },
+  },
   layoutReport: { required: { report: 'object' } },
   newChat: {},
   selectConversation: { required: { id: 'string' } },
@@ -137,6 +148,10 @@ export const SETTINGS_INCOMING_MESSAGE_SPECS: Record<string, IncomingMessageSpec
   lanSyncConnect: {},
   lanSyncJoin: {},
   lanSyncGroup: {},
+  // 跨网络（中继）的三条入口：只是转成命令，不带任何参数。
+  relayCreate: {},
+  relayJoin: {},
+  relayStatus: {},
   mobileOpen: {},
   lanSyncDisconnect: {},
   lanSyncLedger: {},

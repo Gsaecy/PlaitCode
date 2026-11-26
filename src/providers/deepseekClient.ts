@@ -11,6 +11,7 @@ import { tt } from '../core/i18n';
 import { isTransportDropError } from '../agent/abortReason';
 import { stallExtended, stallIdleSeconds } from '../core/requestBudget';
 import { hasImageParts, isTextOnlyContentRejection, stripImageParts } from './visionFallback';
+import { isDeepSeekHost, stripReasoningHistory } from './reasoningHistory';
 import { sanitizeJsonStrings } from '../core/textSafety';
 import { registerKnownSecret } from '../agent/auditLog';
 import { fetchWithNetworkRetry, type RetryEvent } from './netDiagnostics';
@@ -309,6 +310,20 @@ export class DeepSeekClient {
           reason: 'known',
         });
       }
+    }
+    /*
+     * 旧轮次的思考过程（`reasoning_content`）**不再发回服务端**。
+     *
+     * DeepSeek 官方文档写得很清楚：上下文里只拼 `content`，上一轮的 CoT 不进入下一轮。
+     * 我们却把它逐轮累积着一起发了回去 —— 一次 552 轮的运行里，光「已经想过的思考」
+     * 就有几十 KB 而且**每一轮都要重发一遍**（2026-11-26 实测：团队任务那条对话
+     * 累计 5.6 亿 tokens）。去掉它不改变任何行为，纯粹是把重复的账停掉。
+     *
+     * 只对 DeepSeek 生效：部分 OpenAI 兼容网关要靠回传思考片段维持工具调用链，
+     * 那些配置一律保持原样。
+     */
+    if (isDeepSeekHost(endpoint)) {
+      outgoing = stripReasoningHistory(outgoing);
     }
     const body: Record<string, unknown> = {
       model: settings.model,

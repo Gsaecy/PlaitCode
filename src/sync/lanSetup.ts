@@ -40,8 +40,27 @@ export interface LanSetupOptions {
     stop?(): void;
     runSyncRequirement(requirement: import('./lanProtocol').SyncRequirement, options?: { readOnly?: boolean }): Promise<boolean>;
     runSyncNote(note: import('./lanProtocol').SyncNote): Promise<boolean>;
+    /**
+     * 把对端的一条内容显示进「团队任务」对话（只显示，不跑模型）。
+     *
+     * 用户 2026-11-26：「macOS 的消息，团队窗口 Windows 显示已读，但团队任务对话框
+     * 实际没有 macOS 的新消息进去。」根因是群发言与队友消息走了两条路，只有后者进对话。
+     */
+    appendPeerLine(line: import('./lanProtocol').PeerLine): Promise<void>;
     /** 群窗口里发一句话（需求或回答），由面板决定走哪条路径。 */
-    sendGroupMessage(text: string, assignee?: { id: string; name: string }): Promise<void>;
+    sendGroupMessage(
+      text: string,
+      assignee?: { id: string; name: string },
+      attachmentIds?: readonly string[],
+    ): Promise<void>;
+    /** 群窗口里的附件：按普通对话框的规则解析并暂存（图片 → 视觉内容）。 */
+    stageGroupAttachment(file: { name: string; mimeType: string; dataBase64: string }): Promise<{
+      ok: boolean;
+      id?: string;
+      name?: string;
+      kind?: string;
+      reason?: string;
+    }>;
     /** 另一台在群里的问句：本机也答一句（群里两个 agent 各报各的）。 */
     answerRemoteGroupChat(body: string): Promise<void>;
     /** 中继上收到甲方需求：开跑但不再广播；跑没跑起来都要回执。 */
@@ -64,6 +83,15 @@ export interface LanSetupOptions {
       steps: number;
       running: boolean;
     }>;
+    /**
+     * 语音输入：开一个只给本机浏览器用的一次性页面，识别结果回填到对应面板。
+     *
+     * webview 没有麦克风权限（用户 2026-11-25：「语音输入失败: not-allowed」），
+     * 所以语音识别必须放到真实浏览器里做。
+     */
+    startVoiceInput(target?: 'chat' | 'group'): Promise<void>;
+    /** 群窗口怎么收语音文字（panel 之间不互相持有，靠这一条接线）。 */
+    registerGroupVoiceSink(sink: (text: string, live: boolean) => void, focus?: () => void, state?: (active: boolean) => void, setup?: (phase: 'installing' | 'ready' | 'failed') => void): void;
   };
   version: string;
 }
@@ -215,8 +243,17 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         ? folders.find((item) => basename(item.uri.fsPath) === collabProjectName)
         : undefined;
       // 没手动选就报「当前正在编辑的项目」，两台才不会默认各指向列表第一个。
-      const name = picked ? basename(picked.uri.fsPath) : activeFolder()?.name;
-      const repoNow = picked ? repoOfFolder(picked.uri.fsPath) : repoOfFolder(activeFolder()?.path ?? '');
+      const name = picked ? basename(picked.uri.fsPath) : collabProjectName || activeFolder()?.name;
+      /*
+       * 选中的协作项目不在本窗口里时，**宁可不说仓库，也不能报成当前活动文件夹的仓库**。
+       *
+       * 用户实况（2026-11-25）：明明两台做的都是同一个项目，对端却判定「项目不一致」，
+       * 于是那一轮降成只读 —— agent 只能汇报「没有写文件那一项」。
+       * 报错仓库比不报仓库更糟：对端会拿着一个错的项目 ID 去做硬比较。
+       */
+      const repoNow = picked
+        ? repoOfFolder(picked.uri.fsPath)
+        : collabProjectName ? '' : repoOfFolder(activeFolder()?.path ?? '');
       return localPeer({
         deviceName,
         version: options.version,
@@ -273,6 +310,16 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      * 自己的工作过程；群的事在群窗口里看（一行一条、可展开），全过程另有
      * `docs/TEAM-CHAT.md`。
      */
+    async onPeerLine(line) {
+      /*
+       * 对端的每一条发言都进「团队任务」对话（只显示、不开跑）。
+       *
+       * 与 `onGroupMessage` 分开：那个是「刷新群窗口 + 弹提示」，这个是「进对话存档」。
+       * 失败绝不能影响同步本身 —— 群记录已经写好了，界面上至少还有团队群窗口可看。
+       */
+      await chat.appendPeerLine(line).catch(() => undefined);
+      await groupPanel?.refresh().catch(() => undefined);
+    },
     async onGroupMessage(message) {
       await groupPanel?.refresh().catch(() => undefined);
       if (message.author === 'agent' && message.phase === 'question') {
@@ -282,6 +329,22 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
             if (choice) await vscode.commands.executeCommand('hwchat.lanSync.openGroup');
           });
       }
+    },
+    /**
+     * 有人读到了群消息：把「已读」画到对应气泡下面。
+     *
+     * 回执不是发言，**不追加气泡、不写群记录**，只刷新面板。
+     */
+    async onGroupRead() {
+      await groupPanel?.refresh().catch(() => undefined);
+    },
+    /** 对端发来的附件收齐了：把「正在接收」换成真图。 */
+    async onAssetReady() {
+      await groupPanel?.refresh().catch(() => undefined);
+    },
+    /** 有设备的 agent 状态变了：重画指示灯。 */
+    async onAgentState() {
+      await groupPanel?.refresh().catch(() => undefined);
     },
     /** 刚输入、还没判定完的那句话：先画出来，不等模型。 */
     onGroupPending: () => {
@@ -356,11 +419,15 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
      */
     onSuperseded: (info) => {
       output.info(`[sync] 有更新的消息（来自 ${info.from}），停止正在执行的需求 ${info.stopped}`);
-      try {
-        chat.stop?.();
-      } catch (error) {
+      /*
+       * 停的是**团队任务那一轮**，不是「用户此刻正在看的对话」。
+       *
+       * `chat.stop()` 只作用于当前视图里的 run —— 用户翻着别的对话时，
+       * 群里那一轮根本没停，于是「新消息顶掉旧任务」实际上没发生。
+       */
+      void chat.stopTeamTask?.().catch((error: unknown) => {
         output.warn(`[sync] 停止旧需求失败：${error instanceof Error ? error.message : String(error)}`);
-      }
+      });
       void groupPanel?.refresh().catch(() => undefined);
       refreshStatus();
     },
@@ -402,6 +469,8 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
     },
     /** 手机上能否批准工具授权（用户可在「手机遥控」窗口里一键关掉）。 */
     canApproveFromPhone: () => setting('mobile.allowApproval', false),
+    /** 自主迭代模式：谈定就开工，不等甲方确认（设置里可关）。 */
+    autonomousMode: () => setting('team.autonomous', false),
     /**
      * 本机产生的每条消息 → 加密后送去中继。
      *
@@ -586,9 +655,17 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
   }
 
   const groupPanel = new GroupPanel(context.extensionUri, service, {
-    send: (text, assignee) => chat.sendGroupMessage(text, assignee),
+    send: (text, assignee, attachmentIds) => chat.sendGroupMessage(text, assignee, attachmentIds),
+    /**
+     * 群窗口的附件走普通对话框那一套（图片 → 视觉，文本 → 正文）。
+     *
+     * 不在群窗口里自己写临时文件：那样模型只拿到一行路径，图片根本读不到。
+     */
+    attach: (file) => chat.stageGroupAttachment(file),
     log: (line) => output.info(line),
     control: () => groupStopAll(),
+    // 语音：群窗口的 webview 没有麦克风权限，交给主面板用「系统浏览器 + 一次性本机页面」。
+    voice: () => chat.startVoiceInput('group'),
     relay: () => {
       const state = relay?.status();
       return state
@@ -596,6 +673,13 @@ export async function setupLanSync(options: LanSetupOptions): Promise<LanSetupRe
         : undefined;
     },
   });
+  // 群窗口的语音结果回传给群输入框（两个面板互不持有，靠这一条接线）。
+  chat.registerGroupVoiceSink(
+    (text, live) => { void groupPanel.insertVoiceText(text, live); },
+    () => { void groupPanel.focusComposer(); },
+    (active) => { void groupPanel.setVoiceActive(active); },
+    (phase) => { void groupPanel.setVoiceSetup(phase); },
+  );
   /*
    * 「手机遥控」窗口：电脑上显示二维码 + 6 位码。
    *

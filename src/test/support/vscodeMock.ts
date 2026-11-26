@@ -30,6 +30,17 @@ export class Uri {
     return new Uri(nodePath.join(uri.fsPath, ...pathSegments));
   }
 
+  /**
+   * `Uri.with({ path })` 的替身。
+   *
+   * 真实 `vscode.Uri` 一定会带上它；界面 HTML 生成时会用它改写路径
+   * （`asWebviewUri` 前后处理），替身缺了就会在测试里抛 `uri.with is not a function`，
+   * 看起来像产品缺陷，其实只是替身不全。
+   */
+  with(change: { path?: string; scheme?: string }): Uri {
+    return new Uri(change.path ?? this.fsPath);
+  }
+
   get path(): string {
     return this.fsPath;
   }
@@ -424,11 +435,16 @@ export const workspace = {
   findFiles,
   createFileSystemWatcher,
   asRelativePath,
-  async openTextDocument(uri: Uri) {
-    return {
-      uri,
-      getText: async () => fsp.readFile(uri.fsPath, 'utf8'),
-    };
+  /** 编辑器文档变化的替身事件：语音听写靠它把文字实时交出来。 */
+  onDidChangeTextDocument: (undefined as unknown as (listener: (event: { document: MockTextDocument }) => unknown) => { dispose(): void }),
+  async openTextDocument(uriOrOptions: Uri | { language?: string; content?: string }) {
+    if (uriOrOptions instanceof Uri) {
+      return {
+        uri: uriOrOptions,
+        getText: async () => fsp.readFile(uriOrOptions.fsPath, 'utf8'),
+      };
+    }
+    return createUntitledDocument(uriOrOptions.content ?? '');
   },
   getConfiguration(section: string, scope?: Uri | MockWorkspaceFolder) {
     // VS Code 只有拿到 resource 才会应用 workspaceFolderValue；替身如实照做，
@@ -464,7 +480,78 @@ export const workspace = {
 };
 
 export const window = {
-  async showTextDocument() {
+  /** 打开文档时把标签登记进 tabGroups —— 听写结束时正是按标签关掉那个临时页的。 */
+  async showTextDocument(document: { uri: Uri }) {
+    const tab = { input: new TabInputText(document.uri) };
+    if (!window.tabGroups.all.length) window.tabGroups.all.push({ tabs: [] });
+    window.tabGroups.all[0]!.tabs.push(tab);
+    return document;
+  },
+  /** 标签组的替身：听写结束时要关掉那个临时编辑器。 */
+  tabGroups: {
+    all: [] as Array<{ tabs: Array<{ input: unknown }> }>,
+    async close(tab: unknown) {
+      const index = window.tabGroups.all.findIndex((group) => group.tabs.some((item) => item === tab));
+      if (index >= 0) {
+        const group = window.tabGroups.all[index]!;
+        group.tabs = group.tabs.filter((item) => item !== tab);
+      }
+      closedTabs.push(tab);
+    },
+  },
+};
+
+/** 被关掉的标签（断言「临时编辑器确实关掉了」）。 */
+export const closedTabs: unknown[] = [];
+
+/** `vscode.TabInputText` 的替身（`instanceof` 判断要用）。 */
+export class TabInputText {
+  constructor(readonly uri: Uri) {}
+}
+
+/** `vscode.ViewColumn.Beside` 等常量。 */
+export const ViewColumn = { Active: -1, Beside: -2, One: 1, Two: 2 } as const;
+
+/** 无标题文档的替身：内容是可变字符串，听写「往里写字」用 `appendText` 模拟。 */
+export interface MockTextDocument {
+  uri: Uri;
+  getText(): string;
+  /** 测试用：模拟听写引擎往里写文字，并触发 onDidChangeTextDocument。 */
+  setText(value: string): void;
+}
+
+const untitledDocuments: MockTextDocument[] = [];
+const documentChangeEmitter = new EventEmitter<{ document: MockTextDocument }>();
+
+// 事件在模块加载时就挂上，`vscode.workspace.onDidChangeTextDocument` 才能被调用方订阅。
+(workspace as unknown as { onDidChangeTextDocument: unknown }).onDidChangeTextDocument = documentChangeEmitter.event;
+
+function createUntitledDocument(initial: string): MockTextDocument {
+  let content = initial;
+  const document: MockTextDocument = {
+    // 每次开一个新的 uri，避免两段听写互相串。
+    uri: Uri.file(`untitled:/hwchat-dictation-${untitledDocuments.length}`),
+    getText: () => content,
+    setText: (value: string) => {
+      content = value;
+      documentChangeEmitter.fire({ document });
+    },
+  };
+  untitledDocuments.push(document);
+  return document;
+}
+
+/** 取出最近创建的无标题文档（测试里模拟「听写出字了」）。 */
+export function lastUntitledDocument(): MockTextDocument | undefined {
+  return untitledDocuments[untitledDocuments.length - 1];
+}
+
+/** 已执行过的命令（断言「真的调了 VS Code 的听写 / 安装命令」）。 */
+export const executedCommands: Array<{ id: string; args: unknown[] }> = [];
+
+export const commands = {
+  async executeCommand(id: string, ...args: unknown[]): Promise<unknown> {
+    executedCommands.push({ id, args });
     return undefined;
   },
 };
@@ -512,9 +599,16 @@ export const extensions = {
   },
 };
 
-let installedExtension: { id: string } | undefined;
+let installedExtension: MockInstalledExtension | undefined;
 
-export function setInstalledExtension(extension: { id: string } | undefined): void {
+/** 装没装扩展的替身：`isActive` / `activate()` 都要有，否则「等它真的可用」测不出来。 */
+export interface MockInstalledExtension {
+  id: string;
+  isActive?: boolean;
+  activate?: () => Promise<unknown>;
+}
+
+export function setInstalledExtension(extension: MockInstalledExtension | undefined): void {
   installedExtension = extension;
 }
 

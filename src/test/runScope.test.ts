@@ -86,7 +86,10 @@ test('运行收尾只删自己那一轮的登记', () => {
     /^[ \t]*this\.runs\.delete\(conversationId\);[ \t]*$/m,
     '无条件 delete(conversationId) 会把同一对话新起的那一轮删掉',
   );
-  assert.match(PANEL, /if \(this\.runs\.get\(conversationId\) === run\) this\.runs\.delete\(conversationId\);/);
+  // 守卫写在变量里，删除与「状态灯收尾」都只能用这个判断。
+  assert.match(PANEL, /const finishingOwnRun = this\.runs\.get\(conversationId\) === run;/);
+  assert.match(PANEL, /if \(finishingOwnRun\) this\.runs\.delete\(conversationId\);/);
+  assert.match(PANEL, /if \(finishingOwnRun\) \{\s*this\.agentLastError = runOutcome === 'failed';/, '状态灯也只能在自己那一轮收尾时更新');
 });
 
 test('审批与方案卡片按 runId 结算，不再按对话整片结算', () => {

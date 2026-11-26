@@ -12,6 +12,7 @@
  *  2. 原生 `run_command` 没有「常驻」概念，静态服务器只能跑满超时。
  */
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -58,6 +59,31 @@ function canConnect(port: number, timeoutMs = 3000): Promise<boolean> {
   });
 }
 
+/**
+ * 起静态服务器的命令。
+ *
+ * 两个坑：
+ *  1. 原来用的是 `python3 -m http.server` —— Windows 上通常没有 python3，
+ *     测试实际在验「这台机器装没装 python」，后台模式本身反而没被验过。
+ *  2. 一行 `node -e "…"` 里**不能出现 `>`**：命令是经 cmd 跑的，`=>` 会被当成重定向，
+ *     整段脚本被截断（实测会卡住）。所以脚本先落成临时文件，再 `node "<file>" <port>`。
+ */
+function staticServerCommand(port: number): string {
+  /*
+   * 脚本必须落在**工作区内**：`run_command` 有路径隔离，写到 `tmpdir()`（工作区外）
+   * 会被直接拦下，测试就变成了「验路径隔离」。`out/` 是构建产物目录，不进仓库。
+   */
+  const script = join(__dirname, 'hwchat-bg-server.cjs');
+  writeFileSync(script, [
+    "const http = require('node:http');",
+    'const port = Number(process.argv[2]);',
+    "http.createServer(function (request, response) { response.end('ok'); }).listen(port, '127.0.0.1', function () {",
+    "  console.log('Serving on 127.0.0.1:' + port);",
+    '});',
+  ].join('\n'), 'utf8');
+  return `node "${script}" ${port}`;
+}
+
 test('后台模式：起真实静态服务器、立刻返回、端口真的可连、停止后释放', async () => {
   setWorkspaceRoots([process.cwd()]);
   const executor = makeExecutor();
@@ -65,7 +91,7 @@ test('后台模式：起真实静态服务器、立刻返回、端口真的可�
   try {
     const startedAt = Date.now();
     const result = await executor.execute(
-      commandCall(`python3 -m http.server ${port} --bind 127.0.0.1`, { background: true }) as never,
+      commandCall(staticServerCommand(port), { background: true }) as never,
       'agent', settings, async () => true, 'conv-bg',
     );
     const elapsed = Date.now() - startedAt;
@@ -98,7 +124,7 @@ test('后台模式：命令起不来时把输出带回来，而不是谎报「�
     await new Promise<void>((resolve) => blocker.listen(18793, '127.0.0.1', () => resolve()));
     try {
       const result = await executor.execute(
-        commandCall('python3 -m http.server 18793 --bind 127.0.0.1', { background: true }) as never,
+        commandCall(staticServerCommand(18793), { background: true }) as never,
         'agent', settings, async () => true, 'conv-bg-fail',
       );
       assert.equal(result.status, 'error', '起不来就必须报错');

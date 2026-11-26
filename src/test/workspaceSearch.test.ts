@@ -117,7 +117,8 @@ test('the minimal exclude profile still sees build output (bare filename lookup)
   // 正文里的裸文件名 `extension.js` 真实位置就是 `out/extension.js`：
   // 这类查询必须能看见构建目录，否则文件引用只能降级成普通文本。
   const result = await searchWorkspace({ include: '**/extension.js', limit: 50, exclude: 'minimal' });
-  assert.ok(result.outcome.files.some((uri) => uri.fsPath.endsWith('out/extension.js')));
+  // `uri.fsPath` 在 Windows 上是 `C:\…\out\extension.js`，所以按两种分隔符都认。
+  assert.ok(result.outcome.files.some((uri) => /[\\/]out[\\/]extension\.js$/.test(uri.fsPath)));
 
   invalidateWorkspaceSearch();
   const defaultProfile = await searchWorkspace({ include: '**/extension.js', limit: 50 });

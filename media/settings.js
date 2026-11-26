@@ -51,6 +51,9 @@
     skillCount: document.getElementById('skillCount'),
     skillSummaryList: document.getElementById('skillSummaryList'),
     lanSyncConnectButton: document.getElementById('lanSyncConnectButton'),
+    relayCreateButton: document.getElementById('relayCreateButton'),
+    relayJoinButton: document.getElementById('relayJoinButton'),
+    relayStatusButton: document.getElementById('relayStatusButton'),
     lanSyncJoinButton: document.getElementById('lanSyncJoinButton'),
     lanSyncGroupButton: document.getElementById('lanSyncGroupButton'),
     mobileButton: document.getElementById('mobileButton'),
@@ -486,6 +489,9 @@
   elements.exportAllButton.addEventListener('click', () => post('exportAll'));
   elements.lanSyncConnectButton.addEventListener('click', (event) => postBusy('lanSyncConnect', event.currentTarget));
   elements.lanSyncJoinButton?.addEventListener('click', (event) => postBusy('lanSyncJoin', event.currentTarget));
+  elements.relayCreateButton?.addEventListener('click', (event) => postBusy('relayCreate', event.currentTarget));
+  elements.relayJoinButton?.addEventListener('click', (event) => postBusy('relayJoin', event.currentTarget));
+  elements.relayStatusButton?.addEventListener('click', () => post('relayStatus'));
   elements.lanSyncGroupButton.addEventListener('click', () => post('lanSyncGroup'));
   elements.mobileButton.addEventListener('click', () => post('mobileOpen'));
   elements.lanSyncLedgerButton.addEventListener('click', () => post('lanSyncLedger'));

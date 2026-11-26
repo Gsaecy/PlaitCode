@@ -2,9 +2,21 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { badgeBinding, chooseProjectRoot, externalToolPathViolation, foreignPathStyle, involvedProjectRoots, normalizeWorkspaceGlob, PROJECT_BADGE_LIMIT, projectNameOf, resolveWorkspacePath, rootsFromChangedFiles } from '../agent/workspacePaths';
 
+import { join } from 'node:path';
+
+/**
+ * 夹具路径按**本机**风格生成。
+ *
+ * 这些函数用的是本机路径语义（`resolve` / `isAbsolute` / `sep`），所以夹具写死
+ * `/Users/test/...` 时，在 Windows 上会被解析成 `D:\Users\test\...`，断言全对不上 ——
+ * 失败的是夹具，不是产品。`at()` 在两个平台上都产出「该平台的绝对路径」，
+ * 于是同一套用例在哪台机器上验的都是同一条规则。
+ */
+const at = (...parts: string[]): string => join(process.platform === 'win32' ? 'C:\\' : '/', ...parts);
+
 const roots = [
-  { name: 'Safevault_android', fsPath: '/Users/test/AI projects/Safevault_android' },
-  { name: 'MaiKer_Win', fsPath: '/Users/test/AI projects/MaiKer_Win' },
+  { name: 'Safevault_android', fsPath: at('Users', 'test', 'AI projects', 'Safevault_android') },
+  { name: 'MaiKer_Win', fsPath: at('Users', 'test', 'AI projects', 'MaiKer_Win') },
 ];
 
 /** 只把列出的路径视为存在，模拟真实文件系统探测。 */
@@ -14,20 +26,20 @@ function probe(existing: readonly string[]) {
 }
 
 test('resolves absolute files inside any VS Code workspace root', () => {
-  const resolved = resolveWorkspacePath('/Users/test/AI projects/MaiKer_Win/docs/TECHNICAL.md', roots);
+  const resolved = resolveWorkspacePath(at('Users', 'test', 'AI projects', 'MaiKer_Win', 'docs', 'TECHNICAL.md'), roots);
   assert.equal(resolved.root.name, 'MaiKer_Win');
-  assert.equal(resolved.fsPath, '/Users/test/AI projects/MaiKer_Win/docs/TECHNICAL.md');
+  assert.equal(resolved.fsPath, at('Users', 'test', 'AI projects', 'MaiKer_Win', 'docs', 'TECHNICAL.md'));
 });
 
 test('resolves paths prefixed by a multi-root workspace folder name', () => {
   const resolved = resolveWorkspacePath('MaiKer_Win/docs/TECHNICAL.md', roots);
   assert.equal(resolved.root.name, 'MaiKer_Win');
-  assert.equal(resolved.fsPath, '/Users/test/AI projects/MaiKer_Win/docs/TECHNICAL.md');
+  assert.equal(resolved.fsPath, at('Users', 'test', 'AI projects', 'MaiKer_Win', 'docs', 'TECHNICAL.md'));
 });
 
 test('rejects paths outside all workspace roots', () => {
   assert.throws(
-    () => resolveWorkspacePath('/Users/test/Documents/private.txt', roots),
+    () => resolveWorkspacePath(at('Users', 'test', 'Documents', 'private.txt'), roots),
     /当前 VS Code 工作区内/,
   );
 });
@@ -35,15 +47,15 @@ test('rejects paths outside all workspace roots', () => {
 test('resolves a relative path that only exists in a later workspace root', () => {
   // 旧实现只把相对路径解析到第一个根目录，导致读取第二个根里的文件时抛出 ENOENT。
   const resolved = resolveWorkspacePath('src/agent/commandPaths.ts', roots, {
-    exists: probe(['/Users/test/AI projects/MaiKer_Win/src/agent/commandPaths.ts']),
+    exists: probe([at('Users', 'test', 'AI projects', 'MaiKer_Win', 'src', 'agent', 'commandPaths.ts')]),
   });
   assert.equal(resolved.root.name, 'MaiKer_Win');
-  assert.equal(resolved.fsPath, '/Users/test/AI projects/MaiKer_Win/src/agent/commandPaths.ts');
+  assert.equal(resolved.fsPath, at('Users', 'test', 'AI projects', 'MaiKer_Win', 'src', 'agent', 'commandPaths.ts'));
 });
 
 test('prefers the first root when the relative path exists only there', () => {
   const resolved = resolveWorkspacePath('src/index.ts', roots, {
-    exists: probe(['/Users/test/AI projects/Safevault_android/src/index.ts']),
+    exists: probe([at('Users', 'test', 'AI projects', 'Safevault_android', 'src', 'index.ts')]),
   });
   assert.equal(resolved.root.name, 'Safevault_android');
 });
@@ -53,8 +65,8 @@ test('rejects a relative path that exists in several roots and asks for a prefix
     () =>
       resolveWorkspacePath('src/index.ts', roots, {
         exists: probe([
-          '/Users/test/AI projects/Safevault_android/src/index.ts',
-          '/Users/test/AI projects/MaiKer_Win/src/index.ts',
+          at('Users', 'test', 'AI projects', 'Safevault_android', 'src', 'index.ts'),
+          at('Users', 'test', 'AI projects', 'MaiKer_Win', 'src', 'index.ts'),
         ]),
       }),
     /同时存在.*Safevault_android、MaiKer_Win.*根目录名/,
@@ -64,7 +76,7 @@ test('rejects a relative path that exists in several roots and asks for a prefix
 test('falls back to the first root when the path exists nowhere, so new files can be created', () => {
   const resolved = resolveWorkspacePath('src/new-file.ts', roots, { exists: probe([]) });
   assert.equal(resolved.root.name, 'Safevault_android');
-  assert.equal(resolved.fsPath, '/Users/test/AI projects/Safevault_android/src/new-file.ts');
+  assert.equal(resolved.fsPath, at('Users', 'test', 'AI projects', 'Safevault_android', 'src', 'new-file.ts'));
 });
 
 test('does not treat the bare workspace root as ambiguous', () => {
@@ -72,7 +84,7 @@ test('does not treat the bare workspace root as ambiguous', () => {
     exists: probe(roots.map((root) => root.fsPath)),
   });
   assert.equal(resolved.root.name, 'Safevault_android');
-  assert.equal(resolved.fsPath, '/Users/test/AI projects/Safevault_android');
+  assert.equal(resolved.fsPath, at('Users', 'test', 'AI projects', 'Safevault_android'));
 });
 
 test('keeps legacy first-root behavior when no existence probe is supplied', () => {
@@ -82,7 +94,7 @@ test('keeps legacy first-root behavior when no existence probe is supplied', () 
 
 test('an explicit root prefix still wins over existence probing', () => {
   const resolved = resolveWorkspacePath('MaiKer_Win/src/index.ts', roots, {
-    exists: probe(['/Users/test/AI projects/Safevault_android/src/index.ts']),
+    exists: probe([at('Users', 'test', 'AI projects', 'Safevault_android', 'src', 'index.ts')]),
   });
   assert.equal(resolved.root.name, 'MaiKer_Win');
 });
@@ -93,7 +105,7 @@ test('preferredRoot: `.` resolves to the conversation project, not the first roo
   // 真实缺陷：不传 cwd 时 `'.'` 落到第一个根，于是「提交一下」提交掉了另一个项目。
   const resolved = resolveWorkspacePath('.', roots, { preferredRoot: roots[1]! });
   assert.equal(resolved.root.name, 'MaiKer_Win');
-  assert.equal(resolved.fsPath, '/Users/test/AI projects/MaiKer_Win');
+  assert.equal(resolved.fsPath, at('Users', 'test', 'AI projects', 'MaiKer_Win'));
 });
 
 test('preferredRoot: a new file is created inside the conversation project', () => {
@@ -102,14 +114,14 @@ test('preferredRoot: a new file is created inside the conversation project', () 
     preferredRoot: roots[1]!,
   });
   assert.equal(resolved.root.name, 'MaiKer_Win');
-  assert.equal(resolved.fsPath, '/Users/test/AI projects/MaiKer_Win/src/new-file.ts');
+  assert.equal(resolved.fsPath, at('Users', 'test', 'AI projects', 'MaiKer_Win', 'src', 'new-file.ts'));
 });
 
 test('preferredRoot: a relative path existing in several roots resolves to the project', () => {
   const resolved = resolveWorkspacePath('src/index.ts', roots, {
     exists: probe([
-      '/Users/test/AI projects/Safevault_android/src/index.ts',
-      '/Users/test/AI projects/MaiKer_Win/src/index.ts',
+      at('Users', 'test', 'AI projects', 'Safevault_android', 'src', 'index.ts'),
+      at('Users', 'test', 'AI projects', 'MaiKer_Win', 'src', 'index.ts'),
     ]),
     preferredRoot: roots[1]!,
   });
@@ -117,7 +129,7 @@ test('preferredRoot: a relative path existing in several roots resolves to the p
 });
 
 test('preferredRoot: a root that is no longer in the workspace is ignored', () => {
-  const stale = { name: 'Removed', fsPath: '/Users/test/AI projects/Removed' };
+  const stale = { name: 'Removed', fsPath: at('Users', 'test', 'AI projects', 'Removed') };
   const resolved = resolveWorkspacePath('.', roots, { preferredRoot: stale });
   // 旧绑定不能让解析整体失败，退回第一个根；git 侧另有闸门会拒绝跨项目写操作。
   assert.equal(resolved.root.name, 'Safevault_android');
@@ -184,7 +196,7 @@ test('external tools: absolute path outside every root is rejected', () => {
 
 test('external tools: absolute path inside a root is allowed', () => {
   assert.equal(
-    externalToolPathViolation({ path: '/Users/test/AI projects/MaiKer_Win/src/index.ts' }, roots),
+    externalToolPathViolation({ path: at('Users', 'test', 'AI projects', 'MaiKer_Win', 'src', 'index.ts') }, roots),
     undefined,
   );
 });
@@ -228,7 +240,7 @@ test('project root: the stored binding wins while that folder is still in the wo
 test('project root: an archived binding whose folder was removed is ignored', () => {
   // 工作区根被移除后，存档里还留着旧路径。必须当作没绑定，否则徽标会显示一个不存在的项目。
   assert.equal(
-    chooseProjectRoot({ roots: roots.map((root) => root.fsPath), stored: '/Users/test/AI projects/Gone' }),
+    chooseProjectRoot({ roots: roots.map((root) => root.fsPath), stored: at('Users', 'test', 'AI projects', 'Gone') }),
     undefined,
   );
 });
@@ -244,7 +256,7 @@ test('project root: the active editor decides when nothing is bound yet', () => 
 });
 
 test('project root: a single root needs no hint', () => {
-  assert.equal(chooseProjectRoot({ roots: ['/Users/test/only'] }), '/Users/test/only');
+  assert.equal(chooseProjectRoot({ roots: [at('Users', 'test', 'only')] }), at('Users', 'test', 'only'));
 });
 
 /*
@@ -255,7 +267,7 @@ test('project root: a single root needs no hint', () => {
  * 路径解析与 git 归属用的，却被当成了「这条对话已归属该项目」。
  */
 test('徽标：单根工作区的新对话仍然是「项目待建立」（Windows 现场）', () => {
-  const single = ['/Users/test/AI projects/Personal Workstation OS'];
+  const single = [at('Users', 'test', 'AI projects', 'Personal Workstation OS')];
   // 路径解析照样能定出根（git/相对路径需要它）……
   assert.equal(chooseProjectRoot({ roots: [...single] }), single[0]);
   // ……但徽标不能把猜出来的目录名画成既成事实。
@@ -265,22 +277,22 @@ test('徽标：单根工作区的新对话仍然是「项目待建立」（Windo
 });
 
 test('徽标：显式绑定过的对话显示那个项目', () => {
-  const single = ['/Users/test/AI projects/Personal Workstation OS'];
+  const single = [at('Users', 'test', 'AI projects', 'Personal Workstation OS')];
   const badge = badgeBinding({ roots: single, stored: single[0] });
   assert.equal(badge.bound, true);
   assert.equal(badge.primary, single[0]);
 });
 
 test('徽标：动过文件之后才绑定（哪怕没有存 projectRoot）', () => {
-  const roots = ['/Users/test/AI projects/A', '/Users/test/AI projects/B'];
+  const roots = [at('Users', 'test', 'AI projects', 'A'), at('Users', 'test', 'AI projects', 'B')];
   const badge = badgeBinding({ roots, touched: [roots[1]!] });
   assert.equal(badge.bound, true);
   assert.equal(badge.primary, roots[1]);
 });
 
 test('徽标：存档里的 projectRoot 已不在工作区时不算绑定', () => {
-  const single = ['/Users/test/AI projects/A'];
-  const badge = badgeBinding({ roots: single, stored: '/Users/test/AI projects/Gone' });
+  const single = [at('Users', 'test', 'AI projects', 'A')];
+  const badge = badgeBinding({ roots: single, stored: at('Users', 'test', 'AI projects', 'Gone') });
   assert.equal(badge.bound, false);
 });
 
@@ -304,9 +316,9 @@ test('project badge name: uses the folder name, and the filesystem root has none
 /* ── 涉及多个项目 ─────────────────────────────────────────────── */
 
 const many = [
-  { name: 'HWChat', fsPath: '/Users/test/AI projects/HWChat' },
-  { name: 'Local_skill_quick_access', fsPath: '/Users/test/AI projects/Local_skill_quick_access' },
-  { name: 'MaiKer_Win', fsPath: '/Users/test/AI projects/MaiKer_Win' },
+  { name: 'HWChat', fsPath: at('Users', 'test', 'AI projects', 'HWChat') },
+  { name: 'Local_skill_quick_access', fsPath: at('Users', 'test', 'AI projects', 'Local_skill_quick_access') },
+  { name: 'MaiKer_Win', fsPath: at('Users', 'test', 'AI projects', 'MaiKer_Win') },
 ];
 
 test('involved projects: primary first, then the order they were touched', () => {
@@ -337,8 +349,8 @@ test('involved projects: roots that are no longer in the workspace are dropped',
   assert.deepEqual(
     involvedProjectRoots({
       roots: many.map((root) => root.fsPath),
-      primary: '/Users/test/AI projects/Deleted',
-      touched: ['/Users/test/AI projects/Deleted', many[2]!.fsPath],
+      primary: at('Users', 'test', 'AI projects', 'Deleted'),
+      touched: [at('Users', 'test', 'AI projects', 'Deleted'), many[2]!.fsPath],
     }),
     [many[2]!.fsPath],
   );
@@ -349,7 +361,7 @@ test('involved projects: an unbound conversation with no history shows nothing',
 });
 
 test('involved projects: the badge list is capped, primary still first', () => {
-  const paths = Array.from({ length: PROJECT_BADGE_LIMIT + 3 }, (_value, index) => `/Users/test/AI projects/P${index}`);
+  const paths = Array.from({ length: PROJECT_BADGE_LIMIT + 3 }, (_value, index) => at('Users', 'test', 'AI projects', `P${index}`));
   const list = involvedProjectRoots({
     roots: paths,
     primary: paths[0],
@@ -385,7 +397,7 @@ test('involved projects: a file name equal to a project name is not a project', 
   // 名字相近的项目不能被当成同一个。
   assert.deepEqual(rootsFromChangedFiles({ roots: many, files: ['HWChat-older/src/a.ts'] }), []);
   // 绝对路径不参与推断。
-  assert.deepEqual(rootsFromChangedFiles({ roots: many, files: ['/Users/test/AI projects/MaiKer_Win/src/a.ts'] }), []);
+  assert.deepEqual(rootsFromChangedFiles({ roots: many, files: [at('Users', 'test', 'AI projects', 'MaiKer_Win', 'src', 'a.ts')] }), []);
 });
 
 
@@ -419,8 +431,10 @@ test('resolveWorkspacePath 拒绝外平台绝对路径，并列出本机可用�
 });
 
 test('平台检查不影响正常相对路径与工作区内绝对路径', () => {
-  assert.equal(resolveWorkspacePath('docs/TECHNICAL.md', roots, { platform: 'darwin' }).root.name, 'Safevault_android');
-  assert.equal(resolveWorkspacePath(roots[1]!.fsPath + '/README.md', roots, { platform: 'darwin' }).root.name, 'MaiKer_Win');
+  // 声明了哪个平台，夹具就必须是那个平台的路径（`at()` 给的是本机风格）。
+  const platform = process.platform;
+  assert.equal(resolveWorkspacePath('docs/TECHNICAL.md', roots, { platform }).root.name, 'Safevault_android');
+  assert.equal(resolveWorkspacePath(roots[1]!.fsPath + '/README.md', roots, { platform }).root.name, 'MaiKer_Win');
 });
 
 /* ── 路径身份：大小写不该让同一个目录变成两个 ───────────────────── */
@@ -440,8 +454,8 @@ import { gitScopeVerdict, pathKey, samePath } from '../agent/workspacePaths';
  * 大小写敏感的平台（Linux）必须仍然当成两个。
  */
 test('路径身份：大小写不敏感时必须认成同一个目录', () => {
-  assert.equal(samePath('/work/AI Projects/MaiKer_Win', '/work/ai projects/maiker_win', true), true);
-  assert.equal(pathKey('/work/AI Projects/MaiKer_Win/', true), pathKey('/WORK/AI PROJECTS/MAIKER_WIN', true));
+  assert.equal(samePath(at('work', 'AI Projects', 'MaiKer_Win'), at('work', 'ai projects', 'maiker_win'), true), true);
+  assert.equal(pathKey(at('work', 'AI Projects', 'MaiKer_Win'), true), pathKey(at('WORK', 'AI PROJECTS', 'MAIKER_WIN'), true));
 });
 
 test('路径身份：大小写敏感的平台（Linux）不许折叠', () => {
@@ -450,15 +464,15 @@ test('路径身份：大小写敏感的平台（Linux）不许折叠', () => {
 });
 
 test('路径身份：尾部斜杠不影响判断', () => {
-  assert.equal(samePath('/work/a/', '/work/a', true), true);
-  assert.equal(samePath('/work/a///', '/work/a', true), true);
+  assert.equal(samePath(at('work', 'a'), at('work', 'a'), true), true);
+  assert.equal(samePath(at('work', 'a'), at('work', 'a'), true), true);
 });
 
 test('git 判定：仓库根与项目根只是盘符大小写不同 → 允许（就是这次的 bug）', () => {
   const verdict = gitScopeVerdict({
-    roots: ['/work/ai projects/maiker_windows'],
-    repo: '/work/AI Projects/maiker_windows',
-    project: '/work/AI Projects/maiker_windows',
+    roots: [at('work', 'ai projects', 'maiker_windows')],
+    repo: at('work', 'AI Projects', 'maiker_windows'),
+    project: at('work', 'AI Projects', 'maiker_windows'),
     caseInsensitive: true,
   });
   assert.equal(verdict.kind, 'ok');
@@ -466,34 +480,34 @@ test('git 判定：仓库根与项目根只是盘符大小写不同 → 允许�
 
 test('git 判定：工作区根与仓库根大小写不同，项目根也对 → 仍然允许', () => {
   const verdict = gitScopeVerdict({
-    roots: ['/work/ai projects/maiker_windows'],
-    repo: '/work/AI Projects/maiker_windows',
-    project: '/work/ai projects/maiker_windows',
+    roots: [at('work', 'ai projects', 'maiker_windows')],
+    repo: at('work', 'AI Projects', 'maiker_windows'),
+    project: at('work', 'ai projects', 'maiker_windows'),
     caseInsensitive: true,
   });
   assert.equal(verdict.kind, 'ok', '仓库根自己绝不能被当成「外来项目」');
 });
 
 test('git 判定：仓库根就是项目根 → 允许', () => {
-  assert.equal(gitScopeVerdict({ roots: ['/work/repo'], repo: '/work/repo', project: '/work/repo' }).kind, 'ok');
+  assert.equal(gitScopeVerdict({ roots: [at('work', 'repo')], repo: at('work', 'repo'), project: at('work', 'repo') }).kind, 'ok');
 });
 
 test('git 判定：项目根在仓库根之内且仓库根是工作区根 → 允许', () => {
-  const verdict = gitScopeVerdict({ roots: ['/work/repo'], repo: '/work/repo', project: '/work/repo/sub' });
+  const verdict = gitScopeVerdict({ roots: [at('work', 'repo')], repo: at('work', 'repo'), project: at('work', 'repo', 'sub') });
   assert.equal(verdict.kind, 'ok');
 });
 
 test('git 判定：仓库根罩住了**真的**另一个工作区项目 → 仍然要拦', () => {
   const verdict = gitScopeVerdict({
-    roots: ['/work/repo', '/work/repo/other-project'],
-    repo: '/work/repo',
-    project: '/work/repo',
+    roots: [at('work', 'repo'), at('work', 'repo', 'other-project')],
+    repo: at('work', 'repo'),
+    project: at('work', 'repo'),
   });
   assert.equal(verdict.kind, 'foreign');
-  assert.equal(verdict.kind === 'foreign' ? verdict.foreignRoot : '', '/work/repo/other-project');
+  assert.equal(verdict.kind === 'foreign' ? verdict.foreignRoot : '', at('work', 'repo', 'other-project'));
 });
 
 test('git 判定：仓库在项目之外（仓库存放不当）→ 报不匹配', () => {
-  const verdict = gitScopeVerdict({ roots: ['/work/a', '/work/b'], repo: '/work/c', project: '/work/a' });
+  const verdict = gitScopeVerdict({ roots: [at('work', 'a'), at('work', 'b')], repo: at('work', 'c'), project: at('work', 'a') });
   assert.equal(verdict.kind, 'mismatch');
 });

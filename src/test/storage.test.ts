@@ -20,6 +20,72 @@ async function withStorage(
   }
 }
 
+test('协议提示词只发给模型：气泡与列表标题用 displayContent，历史仍留全文', async () => {
+  /*
+   * 用户 2026-11-25：agent 收到的团队协议提示词（身份 / 分工 / 报数 / 收尾要求…）
+   * 在气泡里占一整屏 —— 「除了需求原文外，其他的内容根本不需要显示出来，只要保证它生效」。
+   * 所以 `content` 必须是完整提示词（历史、上下文、请求都用它），
+   * 而界面读的 `displayContent` 只有甲方原话。
+   */
+  await withStorage(async (storage, root) => {
+    const conversation = await storage.createConversation();
+    const prompt = [
+      '甲方在团队群里提出了一个需求（需求号 r1）。',
+      '【任务项目】DeepSeek 项目',
+      '需求原文：',
+      '你们讨论一下，哪些内容需要同步？',
+      '',
+      '谁在说话（先认清这三方，再动手）',
+      '……一大段潜规则……',
+    ].join('\n');
+    const plain = '你们讨论一下，哪些内容需要同步？';
+    const message = await storage.appendMessage(conversation.id, {
+      role: 'user',
+      content: prompt,
+      displayContent: plain,
+      status: 'complete',
+    });
+
+    const reloaded = new ConversationStorage(root);
+    await reloaded.initialize();
+    const [stored] = await reloaded.getAllMessages(conversation.id);
+    assert.equal(stored?.content, prompt, '完整提示词必须留在历史里（否则模型就丢了规则）');
+    assert.equal(stored?.displayContent, plain, '界面只该拿到原文');
+
+    const [summary] = await reloaded.listConversations();
+    assert.ok(plain.startsWith(summary?.title ?? ''), `标题要用原文：${summary?.title}`);
+    assert.doesNotMatch(summary?.title ?? '', /需求号/, `标题不该是协议提示词：${summary?.title}`);
+    assert.doesNotMatch(summary?.preview ?? '', /潜规则/, '列表预览也不该露出协议提示词');
+    assert.equal(message.displayContent, plain);
+  });
+});
+
+test('编辑一条带 displayContent 的消息：气泡跟着新正文走，不再显示旧原话', async () => {
+  /*
+   * 用户改了自己的话，界面必须显示改完的正文。`displayContent`（原文）如果留着，
+   * 气泡仍是改之前那句，而 agent 读到的却是新内容 —— 两边对不上，用户会以为没保存。
+   */
+  await withStorage(async (storage, root) => {
+    const conversation = await storage.createConversation();
+    const message = await storage.appendMessage(conversation.id, {
+      role: 'user',
+      content: '甲方在团队群里提出了一个需求（需求号 r1）。\n需求原文：\n旧的一句话',
+      displayContent: '旧的一句话',
+      status: 'complete',
+    });
+    const updated = await storage.updateMessage(conversation.id, message.id, { content: '改过的一句话' });
+    assert.equal(updated.displayContent, undefined, '改正文后旧原话必须让位');
+    assert.equal(updated.content, '改过的一句话');
+
+    const reloaded = new ConversationStorage(root);
+    await reloaded.initialize();
+    const [stored] = await reloaded.getAllMessages(conversation.id);
+    assert.equal(stored?.displayContent, undefined);
+    const [summary] = await reloaded.listConversations();
+    assert.match(summary?.preview ?? '', /改过的一句话/, '列表预览也要跟着改');
+  });
+});
+
 test('recovers conversations and message metadata when the manifest is corrupt', async () => {
   await withStorage(async (storage, root) => {
     const conversation = await storage.createConversation();

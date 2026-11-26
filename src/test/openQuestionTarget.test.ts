@@ -73,19 +73,46 @@ test('追问带上「是哪台在问」和可点选项', async () => {
   }
 });
 
+test('甲方再开口之后，旧追问不再算「在等回答」', async () => {
+  /*
+   * 用户实况：「我没 @ 谁，直接发的消息却显示 @windows」——旧追问一直挂着「在等」，
+   * 于是之后每一句话都被它劫走，只发给提问的那台。
+   */
+  const { service, dir } = await makeService();
+  try {
+    const requirement = await service.shareRequirement('加个导出', '');
+    await service.postGroup({ author: 'agent', phase: 'question', body: STALLED, requirementId: requirement.requirement!.id });
+    assert.ok(service.openQuestionTarget(), '刚问完是在等回答');
+
+    await service.postGroup({ author: 'user', phase: 'requirement', body: '这次 Windows 能看到同步信息了' });
+    assert.equal(service.openQuestionTarget(), undefined, '甲方说过话之后就不该再劫持下一句');
+  } finally {
+    service.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('回答只发给提问的那一台，另一台不重复执行', () => {
   const panel = readFileSync('src/views/chatPanel.ts', 'utf8');
-  assert.match(panel, /const open = this\.lanSync\.openQuestionTarget\(\)/, '要用「谁问的」当回答目标');
-  assert.match(panel, /assignee: open\.askerId/, '回答消息要带指派');
-  assert.match(panel, /open\.askerId !== this\.lanSync\.localPeer\(\)\.id[\s\S]{0,400}return;/, '本机不是问话方时不再自己开跑');
+  assert.match(panel, /const openTarget = this\.lanSync\.openQuestionTarget\(\)/, '要用「谁问的」当回答目标');
+  assert.match(panel, /const answerTo = route\.kind === 'answer' \? openTarget : undefined;/, '按分流结论决定是不是回答');
+  assert.match(panel, /to: answerTo\.askerId/, '回答只发给提问的那一台（用 to 定向）');
+  assert.doesNotMatch(panel, /assignee: answerTo\.askerId/, '不能在气泡上挂「@某台」——用户没点名');
+  assert.match(panel, /answerTo\.askerId !== this\.lanSync\.localPeer\(\)\.id[\s\S]{0,400}return;/, '本机不是问话方时不再自己开跑');
+  // 「算不算回答」的判定在纯函数里（`groupRouting.test.ts` 执行验证）。
+  assert.match(panel, /routeGroupMessage\(\{/, '分流函数要参与决定');
+  const routing = readFileSync('src/sync/groupRouting.ts', 'utf8');
+  assert.match(routing, /isAnswerToOpenQuestion\(/, '要有「这句话到底算不算回答」的判断');
   const sync = readFileSync('src/sync/lanSync.ts', 'utf8');
   assert.match(sync, /甲方回答的是 \$\{target\} 的追问，这台只参考不执行/, '接收端也要认这个指派');
 });
 
 test('提醒条有「哪台在问」、选项和关闭按钮', () => {
   const panel = readFileSync('src/views/groupPanel.ts', 'utf8');
+/** 群窗口界面脚本（真文件）；宿主侧仍在 groupPanel.ts。 */
+const GROUP_SCRIPT = readFileSync('media/group.js', 'utf8');
   assert.match(panel, /id="bannerClose"/, '要有关闭按钮');
-  assert.match(panel, /的乙方在等你回答/, '要写清是哪台在问');
+  assert.match(GROUP_SCRIPT, /的乙方在等你回答/, '要写清是哪台在问');
   assert.match(panel, /id="bannerOpts"/, '要有可点选项');
-  assert.match(panel, /dismissedQuestion/, '关掉后不再一直占地方');
+  assert.match(GROUP_SCRIPT, /dismissedQuestion/, '关掉后不再一直占地方');
 });

@@ -9,6 +9,8 @@ import {
   type SyncPeer,
 } from '../sync/lanProtocol';
 import { narrowToolNames, SYNC_READ_ONLY_PLAYBOOK } from '../agent/toolPlaybooks';
+import { isAnswerToOpenQuestion } from '../sync/groupIntent';
+import { shouldReportToGroup } from '../sync/groupRouting';
 
 /**
  * 用户 2026-11-25 报的四个问题：
@@ -20,6 +22,17 @@ import { narrowToolNames, SYNC_READ_ONLY_PLAYBOOK } from '../agent/toolPlaybooks
  */
 
 const PANEL = readFileSync('src/views/chatPanel.ts', 'utf8');
+
+test('指派给一台不在群里的设备，必须当场说「它收不到」（不许看起来像已发出）', () => {
+  /*
+   * 用户实况：@macmini 发出去，macmini 那边没看到。消息只留在本机、没有回执，
+   * 但界面像「发成功了」。判断依据必须是**当前名单**（groupState().peers），
+   * 不是某个写死的设备名。
+   */
+  assert.match(PANEL, /const roster = this\.lanSync\.groupState\(\)\.peers;/);
+  assert.match(PANEL, /const online = roster\.some\(\(peer\) => peer\.id === assignee\);/);
+  assert.match(PANEL, /现在不在群里（可能离线，或两台版本不一致）：这条它收不到/);
+});
 
 const win: SyncPeer = { id: 'p-win', name: 'MAGICBOOKV14', platform: 'win32', project: 'app', version: 't', repo: 'github.com/acme/app' };
 const mac: SyncPeer = { id: 'p-mac', name: 'guohongyu', platform: 'darwin', project: 'app', version: 't', repo: 'github.com/acme/app' };
@@ -51,7 +64,10 @@ test('2. 只读执行（项目不一致）时 team_sync 仍必须可用', () => 
 test('2. 「群里的活」在起跑时定下来，回执不靠会丢的需求号', () => {
   assert.match(PANEL, /groupRun\?: boolean/, 'run 上要有群活标记');
   assert.match(PANEL, /options\?\.origin === 'group' \|\| options\?\.origin === 'sync'/, '按来源判定');
-  assert.match(PANEL, /const isGroupRun = run\.groupRun === true/, '回执判据用标记');
+  assert.match(PANEL, /groupRun: run\.groupRun,/, '回执判据用标记');
+  assert.match(PANEL, /if \(!shouldReportToGroup\(\{/, '回执判据走纯函数（泄漏硬闸）');
+  // 判据本身是执行验证（`groupRouting.test.ts` 里三种来源逐条跑过）。
+  assert.equal(shouldReportToGroup({ groupRun: true, conversationId: 'team-1' }), true);
 });
 
 test('4. 简单问题有可数的篇幅上限（不许一律长篇）', () => {
@@ -81,6 +97,28 @@ test('5. 群消息行标出「说给谁」', () => {
 
   const broadcast = makeGroupMessage(win, { author: 'user', phase: 'requirement', body: '加个开关' }, 12, 'c')!;
   assert.doesNotMatch(renderGroupLine(broadcast, [win, mac], mac.id), /说给/, '广播不加标注');
+});
+
+test('5. 只有明确 @ 提问那台、或一句话就是短回答，才算「回答追问」', () => {
+  /*
+   * 用户实况（2026-11-25）：「我没 @ 谁，直接发的消息却显示 @windows，导致 macOS 没收到」。
+   * 以前只要有追问在等，下一句无论多长都被当成回答，只发给提问的那台。
+   */
+  const options = ['接着做', '换个做法', '让另一台先做'];
+  assert.equal(
+    isAnswerToOpenQuestion({ text: '让 macOS 也看一下这个改动', target: 'p-mac', askerId: 'p-win', options }),
+    false,
+    '点名另一台 → 新需求',
+  );
+  assert.equal(isAnswerToOpenQuestion({ text: '接着做', askerId: 'p-win', options }), true, '选项原文 → 回答');
+  assert.equal(isAnswerToOpenQuestion({ text: '接着做。', askerId: 'p-win', options }), true, '带标点也算');
+  assert.equal(isAnswerToOpenQuestion({ text: '好', askerId: 'p-win', options }), true, '短确认 → 回答');
+  assert.equal(isAnswerToOpenQuestion({ text: '这条给 macOS 也发一份', askerId: 'p-win', options }), false, '长指令 → 新需求');
+  assert.equal(isAnswerToOpenQuestion({ text: '点名的就是提问者', target: 'p-win', askerId: 'p-win', options }), true);
+  // 判定已挪进纯函数（`groupRouting.test.ts` 执行验证），面板必须真的用它。
+  const ROUTING = readFileSync('src/sync/groupRouting.ts', 'utf8');
+  assert.ok(ROUTING.indexOf('isAnswerToOpenQuestion({') > 0, '分流函数要用这个判断');
+  assert.ok(PANEL.indexOf('const route = routeGroupMessage({') > 0, '群分支要调用分流函数');
 });
 
 test('5. 回答的收件人过网（另一台据此只参考不执行）', () => {

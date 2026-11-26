@@ -379,6 +379,7 @@ export class ConversationStorage {
       consumedByAssistantId: input.consumedByAssistantId,
       replyToMessageId: input.replyToMessageId,
       executionStatus: normalizeExecutionStatus(input.executionStatus),
+      displayContent: input.displayContent,
     };
     await this.enqueueWrite(async () => {
       await writeJsonAtomic(this.messagePath(conversationId, message.id), message);
@@ -387,9 +388,9 @@ export class ConversationStorage {
       summary.messageCount += 1;
       summary.totalTokens = Math.max(0, (summary.totalTokens ?? 0) + (message.usage?.totalTokens ?? 0));
       summary.updatedAt = now;
-      summary.preview = previewText(message.content);
+      summary.preview = previewText(message.displayContent ?? message.content);
       if (message.role === 'user' && !summary.titleCustomized && summary.title === tt('storage.defaultTitle')) {
-        summary.title = shortTitle(message.content);
+        summary.title = shortTitle(message.displayContent ?? message.content);
       }
       if (message.role === 'assistant' && message.toolExecutions?.length) {
         summary.preview = previewText(message.toolExecutions.at(-1)?.summary ?? message.content);
@@ -405,7 +406,7 @@ export class ConversationStorage {
   async updateMessage(
     conversationId: string,
     messageId: string,
-    patch: Partial<Pick<ChatMessage, 'content' | 'reasoning' | 'usage' | 'status' | 'model' | 'toolExecutions' | 'toolCalls' | 'usedSkills' | 'attachments' | 'consumedByAssistantId' | 'replyToMessageId' | 'executionStatus'>>,
+    patch: Partial<Pick<ChatMessage, 'content' | 'displayContent' | 'reasoning' | 'usage' | 'status' | 'model' | 'toolExecutions' | 'toolCalls' | 'usedSkills' | 'attachments' | 'consumedByAssistantId' | 'replyToMessageId' | 'executionStatus'>>,
   ): Promise<ChatMessage> {
     await this.initialize();
     const summary = this.requireSummary(conversationId);
@@ -421,6 +422,13 @@ export class ConversationStorage {
         ...(patch.executionStatus === undefined ? {} : { executionStatus: normalizeExecutionStatus(patch.executionStatus) }),
         updatedAt: Date.now(),
       };
+      /*
+       * 正文被改写（界面里的「编辑」）时，旧的 `displayContent` 必须让位 ——
+       * 否则气泡还显示改之前那句话，而 agent 读到的已经是新内容，两边对不上。
+       */
+      if (patch.content !== undefined && patch.displayContent === undefined) {
+        delete updated.displayContent;
+      }
       summary.totalTokens = Math.max(
         0,
         (summary.totalTokens ?? 0) - (current.usage?.totalTokens ?? 0) + (updated.usage?.totalTokens ?? 0),
@@ -441,7 +449,7 @@ export class ConversationStorage {
        * 顶掉了真正的最后一条回复。预览必须跟着「最后一条有正文的消息」走。
        */
       if (patch.content !== undefined && updated.content) {
-        summary.preview = previewText(updated.content);
+        summary.preview = previewText(updated.displayContent ?? updated.content);
       }
       if (updated.model) {
         summary.model = updated.model;
@@ -1978,11 +1986,11 @@ export class ConversationStorage {
       const createdAt = firstMessage?.createdAt ?? Date.now();
       conversations.push({
         id,
-        title: shortTitle(firstUser?.content ?? tt('storage.defaultTitle')),
+        title: shortTitle(firstUser?.displayContent ?? firstUser?.content ?? tt('storage.defaultTitle')),
         createdAt,
         updatedAt: lastMessage?.updatedAt ?? createdAt,
         messageCount: files.length,
-        preview: previewText(lastMessage?.content ?? ''),
+        preview: previewText(lastMessage?.displayContent ?? lastMessage?.content ?? ''),
         pinned: false,
         totalTokens,
         model: lastMessage?.model,
@@ -2123,11 +2131,11 @@ export class ConversationStorage {
         const createdAt = firstMessage?.createdAt ?? Date.now();
         summary = {
           id,
-          title: shortTitle(firstUser?.content ?? tt('storage.defaultTitle')),
+          title: shortTitle(firstUser?.displayContent ?? firstUser?.content ?? tt('storage.defaultTitle')),
           createdAt,
           updatedAt: lastMessage?.updatedAt ?? createdAt,
           messageCount: files.length,
-          preview: previewText(lastMessage?.content ?? ''),
+          preview: previewText(lastMessage?.displayContent ?? lastMessage?.content ?? ''),
           pinned: false,
           totalTokens: diskTokenTotal,
           model: lastMessage?.model,
@@ -2145,7 +2153,9 @@ export class ConversationStorage {
       } else {
         const nextCount = files.length;
         const nextUpdatedAt = Math.max(summary.updatedAt, lastMessage?.updatedAt ?? 0);
-        const nextPreview = lastMessage?.content ? previewText(lastMessage.content) : summary.preview;
+        const nextPreview = (lastMessage?.displayContent ?? lastMessage?.content)
+          ? previewText(lastMessage?.displayContent ?? lastMessage?.content ?? '')
+          : summary.preview;
         if (
           summary.messageCount !== nextCount
           || summary.updatedAt !== nextUpdatedAt

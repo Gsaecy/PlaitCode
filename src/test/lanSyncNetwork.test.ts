@@ -187,6 +187,62 @@ test('话里说「让 macos 做」时，Windows 不执行（不再两台都跑�
   assert.equal(resolveAssigneeFromText('让 mac 传给 Windows', devices), undefined);
 });
 
+test('端到端：@ 了哪台，那台就真的收到并开跑，另一台不跑', async () => {
+  /*
+   * 用户 2026-11-25：「@谁，谁能看到消息，这么简单的功能你都不会做吗」——
+   * @ 的效果必须端到端验一遍：被点名的设备收到需求并开跑，没被点名的只记录。
+   */
+  const HUB_PORT = 48_401;
+  const PEER_PORT = 48_402;
+  const hubRan: SyncRequirement[] = [];
+  const peerRan: SyncRequirement[] = [];
+  const peerGroup: string[] = [];
+
+  const hub = await makeService(winPeer, { onRequirement: async (item) => { hubRan.push(item); return true; } });
+  const peer = await makeService(macPeer, {
+    onRequirement: async (item) => { peerRan.push(item); return true; },
+    onGroupMessage: async (message) => { peerGroup.push(String(message.body)); },
+  });
+
+  try {
+    await hub.service.setPairingCode('AT-CODE');
+    await peer.service.setPairingCode('AT-CODE');
+    assert.equal((await hub.service.startHub(HUB_PORT)).ok, true);
+    assert.equal((await peer.service.joinHub(`http://127.0.0.1:${HUB_PORT}`, PEER_PORT)).ok, true);
+
+    // Windows 这台 @ 了 macOS：需求带 assignee=mac，群消息也带同样的指派。
+    const shared = await hub.service.shareRequirement('只有 macOS 做这条', macPeer.id);
+    assert.equal(shared.ok, true, shared.message);
+    await hub.service.postGroup({
+      author: 'user',
+      phase: 'requirement',
+      body: '只有 macOS 做这条',
+      assignee: macPeer.id,
+      requirementId: shared.requirement!.id,
+    });
+
+    let waited = 0;
+    while (waited < 2_000 && !peerRan.length) { await new Promise((r) => setTimeout(r, 50)); waited += 50; }
+    assert.equal(peerRan.length, 1, 'macOS 必须收到并开跑');
+    assert.equal(peerRan[0]!.assignee, macPeer.id);
+    assert.ok(peerGroup.includes('只有 macOS 做这条'), '群窗口也要看到这条消息');
+    assert.equal(hubRan.length, 0, 'Windows 这台被 @ 的不是自己 → 不执行');
+
+    // 反过来：@ Windows 时只有 Windows 跑。
+    const back = await peer.service.shareRequirement('这条给 Windows', winPeer.id);
+    assert.equal(back.ok, true, back.message);
+    waited = 0;
+    while (waited < 2_000 && !hubRan.length) { await new Promise((r) => setTimeout(r, 50)); waited += 50; }
+    assert.equal(hubRan.length, 1, 'Windows 必须收到并开跑');
+    assert.equal(peerRan.length, 1, 'macOS 不再多跑一轮');
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
 test('指派信息必须过网络保留，否则对端照样会跑', async () => {
   const { makeRequirement, parseSyncMessage } = await import('../sync/lanProtocol.js');
   const peer = { id: 'p-win', name: 'PC', platform: 'win32' as const, project: 'app', version: 't' };
@@ -218,6 +274,146 @@ test('刚发的话立刻上屏：判定期间有临时那条，正式消息进�
     // 空内容不该造出一条假的「发送中」。
     service.beginPendingGroup('   ');
     assert.equal(service.groupState().pending, undefined);
+  } finally {
+    service.dispose();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('端到端：另一台收到甲方发言会回执，发送方看得到「已读」，而且群里不会多出气泡', async () => {
+  const HUB_PORT = 48_381;
+  const PEER_PORT = 48_382;
+  const hub = await makeService(winPeer);
+  const peer = await makeService(macPeer);
+  try {
+    await hub.service.setPairingCode('RCPT-CODE');
+    await peer.service.setPairingCode('RCPT-CODE');
+    assert.equal((await hub.service.startHub(HUB_PORT)).ok, true);
+    assert.equal((await peer.service.joinHub(`http://127.0.0.1:${HUB_PORT}`, PEER_PORT)).ok, true);
+
+    // 甲方在 Windows 上发一句 @所有人（闲聊通道）：另一台必须回执。
+    const posted = await hub.service.postGroup({ author: 'user', phase: 'analysis', body: '大家都看一下' });
+    const id = posted.group!.id;
+
+    let reads = hub.service.readsOf(id);
+    // 本机会立刻记自己已读，所以判据是「**两台都到了**」，不是「有人到了」。
+    for (let wait = 0; wait < 40 && reads.length < 2; wait += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      reads = hub.service.readsOf(id);
+    }
+    assert.deepEqual(
+      [...reads].sort(),
+      [winPeer.id, macPeer.id].sort(),
+      '两台都必须在已读名单里：本机自己也收到这条（2026-11-25 用户实况：只显示另一台）',
+    );
+
+    // 回执不是发言：群里只有甲方那一条。
+    assert.equal(
+      hub.service.recentGroup(10).filter((item) => item.author === 'agent').length,
+      0,
+      '回执不能变成 agent 的气泡',
+    );
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
+test('端到端：群里的图片 / 文件真的传到另一台并落盘（分片传输）', async () => {
+  /*
+   * 用户实况：「我发在群聊天的图片，没法传递到各自 agent 的设备上，所以会显示看不到」。
+   * 这里用一份**多分片**的载荷验证：分片能重组、字节一致、对端拿得到本机路径。
+   */
+  const HUB_PORT = 48_411;
+  const PEER_PORT = 48_412;
+  const hub = await makeService(winPeer);
+  const peer = await makeService(macPeer);
+  try {
+    await hub.service.setPairingCode('ASSET-CODE');
+    await peer.service.setPairingCode('ASSET-CODE');
+    assert.equal((await hub.service.startHub(HUB_PORT)).ok, true);
+    assert.equal((await peer.service.joinHub(`http://127.0.0.1:${HUB_PORT}`, PEER_PORT)).ok, true);
+
+    // ≈ 90 KB 原文 → base64 约 120 KB → 3 个分片（单片上限 52 000 字符）。
+    const original = Buffer.from('hwchat-asset-'.repeat(7_000), 'utf8');
+    const ref = await hub.service.shareAsset({
+      name: '大文件.txt',
+      mimeType: 'text/plain',
+      kind: 'file',
+      dataBase64: original.toString('base64'),
+    });
+    assert.ok(ref, '本机也要有一份');
+
+    let path = '';
+    for (let wait = 0; wait < 100 && !path; wait += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      path = peer.service.assetPath(ref!.id);
+    }
+    assert.ok(path, 'macOS 这台必须收到并落盘');
+    const received = await readFile(path);
+    assert.equal(received.byteLength, original.byteLength, '字节数要一致');
+    assert.equal(received.toString('utf8'), original.toString('utf8'), '内容要逐字一致');
+
+    // 发消息的那台自己也有一份（本机 agent 要能读）。
+    assert.ok(hub.service.assetPath(ref!.id), '发送方本机也要能拿到路径');
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
+test('端到端：agent 状态会广播给另一台（团队群的指示灯）', async () => {
+  const HUB_PORT = 48_391;
+  const PEER_PORT = 48_392;
+  const hub = await makeService(winPeer);
+  const peer = await makeService(macPeer);
+  try {
+    await hub.service.setPairingCode('STATE-CODE');
+    await peer.service.setPairingCode('STATE-CODE');
+    assert.equal((await hub.service.startHub(HUB_PORT)).ok, true);
+    assert.equal((await peer.service.joinHub(`http://127.0.0.1:${HUB_PORT}`, PEER_PORT)).ok, true);
+
+    hub.service.reportAgentState('running');
+    let seen = peer.service.agentStates()[winPeer.id];
+    for (let wait = 0; wait < 40 && seen !== 'running'; wait += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      seen = peer.service.agentStates()[winPeer.id];
+    }
+    assert.equal(seen, 'running', '对端要显示「运行中」');
+
+    hub.service.reportAgentState('waiting');
+    for (let wait = 0; wait < 40 && peer.service.agentStates()[winPeer.id] !== 'waiting'; wait += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(peer.service.agentStates()[winPeer.id], 'waiting', '卡在等确认要转黄闪');
+
+    // 状态只是显示，不该进群记录、也不该触发执行。
+    assert.equal(peer.service.recentGroup(10).length, 0, '状态消息不能变成群发言');
+  } finally {
+    hub.service.dispose();
+    peer.service.dispose();
+    await rm(hub.dir, { recursive: true, force: true });
+    await rm(peer.dir, { recursive: true, force: true });
+  }
+});
+
+test('报数这类群口令不挂在最近一条需求上，任务看板不被拉回待解析', async () => {
+  const { service, dir } = await makeService(winPeer);
+  try {
+    const shared = await service.shareRequirement('加一个开关');
+    const requirementId = shared.requirement!.id;
+    await service.postGroup({ author: 'user', phase: 'analysis', body: '报数', detached: true });
+    await service.postGroup({ author: 'agent', phase: 'analysis', body: '1', detached: true });
+    const rollCall = service.recentGroup(2);
+    assert.equal(rollCall.length, 2);
+    for (const item of rollCall) {
+      assert.notEqual(item.requirementId, requirementId, '报数不能挂在需求上');
+      assert.ok(item.requirementId, '但仍要有自己的消息号');
+    }
   } finally {
     service.dispose();
     await rm(dir, { recursive: true, force: true });
@@ -381,7 +577,7 @@ test('端到端：配对码不一致时加入失败，需求不会外泄', async
   }
 });
 
-test('协作消息：主机发一条，对端 agent 收到；纯陈述不触发自动开跑', async () => {
+test('协作消息：主机发一条，对端 agent 一定收到（可见性只由 @ 决定）', async () => {
   const hub = await makeService(winPeer);
   const notes: SyncNote[] = [];
   const statements: SyncNote[] = [];
@@ -402,16 +598,23 @@ test('协作消息：主机发一条，对端 agent 收到；纯陈述不触发�
     assert.equal((await hub.service.startHub(HUB_PORT + 20)).ok, true);
     assert.equal((await peer.joinHub(`http://127.0.0.1:${HUB_PORT + 20}`, PEER_PORT + 20)).ok, true);
 
-    // 纯陈述：记录但不自动跑。
+    /*
+     * 2026-11-26 改判：**陈述也要交给对端 agent**。
+     *
+     * 用户原话：「让 agent 的消息也像用户消息一样，能被相互看见，唯一约束看不看得见的是
+     * @某个 agent 的行为」。以前陈述只落库不叫醒，于是「队友回了结论，我这台毫无反应」。
+     * 要不要动手由 agent 按提示词判断，防接龙靠 `MAX_DIALOGUE_NOTES` 轮次上限。
+     */
     await hub.service.shareNote({ body: '我把标题栏改成自绘了', topic: '窗口' });
     await new Promise((resolve) => setTimeout(resolve, 300));
-    assert.equal(notes.length, 0, '纯陈述不该让对端开跑（防接龙）');
-    assert.equal(peer.recentNotes(5).length, 1, '但必须记录下来，status 能看到');
+    assert.equal(notes.length, 1, '陈述也要交给对端 agent（可见性只由 @ 决定）');
+    assert.match(notes[0]!.body, /标题栏/);
+    assert.equal(peer.recentNotes(5).length, 1, '并且照样记录下来，status 能看到');
 
-    // 提问：触发对端自动跑一轮来回答。
+    // 第二条（提问）同样会被交付。
     await hub.service.shareNote({ body: '你那边的窗口边距是多少？', topic: '窗口' });
-    await waitFor(() => notes.length > 0, 3_000);
-    assert.match(notes[0]!.body, /窗口边距/);
+    await waitFor(() => notes.length > 1, 3_000);
+    assert.match(notes.map((note) => note.body).join('\n'), /窗口边距/);
     statements.push(...peer.recentNotes(5));
     assert.equal(statements.length, 2, '两条都要在本地留存');
   } finally {
