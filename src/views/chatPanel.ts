@@ -1859,6 +1859,13 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
      * 都不是 → 走原来的「新需求 / 回答追问」判断。
      */
     const decision = this.lanSync?.applyPlanDecision(text);
+    /*
+     * 甲方在群里说话了 = 「停止执行」结束。
+     *
+     * 停止时我们关掉了队友消息的交付闸门（否则排队消息会立刻重启一轮），
+     * 现在甲方重新发话，说明还要继续协作，闸门必须打开 —— 否则对面说什么这台都不再听。
+     */
+    this.lanSync?.resumeNoteDelivery();
     if (decision) {
       this.log(`[sync] 甲方对方案的态度：${decision.phase === 'implement' ? '确认' : '要求修改'}（${decision.requirementId}）`);
       const requirement = this.lanSync?.requirementById(decision.requirementId);
@@ -2848,9 +2855,19 @@ export class ChatPanel implements vscode.WebviewViewProvider, vscode.Disposable 
    * 用户正好翻着另一条对话时就什么也停不掉 —— 界面上按了没反应。
    */
   async stopTeamTask(): Promise<{ ok: boolean; message: string }> {
+    /*
+     * 先关掉「队友消息交付」闸门，再停当前这一轮。
+     *
+     * 顺序不能反：abort 之后那一轮会在 finally 里 `flushPendingNotes()`，
+     * 排队的队友消息会被立刻交给 agent → 再开一轮。用户看到的就是
+     * 「点了停止，agent 还在动」（2026-11-26 实测报障）。
+     */
+    const dropped = this.lanSync?.holdNoteDelivery('团队群停止执行') ?? 0;
     const teamId = this.groupConversationId ?? await this.findTeamConversation().catch(() => undefined);
     const run = this.runFor(teamId);
-    if (!run) return { ok: false, message: '这台没有正在执行的团队任务' };
+    if (!run) {
+      return { ok: false, message: dropped ? `没有正在执行的团队任务（已清掉 ${dropped} 条排队消息）` : '这台没有正在执行的团队任务' };
+    }
     const killed = this.toolExecutor.killRunProcesses(run.controller.signal);
     run.controller.abort();
     if (killed) this.log(`[stop] 已立即终止 ${killed} 个子进程`);

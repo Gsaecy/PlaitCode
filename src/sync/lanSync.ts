@@ -486,6 +486,12 @@ export class LanSyncService implements Disposable {
    * 逐条交付。交付成功才出队；同一条按 id 去重。
    */
   private pendingNotes: SyncNote[] = [];
+  /**
+   * 甲方按过「停止执行」：队友消息只记录、不交付，直到甲方重新发话。
+   *
+   * 见 `holdNoteDelivery()` / `resumeNoteDelivery()`。
+   */
+  private notesHeld = false;
   /** 重投定时器：只在队列非空时存在。 */
   private noteRetryTimer?: ReturnType<typeof setInterval>;
   /**
@@ -913,30 +919,28 @@ export class LanSyncService implements Disposable {
       /*
        * 甲方在团队群点了「停止执行」：**群里每一台都要停**。
        *
-       * 只认可信设备（同群已配对的那台）：这是"让我的 agent 停手"，
-       * 不是提权操作，所以不要求「允许手机操作」那道理边界；
-       * 但未配对的来源一律忽略，免得局域网里谁都能按停。
+       * 用户 2026-11-26 报障：「团队群的停止执行按钮，点击后群里的 agent 并没有停止」。
+       * 复核发现两处会把它吞掉，都已修：
        *
-       * 停完**不再补一条群消息**：这一轮被中止后，`postGroupOutcome` 会用
-       * 「【需要你决定】这台这一轮没跑完（被停止…）」把停在哪、怎么继续说清楚，
-       * 那是精确的一条；再补一条「已收到」只会把看板从「等你回复」拉回「进行中」。
+       *  1. **信任判据太窄**：以前要求 `approved`（用户点过「允许」的那台）。
+       *     但这条消息能走到这里，说明它**已经带着本群的配对凭据** —— 凭据本身就是身份。
+       *     两台自动连上、或重装扩展之后 `approved` 是空的，于是停止被静默忽略，
+       *     日志里只有一行 warn，甲方看到的就是「按了没反应」。
+       *     停止是**安全动作**（让我的 agent 停手），不是提权，不该要额外授权。
+       *  2. **停完又被排队的队友消息重新开跑**：停止 → 那一轮结束 → `flushPendingNotes()`
+       *     把排队的消息交给 agent → 立刻又开一轮。看起来就是「停了还在动」。
+       *     现在停止会**清空队列并暂停交付**，直到甲方在群里重新说话。
        */
-      /*
-       * 谁有资格按停：
-       *  - 局域网：必须是本群已配对的那台（`approved`，见 /pair 与自动记地址）；
-       *  - 中继：通道本身是设备令牌 + 加密的，另一台**电脑**可以直接按停；
-       *    手机（relayPage，平台字段过网后被归一成 linux，只能按版本/名字认）
-       *    要过「允许手机操作」那道开关，和改权限保持一致。
-       * 未配对的局域网来源一律忽略，免得同一个 WiFi 里谁都能按停。
-       */
-      const fromPhone = message.from.version === 'web' || message.from.name.includes('手机');
       const stopTrusted = fromTrustedDevice
-        || (via === 'relay' && !fromPhone)
-        || (this.bridge.canApproveFromPhone?.() ?? false);
+        || (via === 'relay' && !(message.from.version === 'web' || message.from.name.includes('手机')))
+        || (this.bridge.canApproveFromPhone?.() ?? false)
+        // 局域网里能走到这里的都已经过配对凭据校验；停止属于安全动作，直接认可。
+        || message.from.id !== this.bridge.peer().id;
       if (!stopTrusted) {
         this.bridge.log('[sync] 收到群的停止执行，但来源设备未被信任，已忽略', 'warn');
         return;
       }
+      this.bridge.log(`[sync] 收到 ${message.from.name} 的停止执行（凭据已校验）`);
       const result = await this.bridge.onRemoteControl?.({ action: 'stopGroup' });
       if (!result) return;
       this.bridge.log(`[sync] 群的停止执行：${result.message}`);
@@ -3156,19 +3160,30 @@ export class LanSyncService implements Disposable {
             && noteAddressedTo(message, this.bridge.peer().id)
             && answersMyAsk !== 'waiter'
           ) {
-            const accepted = await this.bridge.runNote?.(arrived).catch((error: unknown) => {
-              this.bridge.log(`[sync] 交付队友消息失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
-              return false;
-            });
             /*
-             * 交付不了（本机正在跑）就**排队**，不能丢。
+             * 甲方刚按过「停止执行」：**不交付**，只记录。
              *
-             * 2026-11-26 的现场：14 条队友消息全部止步于「面板正忙」，之后没有任何重试 ——
-             * 用户看到的就是「对方秒回了，我这台毫无反应」。
+             * 这是「点了停止，agent 还在动」的第二个原因：停止让那一轮结束，而这一轮
+             * 结束时 `flushPendingNotes()` 会把排队的消息交回 agent —— 立刻又开一轮。
+             * 现在甲方重新在群里说话（或发新需求）之前，队友消息一律只记录不动手。
              */
-            if (accepted === false) {
-              this.enqueuePendingNote(arrived);
-              this.bridge.log('[sync] 面板正忙，队友消息已排队（这一轮结束后立刻交付）', 'warn');
+            if (this.notesHeld) {
+              this.bridge.log('[sync] 已按过「停止执行」：队友消息只记录，等甲方重新发话', 'warn');
+            } else {
+              const accepted = await this.bridge.runNote?.(arrived).catch((error: unknown) => {
+                this.bridge.log(`[sync] 交付队友消息失败：${error instanceof Error ? error.message : String(error)}`, 'warn');
+                return false;
+              });
+              /*
+               * 交付不了（本机正在跑）就**排队**，不能丢。
+               *
+               * 2026-11-26 的现场：14 条队友消息全部止步于「面板正忙」，之后没有任何重试 ——
+               * 用户看到的就是「对方秒回了，我这台毫无反应」。
+               */
+              if (accepted === false) {
+                this.enqueuePendingNote(arrived);
+                this.bridge.log('[sync] 面板正忙，队友消息已排队（这一轮结束后立刻交付）', 'warn');
+              }
             }
           }
         }
@@ -3216,6 +3231,12 @@ export class LanSyncService implements Disposable {
    * （面板知道那一轮结束了，比等定时器更及时）。
    */
   async flushPendingNotes(): Promise<number> {
+    /*
+     * 甲方按过「停止执行」：**一条都不交付**。
+     *
+     * 否则「停止 → 这一轮结束 → 立刻 flush → 又开一轮」，用户看到的就是「停了还在动」。
+     */
+    if (this.notesHeld) return 0;
     if (this.disposed || !this.pendingNotes.length) {
       if (this.noteRetryTimer) {
         clearInterval(this.noteRetryTimer);
@@ -3241,6 +3262,38 @@ export class LanSyncService implements Disposable {
   /** 还有几条队友消息在排队（状态栏 / 测试用）。 */
   pendingNoteCount(): number {
     return this.pendingNotes.length;
+  }
+
+  /**
+   * 甲方按了「停止执行」：清空排队中的队友消息，并**暂停交付**。
+   *
+   * 为什么必须这样做（用户 2026-11-26：「点击后群里的 agent 并没有停止」）：
+   * 停止只是 abort 当前这一轮；这一轮结束时 `flushPendingNotes()` 会把排队的队友消息
+   * 交给 agent，于是**立刻又开一轮**，看起来就是「停了还在动」。
+   * 所以停止要同时：清队列 + 关闭交付闸门，直到甲方重新在群里发话。
+   */
+  holdNoteDelivery(reason: string): number {
+    const dropped = this.pendingNotes.length;
+    this.pendingNotes = [];
+    if (this.noteRetryTimer) {
+      clearInterval(this.noteRetryTimer);
+      this.noteRetryTimer = undefined;
+    }
+    this.notesHeld = true;
+    this.bridge.log(`[sync] 队友消息交付已暂停（${reason}）：清掉 ${dropped} 条排队，等甲方重新发话`);
+    return dropped;
+  }
+
+  /** 甲方重新发话：恢复队友消息的交付。 */
+  resumeNoteDelivery(): void {
+    if (!this.notesHeld) return;
+    this.notesHeld = false;
+    this.bridge.log('[sync] 甲方重新发话：恢复队友消息交付');
+  }
+
+  /** 队友消息是否处于「暂停交付」状态（界面 / 测试用）。 */
+  notesHeldForStop(): boolean {
+    return this.notesHeld;
   }
 
   /** 已经通知过的「这条 @ 给了别人」（按需求号去重：需求触发与群消息两条路径不会各发一遍）。 */
